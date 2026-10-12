@@ -223,6 +223,7 @@ import {
   terminalRateLimitRetryDelayMs,
 } from './terminal-rate-limit-retry.js';
 import { createStdioTransport } from './app-server/stdioTransport.js';
+import { localModelProxyEndpoints, type SessionProcessIsolation } from '../shared/session-process-isolation.js';
 import { CodexInteractionBroker } from './interaction-broker.js';
 import { SYSTEM_PROMPT_APPEND as MAKER_CODEX_SYSTEM_PROMPT_APPEND } from './system-prompt-append.js';
 import { nativeAutoReviewContinuationConfig } from './native-auto-review-policy.js';
@@ -2524,6 +2525,7 @@ export class CodexAgent extends BaseAgent {
       historyHome?: string;
       /** 受邀者任务的 app-server：值是分享给它的供应商(见 prepareCodexExtraSpawnConfig)。 */
       deviceHostedGuestProviderId?: string;
+      processIsolation?: SessionProcessIsolation;
     } = {},
   ): Promise<AppServerHost> {
     const key = opts.keyOverride ?? (opts.providerId ? `local-account:${opts.providerId}` : hostKey(remoteHostId));
@@ -2751,6 +2753,7 @@ assertRouteCurrent();
         opts.localAuthPolicy,
         opts.routeIsCurrent,
         opts.deviceHostedGuestProviderId,
+        opts.processIsolation,
       ).finally(() => {
         // 成功: this.hosts 已赋值, 后续走快路径; 失败: 清掉 promise 让下次调用能重试
         const current = this.hostPromises.get(key);
@@ -2999,6 +3002,7 @@ assertRouteCurrent();
     localAuthPolicy?: 'isolated' | 'legacy-shared',
     routeIsCurrent?: () => boolean,
     deviceHostedGuestProviderId?: string,
+    processIsolation?: SessionProcessIsolation,
   ): Promise<AppServerHost> {
     const seq = (this.createHostSeqByKey.get(key) ?? 0) + 1;
     this.createHostSeqByKey.set(key, seq);
@@ -3307,7 +3311,17 @@ assertRouteCurrent();
       createTransport = () => provider(remoteHostId);
     } else {
       const binaryPath = this.deps.binaryPath;
+      if (processIsolation) {
+        const bound = await this.deps.resolveLocalProcessIsolation?.({
+          kind: 'codex', workingDirectory: processIsolation.workingDirectory,
+          phase: 'spawn', networkEndpoints: localModelProxyEndpoints(extraArgs),
+        });
+        if (!bound) throw new Error('SESSION_PROCESS_ISOLATION_BINDING_MISSING');
+        processIsolation = bound;
+      }
       createTransport = () => createStdioTransport({
+        processIsolation,
+        ...(processIsolation ? { cwd: processIsolation.workingDirectory } : {}),
         binaryPath,
         env,
         extraArgs,
@@ -5053,10 +5067,17 @@ assertRouteCurrent();
     const sessionSqliteHome = sessionStorage?.sqliteHome;
     const companionEnvironment = opts.botRuntimeProfile && !opts.remoteHostId && sid
       ? await this.deps.resolveSessionEnvironment?.(sid) : undefined;
+    const localProcessIsolation = !opts.remoteHostId
+      ? await this.deps.resolveLocalProcessIsolation?.({
+          kind: 'codex', sessionId: sid, workingDirectory: opts.workingDir,
+          phase: 'identity',
+        }) : undefined;
+    // A restricted process belongs to one startup, even when accounts/models match.
+    const restrictedHostIdentity = localProcessIsolation ? randomUUID() : undefined;
     const resolveSessionHostKey = (): string => localSessionHostIdentity({
       sessionId: sid, remoteHostId: opts.remoteHostId, accountSessionHost, accountProviderId,
       reviewMode, customContext: usesCustomContextHost, storage: sessionStorage, policy: localAuthPolicy,
-      environmentIdentity: companionEnvironment?.identity,
+      environmentIdentity: restrictedHostIdentity ?? companionEnvironment?.identity,
       ...(guestCodexHome ? { guestSession: true } : {}),
     });
     let currentHostKey = resolveSessionHostKey();
@@ -5079,6 +5100,11 @@ assertRouteCurrent();
       if (!routeSelection.isCurrent()) throw new CodexRouteSelectionChangedError();
       acquireHostBindingLeaseIfNeeded();
       return await this.getHost(opts.remoteHostId, credentialMode, {
+        ...(localProcessIsolation ? { processIsolation: localProcessIsolation, keyOverride: currentHostKey } : {}),
+        ...(localProcessIsolation?.runtimeDirectory ? {
+          historyHome: path.join(localProcessIsolation.runtimeDirectory, 'codex-home'),
+          sqliteHome: path.join(localProcessIsolation.runtimeDirectory, 'codex-sqlite'),
+        } : {}),
         ...(companionEnvironment ? { keyOverride: currentHostKey } : {}),
         ...(accountProviderId ? { providerId: accountProviderId } : {}),
         ...(sessionSqliteHome ? { sqliteHome: sessionSqliteHome } : {}),
@@ -6576,6 +6602,11 @@ assertRouteCurrent();
           : {}),
         ...(hostedEnvironmentParams()),
       };
+      if (localProcessIsolation) {
+        // The actual native process has a host-bound Seatbelt restriction. Its
+        // tools inherit that restriction; applying Seatbelt again fails on macOS.
+        return { ...shared, sandboxPolicy: { type: 'externalSandbox', networkAccess: 'restricted' } };
+      }
       if (
         currentWorkspacePermissionProfile() !== undefined &&
         !activeTurnPermissionPolicy

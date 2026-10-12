@@ -54,6 +54,7 @@ import { fetchSingleHopWithSsrFGuard } from '@cindy/browser-control-runtime/ssrf
 
 import { createMakerLogger } from './logger-adapter.js';
 import { resolveDesktopOutboundProxy } from './outbound-proxy-resolver.js';
+import { recordSessionPreviewModelParameters } from './session-process-preview.js';
 
 const log = createMakerLogger('outbound-fetch');
 
@@ -792,6 +793,7 @@ export const outboundFetch = (async (
         : ((input as { url?: string }).url ?? '');
   const signal = signalOf(input, init);
   const dispatcher = await resolveOutboundDispatcher(target, { signal });
+  if (init?.body !== undefined) recordSessionPreviewModelParameters(init.body);
   if (!dispatcher) return globalThis.fetch(input, init);
   const request = await normalizeForUndici(input, init);
   if (request.init.redirect !== 'follow') {

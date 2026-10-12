@@ -131,3 +131,4 @@ export {
 } from './contacts/manager.js';
 
 export { LIBRARY_READ_ROOT, parseLibraryAssetRef, resolveLibraryAssetPath } from './agents/shared/library-native-read.js';
+export { projectModelRequestParameters, type SessionProcessIsolation } from './agents/shared/session-process-isolation.js';

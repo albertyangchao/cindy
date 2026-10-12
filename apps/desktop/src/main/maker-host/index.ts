@@ -146,6 +146,7 @@ import {
 } from './session-storage.js';
 import { desktopMakerLogger } from './logger-adapter.js';
 import { guardedOutboundFetch, outboundFetch } from './outbound-fetch.js';
+import { resolveSessionProcessPreview } from './session-process-preview.js';
 import { readCustomProviderKey } from '../secrets/providerSecretStore.js';
 import { createVisionBridge } from '../vision-bridge/vision-bridge.js';
 import {
@@ -1285,6 +1286,7 @@ export function getMaker(): Maker {
       log: desktopMakerLogger.child('command-gate'),
     });
     const claudeAgent = new ClaudeCodeAgent({
+      resolveLocalProcessIsolation: resolveSessionProcessPreview,
       resolveSessionEnvironment: resolveCompanionRuntimeEnvironment,
       getDisabledSkillPaths: readDisabledSkillPaths,
       getManagedSkills: listCindyManagedSkills,
@@ -1613,6 +1615,7 @@ export function getMaker(): Maker {
         ?? 'default';
     };
     const codexAgent = new CodexAgent({
+      resolveLocalProcessIsolation: resolveSessionProcessPreview,
       resolveSessionEnvironment: resolveCompanionRuntimeEnvironment,
       getDisabledSkillPaths: readDisabledSkillPaths,
       getManagedSkills: listCindyManagedSkills,

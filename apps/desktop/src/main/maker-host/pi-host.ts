@@ -50,6 +50,7 @@ import type {
   PiNativeProviderSpec,
   PiNativeProvidersResult,
 } from '@cindy/maker-core';
+import { resolveSessionProcessPreview } from './session-process-preview.js';
 import {
   PI_REASONING_EFFORTS,
   resolvePiModelRoute,
@@ -1874,6 +1875,7 @@ export function buildPiAgent(opts: BuildPiAgentOpts): PiAgent | null {
   }
   log.info('pi agent enabled', { binaryPath });
   return new PiAgent({
+    resolveLocalProcessIsolation: resolveSessionProcessPreview,
     resolveSessionEnvironment: resolveCompanionRuntimeEnvironment,
     getDisabledSkillPaths: readDisabledSkillPaths,
       getManagedSkills: listCindyManagedSkills,

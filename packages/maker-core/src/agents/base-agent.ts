@@ -10,6 +10,7 @@
 import type { AutoReviewUserIntent, AutoReviewUserReferences } from './shared/auto-review-decision.js';
 import { LIBRARY_READ_ROOT } from './shared/library-native-read.js';
 import { canonicalSkillPath, isSkillDisabled } from './shared/skill-activation.js';
+import type { SessionProcessIsolation } from './shared/session-process-isolation.js';
 
 import type {
   AgentEvent,
@@ -660,6 +661,15 @@ export interface PiSubagentRunnerLaunchRequest {
 }
 
 export interface AgentDeps {
+  /** Trusted local host capability. Never supplied by model text or an IPC caller. */
+  resolveLocalProcessIsolation?: (input: {
+    kind: AgentKind;
+    sessionId?: string;
+    workingDirectory: string;
+    phase?: 'identity' | 'spawn';
+    networkEndpoints?: readonly string[];
+    nativeConfigDirectory?: string;
+  }) => Promise<SessionProcessIsolation | undefined>;
   /** Opaque companion credential identity, freshly resolved at startup. No values enter the harness. */
   resolveSessionEnvironment?: (sessionId: string) => Promise<{ identity: string; assertCurrent?(): void } | undefined>;
   /** Cindy-only local Skill overrides. Freeze at native runtime startup; never apply to SSH. */

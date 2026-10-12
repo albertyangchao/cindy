@@ -2085,6 +2085,10 @@ export class PiAgent extends BaseAgent {
     }
     return {
       transport: createPiStdioTransport({
+        processIsolation: await this.deps.resolveLocalProcessIsolation?.({
+          kind: 'pi', sessionId: opts.sessionId ?? undefined, workingDirectory: opts.cwd,
+          phase: 'spawn', nativeConfigDirectory: opts.env.PI_CODING_AGENT_DIR,
+        }),
         binaryPath: this.deps.binaryPath,
         args: opts.args,
         cwd: opts.cwd,

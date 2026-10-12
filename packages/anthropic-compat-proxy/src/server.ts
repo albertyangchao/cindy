@@ -951,6 +951,7 @@ function forward(
   // Optional request-local operational observer. It never receives raw request/response data.
   forwardLifecycle?: ForwardLifecycleObserver | null,
   recoverUpstreamOversized?: (body: Buffer, signal: AbortSignal) => Promise<Buffer>,
+  onOutboundParameters?: ProxyOptions['onOutboundParameters'],
 ): void {
   // Diagnostics are a strict side channel: callback failures must never change forwarding.
   const notifyForwardLifecycle = (notify: () => void): void => {
@@ -1217,6 +1218,7 @@ function forward(
                 headerDelete, responseObserver, transformResponse, clientModel,
                 outboundProxy, pathOverride, responseToolUseIds, threadMintedIdCache,
                 requestDeclaredStream, beforeRetry, forwardLifecycle,
+                undefined, onOutboundParameters,
               );
               return;
             }
@@ -1285,6 +1287,7 @@ function forward(
               requestDeclaredStream,
               beforeRetry,
               forwardLifecycle,
+              undefined, onOutboundParameters,
             );
           };
           if (!beforeRetry) {
@@ -1889,6 +1892,18 @@ function forward(
     upstreamReq.destroy(new Error('upstream socket timeout'));
   });
 
+  if (onOutboundParameters) {
+    try {
+      const parsed = JSON.parse(body.toString('utf8'));
+      if (typeof parsed?.model === 'string') onOutboundParameters({
+        model: parsed.model,
+        effort: ['none', 'minimal', 'low', 'medium', 'high', 'xhigh'].includes(parsed.reasoning?.effort)
+          ? parsed.reasoning.effort : 'UNKNOWN',
+        serviceTier: ['auto', 'default', 'flex', 'priority'].includes(parsed.service_tier)
+          ? parsed.service_tier : 'UNKNOWN',
+      });
+    } catch { /* An unavailable diagnostic cannot change forwarding. */ }
+  }
   upstreamReq.end(body);
 }
 
@@ -2286,6 +2301,7 @@ export async function createAnthropicCompatProxy(opts: ProxyOptions): Promise<Pr
         false,
         beforeRetry,
         guardForwardLifecycleObserver(decision?.forwardLifecycle),
+        undefined, opts.onOutboundParameters,
       );
       return;
     }
@@ -2696,6 +2712,7 @@ export async function createAnthropicCompatProxy(opts: ProxyOptions): Promise<Pr
             signal,
           )
         : undefined,
+      opts.onOutboundParameters,
     );
   });
 

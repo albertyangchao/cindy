@@ -211,6 +211,8 @@ export interface ProxyLogger {
  * createAnthropicCompatProxy 入参。
  */
 export interface ProxyOptions {
+  /** Optional trusted diagnostic side channel. No headers, input or raw bytes. */
+  onOutboundParameters?: (parameters: { model: string; effort: string; serviceTier: string }) => void;
   /**
    * 真正的 Anthropic-compatible 上游 (网关 endpoint,登录随凭据下发)。
    * 函数形态 = 每个请求现取(宿主网关 endpoint 运行期可变,如登录后由服务端下发)。

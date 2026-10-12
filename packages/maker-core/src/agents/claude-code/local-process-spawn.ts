@@ -1,8 +1,11 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 
 import type { SpawnOptions, SpawnedProcess } from '@anthropic-ai/claude-agent-sdk';
+import { isolatedLocalLaunch, type SessionProcessIsolation } from '../shared/session-process-isolation.js';
 
 export interface ObservedClaudeProcessOptions {
+  /** Trusted host-only restriction; env/auth and observer lifecycle stay unchanged. */
+  processIsolation?: SessionProcessIsolation;
   spawnOptions: SpawnOptions;
   registerProcess?: (pid: number) => void | (() => void);
   trackDebugFile?: () => () => void;
@@ -13,9 +16,11 @@ export interface ObservedClaudeProcessOptions {
 export function spawnObservedClaudeProcess(
   opts: ObservedClaudeProcessOptions,
 ): SpawnedProcess {
+  const launch = isolatedLocalLaunch(opts.spawnOptions.command, opts.spawnOptions.args,
+    opts.spawnOptions.cwd, opts.processIsolation);
   const child: ChildProcessWithoutNullStreams = spawn(
-    opts.spawnOptions.command,
-    opts.spawnOptions.args,
+    launch.command,
+    launch.args,
     {
       cwd: opts.spawnOptions.cwd,
       env: opts.spawnOptions.env,

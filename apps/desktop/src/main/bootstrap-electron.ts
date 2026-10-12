@@ -512,6 +512,7 @@ import {
 } from './embedding-host';
 import { readClaudeApiKey } from './maker-host/auth-adapters';
 import { outboundFetch } from './maker-host/outbound-fetch';
+import { recordSessionProcessPreviewStage, runSessionProcessPreview } from './maker-host/session-process-preview';
 import { registerDevEmbeddingIpc } from './ipc/dev/embedding';
 import {
   acquirePiSubagentLaunchFence,
@@ -6414,6 +6415,11 @@ const registerIpcHandlers = () => {
 
     // 必装 binary 都 ready,现在才能安全构造 Maker 单例并挂 maker:* / 相关 IPC。
     await registerMakerIpcsAfterSplash();
+    if (process.env.XDT_SESSION_PROCESS_PREVIEW) {
+      void runSessionProcessPreview(getMakerCore()).catch(() => {
+        console.error('[session-process-preview] trusted development experiment failed');
+      });
+    }
 
     return {
       claudeCode: { status: 'passed' as const, path: claudeRes.path },
@@ -8752,6 +8758,7 @@ function cleanupLegacyDevShortcut(): Promise<void> {
 }
 
 app.on('ready', async () => {
+  recordSessionProcessPreviewStage('app-ready');
 
   // Smoke-test flag short-circuit: skip all normal init paths.
   const smoke = parseSmokeArgs();
@@ -8784,13 +8791,16 @@ app.on('ready', async () => {
     return; // 用户在错误框选择退出,app.exit 已调用
   }
   registerClientEndpointsIpc();
+  recordSessionProcessPreviewStage('endpoints-ready');
 
   // 网关凭据自动下发:订阅登录态(登录后向 model-access-server 拉 endpoint +
   // 用户专属 key)+ 注册 model-access:* IPC。须在 initClientEndpoints 之后
   // (依赖 modelAccessApiBaseUrl 端点)、renderer auth:initialize 之前装订阅。
   initModelAccess();
+  recordSessionProcessPreviewStage('model-access-ready');
 
   initializeUpdatePresentationRecovery();
+  recordSessionProcessPreviewStage('update-recovery-ready');
 
   // mac dev 下 Dock 显示的是 Electron 默认图标——macOS 忽略 BrowserWindow.icon,
   // Dock 图标取自可执行 bundle 的 icns,而 dev 跑的是 node_modules 里的官方
@@ -8808,6 +8818,7 @@ app.on('ready', async () => {
   }
 
   await ensureMainAppPresence('app-ready');
+  recordSessionProcessPreviewStage('presence-ready');
 
   // Cindy-owned Skill activation and all home-level projections happen through
   // one stable-owner boundary. Passive shared-userData instances may consume the
@@ -8821,6 +8832,7 @@ app.on('ready', async () => {
     });
   }
 
+  recordSessionProcessPreviewStage('skills-ready');
   // macOS App Translocation fix: when the user launches the app without
   // dragging it to /Applications first, macOS runs it from a read-only
   // temporary path, which breaks the in-app auto-updater.  Prompt the

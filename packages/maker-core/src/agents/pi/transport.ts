@@ -31,6 +31,7 @@ import { StringDecoder } from 'node:string_decoder';
 
 import { redactSensitiveText } from '@cindy/maker-shared/error-redaction';
 import type { Logger } from '../../interfaces/logger.js';
+import { isolatedLocalLaunch, type SessionProcessIsolation } from '../shared/session-process-isolation.js';
 
 /** transport 关闭信息:远端进程退出码 / 信号 + 人类可读原因。 */
 export interface PiTransportCloseInfo {
@@ -103,6 +104,8 @@ export interface PiTransport {
 }
 
 export interface PiStdioTransportOptions {
+  /** Trusted host-only restriction for this concrete local process. */
+  processIsolation?: SessionProcessIsolation;
   binaryPath: string;
   args: string[];
   cwd: string;
@@ -117,7 +120,8 @@ export interface PiStdioTransportOptions {
  * 从原 PiRpcProcess 内联逻辑迁出, 行为不变 (JSONL framing 仍由上层负责)。
  */
 export function createPiStdioTransport(opts: PiStdioTransportOptions): PiTransport {
-  const child: ChildProcessWithoutNullStreams = spawn(opts.binaryPath, opts.args, {
+  const launch = isolatedLocalLaunch(opts.binaryPath, opts.args, opts.cwd, opts.processIsolation);
+  const child: ChildProcessWithoutNullStreams = spawn(launch.command, launch.args, {
     cwd: opts.cwd,
     env: opts.env as NodeJS.ProcessEnv,
     stdio: ['pipe', 'pipe', 'pipe'],

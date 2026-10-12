@@ -962,6 +962,7 @@ function devEnvEntries(env) {
     ['XDT_SCHEDULER_PASSIVE', env.XDT_SCHEDULER_PASSIVE],
     ['XDT_ISOLATED', env.XDT_ISOLATED],
     ['XDT_ISOLATED_NAME', env.XDT_ISOLATED_NAME],
+    ['XDT_SESSION_PROCESS_PREVIEW', env.XDT_SESSION_PROCESS_PREVIEW],
     // Cindy Make 测试窗口标记必须穿过 restart → dev-env → Forge，
     // 否则测试进程会退化成普通开发窗口（数据虽隔离，关闭／前台行为却不再是测试版）。
     ['XDT_CINDY_MAKE_TEST', env.XDT_CINDY_MAKE_TEST],

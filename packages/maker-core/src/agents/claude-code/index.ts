@@ -1542,6 +1542,15 @@ export class ClaudeCodeAgent extends BaseAgent {
       // 拿到这份 env 之后做 —— 扫描需要 env 里的 CLAUDE_CONFIG_DIR 才能找对目录。
       subagentModel: null,
     });
+    const localProcessIsolation = !opts.remoteHostId
+      ? await this.deps.resolveLocalProcessIsolation?.({
+          kind: 'claude-code', sessionId: opts.sessionId, workingDirectory: opts.workingDir,
+          phase: 'spawn', networkEndpoints: typeof env.ANTHROPIC_BASE_URL === 'string' ? [env.ANTHROPIC_BASE_URL] : [],
+        }) : undefined;
+    if (localProcessIsolation?.runtimeDirectory) {
+      env.CLAUDE_CONFIG_DIR = path.join(localProcessIsolation.runtimeDirectory, 'claude-home');
+      env.TMPDIR = localProcessIsolation.runtimeDirectory;
+    }
 
     // 「Subagent 模型」设置的默认值语义(见 subagent-model-default.ts):
     // 平台的 CLAUDE_CODE_SUBAGENT_MODEL 是最高优先级**强制覆盖**,会静默盖掉用户手写
@@ -4365,10 +4374,11 @@ export class ClaudeCodeAgent extends BaseAgent {
           ...(finalResumeAt ? { resumeSessionAt: finalResumeAt } : {}),
           ...(finalFork ? { forkSession: true } : {}),
           env,
-          ...(this.deps.registerLocalAgentProcess || this.deps.trackCcDebugFile
+          ...(this.deps.registerLocalAgentProcess || this.deps.trackCcDebugFile || localProcessIsolation
             ? {
                 spawnClaudeCodeProcess: (spawnOptions) =>
                   spawnObservedClaudeProcess({
+                    processIsolation: localProcessIsolation,
                     spawnOptions,
                     registerProcess: (pid) =>
                       this.deps.registerLocalAgentProcess?.({

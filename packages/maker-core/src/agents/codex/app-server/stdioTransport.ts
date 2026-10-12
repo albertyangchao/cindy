@@ -10,6 +10,7 @@
 
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { createInterface, type Interface } from 'node:readline';
+import { isolatedLocalLaunch, type SessionProcessIsolation } from '../../shared/session-process-isolation.js';
 import type {
   CloseHandler,
   LineHandler,
@@ -18,6 +19,8 @@ import type {
 } from './transport.js';
 
 export interface StdioTransportOptions {
+  /** Trusted host-only restriction; each restricted transport must be dedicated. */
+  processIsolation?: SessionProcessIsolation;
   /** `codex` 可执行文件的绝对路径 (host 已 provisioned)。 */
   binaryPath: string;
   /** 子进程 cwd; 不传则继承父进程 cwd。 */
@@ -74,7 +77,8 @@ export function createStdioTransport(opts: StdioTransportOptions): Transport {
   const exitPromise = new Promise<void>((resolve) => { resolveExit = resolve; });
 
   const args = ['app-server', ...(opts.extraArgs ?? [])];
-  const child: ChildProcessWithoutNullStreams = spawn(opts.binaryPath, args, {
+  const launch = isolatedLocalLaunch(opts.binaryPath, args, opts.cwd, opts.processIsolation);
+  const child: ChildProcessWithoutNullStreams = spawn(launch.command, launch.args, {
     cwd: opts.cwd,
     env: opts.env,
     // 三路全 pipe: stdin 我们写, stdout 我们读, stderr 走 onStderr (诊断用)。

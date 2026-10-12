@@ -137,6 +137,7 @@ import {
 import { createMakerLogger } from './logger-adapter.js';
 import { resolveDesktopOutboundProxy } from './outbound-proxy-resolver.js';
 import { outboundFetch } from './outbound-fetch.js';
+import { recordSessionPreviewModelParameters } from './session-process-preview.js';
 import { desktopAnthropicImageCodec } from './anthropic-image-codec.js';
 import { readSilentEncryptedRetrySettings } from './silent-encrypted-retry-store.js';
 import { getLogDir } from '../logger.js';
@@ -3340,6 +3341,9 @@ async function createCodexProxyHandle(
     return decision instanceof Promise ? decision.then(uncompressed) : uncompressed(decision);
   };
   const handle = await createAnthropicCompatProxy({
+    onOutboundParameters: (parameters) => recordSessionPreviewModelParameters({
+      model: parameters.model, reasoning: { effort: parameters.effort }, service_tier: parameters.serviceTier,
+    }),
     // 默认上游 = gateway(含 /v1)；普通模型 + oauth 由 routingTransform 覆盖到 ChatGPT。
     upstream: () => buildCodexGatewayBaseUrl(),
     transformRequest: createTransformRequestChain(frozenAuthInjection, execAdapter, pricing, guestProviderId !== undefined).map(
@@ -3369,7 +3373,7 @@ async function createCodexProxyHandle(
     },
     requestGuard: ctx => codexTextOnlyRequestGuard(isCodexTextOnly(selectedThreadIdFromHeaders(ctx.headers)), ctx, isChatGptUpstreamBase),
     // Accepted WebSockets route exclusively to CODEX_OAUTH_UPSTREAM (see resolver below).
-    webSocketTransforms: ctx => codexTextOnlyWebSocketTransforms(() => isCodexTextOnly(selectedThreadIdFromHeaders(ctx.headers)), true),
+    webSocketTransforms: ctx => codexTextOnlyWebSocketTransforms(() => isCodexTextOnly(selectedThreadIdFromHeaders(ctx.headers)), true, recordSessionPreviewModelParameters),
     transformResponse: (ctx) => {
       const response = {
         contentType: ctx.responseHeaders['content-type'] ?? '',
