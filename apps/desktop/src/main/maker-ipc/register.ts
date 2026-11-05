@@ -15232,6 +15232,8 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
   let pluginTargetReviewReady = false;
   const restrictedCompletions = new Map<string,(claim:import('./restrictedPartnerExecution.js').RestrictedPartnerClaim,text:string,current:()=>void)=>Promise<void>>();
   const restrictedPartnerHost = createRestrictedPartnerHost({
+    research:true,
+    modelConfiguration:async(id,current)=>{current();const sessionId=await resolvePluginTargetSession('bot',id);current();const meta=await maker.getSessionMeta(sessionId);current();if(!meta||meta.agentKind!=='codex'||meta.remoteHostId||meta.agentDeviceId)throw Error('RESTRICTED_PARTNER_RUNNER_UNSUPPORTED');const providerId=getSessionProvider(sessionId);if(!providerId)throw Error('ROUTE_UNAVAILABLE');const execution=await resolveSessionExecution({agentKind:'codex',model:meta.model,providerId,effort:meta.effort},sessionId);current();if(execution.agentKind!=='codex'||execution.providerId!==providerId)throw Error('RESTRICTED_PARTNER_ROUTE_UNSUPPORTED');return {providerId:execution.providerId,modelId:execution.model};},
     executionReady: async()=>{
       const status=getCachedBinaryStatus('codex');if(process.platform!=='darwin'||!status.binaryReady||!status.binaryPath)return false;
       const version=await (await import('../agent-binaries/binary-version-probe.js')).probeBinaryVersion(status.binaryPath);
@@ -15247,8 +15249,12 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
         message: async(id,row)=>{const {messageToCamel}=await import('../localDb/mapper.js');guard();const {broadcastMessageRow}=await import('../localDb/ipc/messages.js');guard();if(!isDataOwnerBroadcastScopeCurrent(ownerScope))throw Error('PERMISSION_DENIED');broadcastMessageRow(id,messageToCamel(row),ownerScope);},
       });guard();
       const media=await (await import('./restrictedPartnerMedia.js')).restrictedPartnerMedia(snapshot.client,grant,claim,guard,assets,conversation.laneSessionId);guard();
+      const research=(await import('./restrictedPartnerResearch.js')).restrictedPartnerResearch(snapshot.client,grant,claim,guard,{
+        route:async()=>route,start:opts=>maker.startRestrictedPartnerInput(opts),
+        project:async g=>{guard();const [profile]=await snapshot.client.drizzle.select({persona:botProfileVersions.identitySource}).from(botProfiles).innerJoin(botProfileVersions,and(eq(botProfileVersions.botId,botProfiles.id),eq(botProfileVersions.version,botProfiles.currentVersion))).where(eq(botProfiles.id,g.partnerId)).limit(1);guard();if(!profile)throw Error('TARGET_UNAVAILABLE');const resources=(await import('./restrictedPartnerResources.js')).restrictedPartnerResources(g,guard);guard();return {persona:profile.persona,subjectContext:resources.context,readPaths:[],tools:[...resources.tools,...conversation.tools.filter(t=>t.name==='partner_history')]};},
+      });guard();
       restrictedCompletions.set(claim.runId,conversation.append);
-      return {context:conversation.context+'\n'+media.context,tools:[...conversation.tools,...media.tools],laneSessionId:conversation.laneSessionId,outputs:media.outputs};
+      return {context:conversation.context+'\n'+media.context,tools:[...conversation.tools,...media.tools,research.tool],laneSessionId:conversation.laneSessionId,outputs:()=>{research.assertResolved();return media.outputs();}};
     },
     afterComplete: async(claim,text,current)=>{const append=restrictedCompletions.get(claim.runId);if(!append)throw Error('RESTRICTED_PARTNER_HISTORY_DENIED');try{await append(claim,text,current);}finally{restrictedCompletions.delete(claim.runId);}},
     snapshot: () => {
@@ -15298,8 +15304,23 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       if(!win || win.isDestroyed() || !isTrustedAppRendererWindow(win))return {approved:false,paths:[]};
       const result=await dialog.showMessageBox(win,{type:'question',title:t('restrictedPartner.title'),
         message:t('restrictedPartner.message').replace('{{partner}}',input.label),
-        detail:t('restrictedPartner.detail')+'\nScoped channel history, subject memory CAS, approved resource readers and available configured Core media routes only. No shell or unscoped integrations.\n'+JSON.stringify(input.mediaRoutes??{})+'\n'+'\n\n'+(getInstalledGhostName(input.pluginId)??input.pluginId)+' / '+input.principalId,buttons:[t('pluginCompanionAnswer.allow'),t('pluginCompanionAnswer.cancel')],defaultId:1,cancelId:1});
+        detail:t('restrictedPartner.detail')+'\nScoped channel history, subject memory CAS, approved resource readers and available configured Core media routes only. No shell or unscoped integrations.\n'+JSON.stringify({media:input.mediaRoutes??{},model:input.modelRoute??null})+'\n'+'\n\n'+(getInstalledGhostName(input.pluginId)??input.pluginId)+' / '+input.principalId,buttons:[t('pluginCompanionAnswer.allow'),t('pluginCompanionAnswer.cancel')],defaultId:1,cancelId:1});
       if(result.response!==0)return {approved:false,paths:[]};
+      if(input.requirements){
+        const coverage:Partial<Record<'workspace'|'notes'|'memory',string[]>>={};
+        for(const purpose of input.requirements.purposes){
+          const selection=await dialog.showOpenDialog(win,{title:'Original subject '+purpose+' — approve only this subject’s existing source',properties:purpose==='memory'?['openFile']:['openDirectory','multiSelections']});
+          input.assertCurrent();if(selection.canceled||!selection.filePaths.length)return {approved:false,paths:[]};coverage[purpose as keyof typeof coverage]=selection.filePaths;
+        }
+        input.assertCurrent();const memorySource=coverage.memory;
+        if(!memorySource||memorySource.length!==1)return {approved:false,paths:[]};
+        memorySource[0]=await fsp.realpath(memorySource[0]);input.assertCurrent();
+        const names=(await import('./restrictedPartnerLegacyMemory.js')).legacyMemoryNamespaces(memorySource[0],input.assertCurrent);input.assertCurrent();
+        let legacyNamespace:string|null=null;
+        if(names.length){const picked=await dialog.showMessageBox(win,{type:'question',title:'Original persistent-memory namespace',message:'Select this exact subject’s existing namespace. This never imports old request intents or summaries.',buttons:[...names,'Cancel'],defaultId:names.length,cancelId:names.length});input.assertCurrent();if(picked.response>=names.length)return {approved:false,paths:[]};legacyNamespace=names[picked.response];}
+        const review=await dialog.showMessageBox(win,{type:'question',title:'Confirm original capability sources',message:'These selected folders are the original approved workspace / notes / durable memory for this exact subject.',detail:JSON.stringify(input.requirements)+'\nThis approval binds only these resource purposes. Missing research/services remain blocked; approval never fabricates a provider or cancels old effects.',buttons:['Confirm original sources','Cancel'],defaultId:1,cancelId:1});
+        if(review.response!==0)return {approved:false,paths:[]};return {approved:true,paths:[],coverage,legacyNamespace};
+      }
       if(!input.chooseResources)return {approved:true,paths:[]};
       const selected=await dialog.showOpenDialog(win,{title:t('restrictedPartner.resources'),properties:['openFile','openDirectory','multiSelections']});
       return selected.canceled ? {approved:false,paths:[]} : {approved:true,paths:selected.filePaths};

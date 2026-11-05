@@ -1,3 +1,11 @@
+import { legacyMemoryNamespaces } from './restrictedPartnerLegacyMemory.js';
+import {
+  validateRequirements,
+  grantResourceFingerprint,
+  requirementHash,
+  requirementGaps,
+  type PartnerRequirements,
+} from './restrictedPartnerRequirements.js';
 import { promises as fs } from 'node:fs';
 import { restrictedPartnerResources } from './restrictedPartnerResources.js';
 import { createHash } from 'node:crypto';
@@ -12,9 +20,14 @@ import {
 
 export interface RestrictedPartnerHostDeps {
   executionReady?(): Promise<boolean>;
+  research?: true;
+  modelConfiguration?(
+    partnerId: string,
+    current: () => void,
+  ): Promise<{ providerId: string; modelId: string }>;
   mediaConfiguration?(
     partnerId: string,
-    current:()=>void,
+    current: () => void,
   ): Promise<{ routes: NonNullable<RestrictedPartnerGrant['media']> }>;
   prepare?: import('./restrictedPartnerExecution.js').RestrictedPartnerPorts['prepare'];
   afterComplete?(
@@ -39,14 +52,22 @@ export interface RestrictedPartnerHostDeps {
     label: string;
     chooseResources: boolean;
     mediaRoutes?: RestrictedPartnerGrant['media'];
-  }): Promise<{ approved: boolean; paths: string[] }>;
+    modelRoute?: RestrictedPartnerGrant['modelRoute'];
+    requirements?: PartnerRequirements;
+    assertCurrent: () => void;
+  }): Promise<{
+    approved: boolean;
+    paths: string[];
+    coverage?: Partial<Record<'workspace' | 'notes' | 'memory', string[]>>;
+    legacyNamespace?: string | null;
+  }>;
 }
 const sha = (x: string) => createHash('sha256').update(x).digest('hex');
 const id = (x: unknown): x is string => typeof x === 'string' && /^[a-zA-Z0-9_.:-]{1,200}$/.test(x);
 const fail = (x: string): never => {
   throw new Error(x);
 };
-const safeGrant = (g: RestrictedPartnerGrant) => ({
+const safeGrant = (g: RestrictedPartnerGrant, ready = false, research = false) => ({
   version: 1,
   grantId: g.id,
   revision: g.revision,
@@ -57,7 +78,16 @@ const safeGrant = (g: RestrictedPartnerGrant) => ({
   dispatchEnabled: g.dispatchEnabled,
   resourceCount: g.resourceIds.length,
   personaSha256: g.personaSha256,
-  resourceFingerprint: sha(JSON.stringify([g.resourceIds, g.media ?? {}])),
+  resourceFingerprint: grantResourceFingerprint(g),
+  requirementsFingerprint: g.requirements ? requirementHash(g.requirements) : null,
+  requirementsRevision: g.requirements?.revision ?? null,
+  modelRoute: g.modelRoute ?? null,
+  coverage: Object.fromEntries(
+    ['workspace', 'notes', 'memory'].map((k) => [
+      k,
+      g.resourceCoverage?.[k as 'workspace' | 'notes' | 'memory']?.length ?? 0,
+    ]),
+  ),
   mediaRoutes: g.media ?? {},
   media: Object.fromEntries(
     ['vision', 'draw', 'edit', 'stt', 'tts'].map((k) => [
@@ -67,8 +97,17 @@ const safeGrant = (g: RestrictedPartnerGrant) => ({
   ),
   tools: [
     ...(g.resourceIds.length
-      ? ['partner_resource_read', 'partner_resource_list', 'partner_resource_image']
+      ? [
+          'partner_resource_read',
+          'partner_resource_list',
+          'partner_resource_image',
+          'partner_resource_search',
+        ]
       : []),
+    ...(ready ? ['native_codex_readonly'] : []),
+    ...(ready && research ? ['partner_research'] : []),
+    ...(g.resourceCoverage?.notes?.length ? ['partner_notes_search'] : []),
+    ...(g.legacyMemory ? ['partner_memory_search'] : []),
     'partner_history',
     'partner_memory',
     ...(Object.keys(g.media ?? {}).length ? ['partner_media'] : []),
@@ -135,6 +174,7 @@ export function createRestrictedPartnerHost(deps: RestrictedPartnerHostDeps) {
               'partnerId',
               'expectedRevision',
               'chooseResources',
+              'requirements',
             ].includes(k),
         ) ||
         !id(a.partnerId) ||
@@ -143,6 +183,10 @@ export function createRestrictedPartnerHost(deps: RestrictedPartnerHostDeps) {
         (a.chooseResources !== undefined && typeof a.chooseResources !== 'boolean')
       )
         return fail('INVALID_PARAMS');
+      if (a.requirements !== undefined) {
+        validateRequirements(a.requirements);
+        if (a.requirements.principalId !== principalId) return fail('INVALID_PARAMS');
+      }
       if (binding.has(grantId)) return fail('TASK_BUSY');
       binding.add(grantId);
       epochs.set(grantId, (epochs.get(grantId) ?? 0) + 1);
@@ -156,9 +200,11 @@ export function createRestrictedPartnerHost(deps: RestrictedPartnerHostDeps) {
         current();
         if ((old?.revision ?? 0) !== a.expectedRevision) return fail('STALE_REVISION');
         const profile = await deps.partner(partner.id);
-        if(profile.persona.length>16000)return fail('TARGET_UNAVAILABLE');
+        if (profile.persona.length > 16000) return fail('TARGET_UNAVAILABLE');
         current();
         const media = await deps.mediaConfiguration?.(partner.id, current);
+        const modelRoute = await deps.modelConfiguration?.(partner.id, current);
+        current();
         current();
         const decision = await deps.confirm({
           pluginId,
@@ -167,6 +213,9 @@ export function createRestrictedPartnerHost(deps: RestrictedPartnerHostDeps) {
           label: partner.label,
           chooseResources: a.chooseResources === true,
           mediaRoutes: media?.routes,
+          modelRoute,
+          requirements: a.requirements as PartnerRequirements | undefined,
+          assertCurrent: current,
         });
         current();
         if (!decision.approved) return fail('PERMISSION_DENIED');
@@ -175,9 +224,19 @@ export function createRestrictedPartnerHost(deps: RestrictedPartnerHostDeps) {
         if (profile.version !== latest.version || profile.persona !== latest.persona)
           return fail('STALE_REVISION');
         if (decision.paths.length > 64) return fail('INVALID_PARAMS');
-        const canonical = await Promise.all(decision.paths.map((p) => fs.realpath(p)));
+        const coveragePaths = Object.values(decision.coverage ?? {}).flat();
+        const canonical = await Promise.all(
+          [...decision.paths, ...coveragePaths].map((p) => fs.realpath(p)),
+        );
+        if (canonical.length > 64) return fail('INVALID_PARAMS');
         current();
         const resources = [...new Set(canonical)].map((p) => ({ id: sha(p), path: p }));
+        const coverage: NonNullable<RestrictedPartnerGrant['resourceCoverage']> = {};
+        for (const [purpose, paths] of Object.entries(decision.coverage ?? {}))
+          coverage[purpose as keyof typeof coverage] = [
+            ...new Set(await Promise.all(paths!.map(async (p) => sha(await fs.realpath(p))))),
+          ];
+        current();
         const grant: RestrictedPartnerGrant = {
           version: 1,
           id: grantId,
@@ -193,12 +252,29 @@ export function createRestrictedPartnerHost(deps: RestrictedPartnerHostDeps) {
           dispatchEpoch: 1,
           dispatchEnabled: false,
           ...(media ? { media: media.routes } : {}),
+          ...(modelRoute ? { modelRoute } : {}),
+          ...(a.requirements
+            ? {
+                requirements: structuredClone(a.requirements as PartnerRequirements),
+                resourceCoverage: coverage,
+                ...(decision.legacyNamespace !== undefined && coverage.memory?.length === 1
+                  ? {
+                      legacyMemory: {
+                        resourceId: coverage.memory[0],
+                        namespace: decision.legacyNamespace,
+                      },
+                    }
+                  : {}),
+              }
+            : {}),
         };
+        validGrant(grant);
+        current();
         if (!(await store.compareAndSwapGrant(grant, Number(a.expectedRevision))))
           return fail('STALE_REVISION');
         current();
         revisions.set(grantId, grant.revision);
-        return safeGrant(grant);
+        return safeGrant(grant, true, deps.research === true);
       } finally {
         binding.delete(grantId);
       }
@@ -221,6 +297,79 @@ export function createRestrictedPartnerHost(deps: RestrictedPartnerHostDeps) {
       )
         fail('PERMISSION_DENIED');
     };
+    const readiness = async () => {
+      const ready = (await deps.executionReady?.()) === true;
+      assertGrant(grant);
+      const facts = safeGrant(grant, ready, deps.research === true);
+      const currentMedia = await deps.mediaConfiguration?.(grant.partnerId, () =>
+        assertGrant(grant),
+      );
+      assertGrant(grant);
+      facts.media = Object.fromEntries(
+        ['vision', 'draw', 'edit', 'stt', 'tts'].map((kind) => {
+          const k = kind as keyof NonNullable<RestrictedPartnerGrant['media']>;
+          return [
+            kind,
+            Boolean(
+              grant.media?.[k] &&
+              JSON.stringify(grant.media[k]) === JSON.stringify(currentMedia?.routes[k]),
+            ),
+          ];
+        }),
+      );
+      const modelRoute = await deps.modelConfiguration?.(grant.partnerId, () => assertGrant(grant));
+      assertGrant(grant);
+      const modelAvailable = Boolean(
+        grant.modelRoute && JSON.stringify(grant.modelRoute) === JSON.stringify(modelRoute),
+      );
+      let resourcesAvailable = true;
+      for (const resource of grant.resources) {
+        try {
+          if ((await fs.realpath(resource.path)) !== resource.path) resourcesAvailable = false;
+        } catch {
+          resourcesAvailable = false;
+        }
+        assertGrant(grant);
+      }
+      if (!resourcesAvailable) facts.coverage = { workspace: 0, notes: 0, memory: 0 };
+      let legacyAvailable = Boolean(grant.legacyMemory);
+      if (grant.legacyMemory) {
+        try {
+          const resource = grant.resources.find((r) => r.id === grant.legacyMemory!.resourceId);
+          if (!resource) legacyAvailable = false;
+          else {
+            const ns = legacyMemoryNamespaces(resource.path, () => assertGrant(grant));
+            if (
+              grant.legacyMemory.namespace === null
+                ? ns.length > 0
+                : !ns.includes(grant.legacyMemory.namespace)
+            )
+              legacyAvailable = false;
+          }
+        } catch {
+          legacyAvailable = false;
+        }
+        assertGrant(grant);
+      }
+      if (!legacyAvailable) facts.tools = facts.tools.filter((t) => t !== 'partner_memory_search');
+      return {
+        ...facts,
+        missingRequirements: grant.requirements
+          ? [
+              ...(!modelAvailable ? ['model-route'] : []),
+              ...grant.requirements.media.filter((k) => facts.media[k] !== true),
+              ...requirementGaps(grant.requirements, {
+                tools: facts.tools,
+                coverage: resourcesAvailable
+                  ? { ...grant.resourceCoverage, ...(!legacyAvailable ? { memory: [] } : {}) }
+                  : {},
+                memory: Boolean(deps.prepare),
+                history: Boolean(deps.prepare),
+              }),
+            ]
+          : ['requirements-review'],
+      };
+    };
     if (revisions.has(grantId) && revisions.get(grantId) !== grant.revision)
       return fail('STALE_REVISION');
     revisions.set(grantId, grant.revision);
@@ -228,32 +377,21 @@ export function createRestrictedPartnerHost(deps: RestrictedPartnerHostDeps) {
       a.operation === 'binding' &&
       Object.keys(a).every((k) => ['operation', 'principalId'].includes(k))
     ) {
-      const media = await deps.mediaConfiguration?.(grant.partnerId, () => assertGrant(grant));
-      assertGrant(grant);
       const unresolvedCount = await store.unresolvedCount(pluginId, principalId);
       assertGrant(grant);
-      return {
-        unresolvedCount,
-        ...safeGrant(grant),
-        media: Object.fromEntries(
-          ['vision', 'draw', 'edit', 'stt', 'tts'].map((kind) => {
-            const k = kind as keyof NonNullable<RestrictedPartnerGrant['media']>;
-            return [
-              kind,
-              Boolean(
-                grant.media?.[k] &&
-                JSON.stringify(grant.media[k]) === JSON.stringify(media?.routes[k]),
-              ),
-            ];
-          }),
-        ),
-      };
+      return { unresolvedCount, ...(await readiness()) };
     }
     if (
       ['fence', 'resume'].includes(String(a.operation)) &&
       Object.keys(a).every((k) => ['operation', 'principalId', 'expectedRevision'].includes(k))
     ) {
       if (a.expectedRevision !== grant.revision) return fail('STALE_REVISION');
+      if (
+        a.operation === 'resume' &&
+        grant.requirements &&
+        (await readiness()).missingRequirements.length
+      )
+        return fail('RESTRICTED_PARTNER_REQUIREMENTS_UNMET');
       revisions.delete(grantId);
       binding.add(grantId);
       epochs.set(grantId, (epochs.get(grantId) ?? 0) + 1);
@@ -332,6 +470,12 @@ export function createRestrictedPartnerHost(deps: RestrictedPartnerHostDeps) {
       typeof a.text !== 'string'
     )
       return fail('INVALID_PARAMS');
+    if (
+      grant.requirements &&
+      ((await readiness()).missingRequirements.length ||
+        (a.channel as { memoryRead?: unknown })?.memoryRead !== true)
+    )
+      return fail('RESTRICTED_PARTNER_REQUIREMENTS_UNMET');
     if (deps.prepare) {
       const c = a.channel as Record<string, unknown>;
       if (
@@ -419,7 +563,17 @@ export function createRestrictedPartnerHost(deps: RestrictedPartnerHostDeps) {
             readPaths: [],
           };
         },
-        route: deps.route,
+        route: async (id) => {
+          const route = await deps.route(id);
+          assertGrant(grant);
+          if (
+            grant.modelRoute &&
+            (route.model !== grant.modelRoute.modelId ||
+              route.providerId !== grant.modelRoute.providerId)
+          )
+            return fail('RESTRICTED_PARTNER_ROUTE_UNSUPPORTED');
+          return route;
+        },
         start: deps.start,
         prepare: deps.prepare,
         afterComplete: (claim, text) =>

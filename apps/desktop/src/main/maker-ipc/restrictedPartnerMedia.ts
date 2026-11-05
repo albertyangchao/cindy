@@ -1,3 +1,4 @@
+import { grantResourceFingerprint } from './restrictedPartnerRequirements.js';
 import { createHash } from 'node:crypto';
 import { and, eq } from 'drizzle-orm';
 import { pluginTaskRequests } from '../localDb/schema.js';
@@ -95,7 +96,7 @@ export async function restrictedPartnerMedia(
     if (JSON.stringify(routes[kind]) !== JSON.stringify(config.routes[kind])) fail();
   const c = claim.channel;
   if (!c) fail();
-  const resourceFingerprint = sha(JSON.stringify([g.resourceIds, g.media ?? {}]));
+  const resourceFingerprint = grantResourceFingerprint(g);
   const assets = new Map<string, ManagedMedia>();
   const outputs: RestrictedOutputAsset[] = [];
   let unknown = false;
@@ -163,6 +164,7 @@ export async function restrictedPartnerMedia(
     const data = Buffer.from(bytes);
     const hash = sha(data);
     if (data.length > 4 * 1024 * 1024 || sniffMediaMime(data) !== mimeType) fail();
+    const provenanceHash = sha(JSON.stringify([p.binding, hash]));
     const result = await ingestMedia(
       {
         buffer: data,
@@ -170,7 +172,7 @@ export async function restrictedPartnerMedia(
         refs: [
           {
             refKind: 'integration-cache',
-            refId: 'restricted:' + claim.runId + ':' + hash,
+            refId: 'restricted:' + claim.runId + ':' + provenanceHash,
             originKind: 'integration',
             originId: g.pluginId,
           },
@@ -182,13 +184,13 @@ export async function restrictedPartnerMedia(
     );
     p.assertCurrent();
     const asset = {
-      id: 'asset:' + hash,
+      id: 'asset:' + provenanceHash,
       sha256: hash,
       mimeType,
       bytes: Uint8Array.from(data),
       binding: p.binding,
     };
-    const target = 'restricted:asset:' + claim.runId + ':' + hash;
+    const target = 'restricted:asset:' + claim.runId + ':' + provenanceHash;
     const saved = {
       version: 1,
       runId: claim.runId,
@@ -389,7 +391,13 @@ export async function restrictedPartnerMedia(
       return path!;
     },
   });
-  const context = [];
+  const context: Array<{
+    id: string;
+    mimeType: string;
+    sourceSha256: string;
+    normalizedSha256: string;
+    partial: boolean;
+  }> = [];
   if (inputs.length > 4) fail();
   let total = 0;
   for (const item of inputs) {
@@ -424,10 +432,10 @@ export async function restrictedPartnerMedia(
     if (!kind || !routes[kind]) fail();
     const b = makeBinding(kind, 'input:' + item.sha256),
       permit: MediaPermit = { binding: b, kind, signal: signal.signal, assertCurrent: current };
-    await ingest(permit, bytes, item.mimeType);
+    const prepared = await ingest(permit, bytes, item.mimeType);
     current();
     context.push({
-      id: item.id,
+      id: prepared.id,
       mimeType: item.mimeType,
       sourceSha256: item.sourceSha256,
       normalizedSha256: item.sha256,
@@ -531,7 +539,7 @@ export async function restrictedPartnerMedia(
                 text: receipt.text,
                 asset: receipt.asset,
                 partial: a.inputId
-                  ? (inputs.find((x) => x.id === a.inputId)?.partial ?? false)
+                  ? (context.find((x) => x.id === a.inputId)?.partial ?? false)
                   : false,
               }),
             },

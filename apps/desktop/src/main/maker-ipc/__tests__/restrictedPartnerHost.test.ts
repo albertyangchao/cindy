@@ -1,13 +1,20 @@
+import { mkdtemp, realpath, mkdir, rm } from 'node:fs/promises';
+import path from 'node:path';
+import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
 import Database from 'better-sqlite3';
 import { drizzle } from 'drizzle-orm/better-sqlite3';
 import { expect, it, vi } from 'vitest';
 import type { AgentSessionHandle } from '@cindy/maker-core';
 import type { DbClient } from '../../localDb/client/DbClient.js';
-import { createRestrictedPartnerHost } from '../restrictedPartnerHost.js';
+import {
+  type RestrictedPartnerHostDeps,
+  createRestrictedPartnerHost,
+} from '../restrictedPartnerHost.js';
 function fixture(
   ready = true,
   mediaRoutes: Record<string, { providerId: string; modelId: string }> = {},
+  extra: Partial<RestrictedPartnerHostDeps> = {},
 ) {
   const sqlite = new Database(':memory:');
   sqlite.exec(
@@ -58,6 +65,7 @@ function fixture(
     }),
     start,
     confirm,
+    ...extra,
   });
   const call = (request: unknown) => host('plugin', request, guard) as Promise<any>;
   return {
@@ -193,5 +201,138 @@ it('binding reports current configured media permission; withdrawal cannot sign 
     });
   } finally {
     f.sqlite.close();
+  }
+});
+
+it('reviewed requirement revision/fingerprint is durable, incomplete actual tools cannot resume or submit; unknown schemas/principals refuse', async () => {
+  const f = fixture();
+  const requirement = {
+    version: 1,
+    revision: 1,
+    principalId,
+    addressHashes: ['a'.repeat(64)],
+    source: { registry: 'b'.repeat(64), nativeConfig: 'c'.repeat(64), overlays: ['d'.repeat(64)] },
+    tools: ['readonly-research', 'memory-read'],
+    purposes: ['memory'],
+    media: ['vision'],
+  };
+  try {
+    const b = await f.call({ ...bind, requirements: requirement });
+    expect(b.requirementsFingerprint).toBe(
+      createHash('sha256').update(JSON.stringify(requirement)).digest('hex'),
+    );
+    const facts = await f.call({ operation: 'binding', principalId });
+    expect(facts.missingRequirements).toContain('readonly-research');
+    expect(facts.coverage.memory).toBe(0);
+    await expect(f.call({ operation: 'resume', principalId, expectedRevision: 1 })).rejects.toThrow(
+      'REQUIREMENTS_UNMET',
+    );
+    await expect(
+      f.call({
+        operation: 'submit',
+        principalId,
+        partnerId: bind.partnerId,
+        grantRevision: 1,
+        inputId: 'unsubmitted',
+        text: 'synthetic',
+      }),
+    ).rejects.toThrow('REQUIREMENTS_UNMET');
+    expect(f.start).not.toHaveBeenCalled();
+    await expect(
+      f.call({
+        ...bind,
+        expectedRevision: 1,
+        requirements: { ...requirement, principalId: 'e'.repeat(64) },
+      }),
+    ).rejects.toThrow('INVALID_PARAMS');
+    await expect(
+      f.call({
+        ...bind,
+        expectedRevision: 1,
+        requirements: { ...requirement, tools: ['arbitrary-shell'] },
+      }),
+    ).rejects.toThrow('REQUIREMENTS_INVALID');
+    expect(f.confirm).toHaveBeenCalledTimes(1);
+  } finally {
+    f.sqlite.close();
+  }
+});
+
+it('reviewed actual resource/namespace/model/media grant facts can be ready; model or media drift closes readiness without a run', async () => {
+  const root = await realpath(await mkdtemp(path.join(tmpdir(), 'grant-source-')));
+  await mkdir(path.join(root, 'workspace'));
+  await mkdir(path.join(root, 'notes'));
+  const file = path.join(root, 'memory.db'),
+    memory = new Database(file);
+  memory.exec(
+    "CREATE TABLE sticky_notes(namespace TEXT,note_key TEXT,content TEXT,updated_at INTEGER);INSERT INTO sticky_notes VALUES('mine','fact','preserved',1)",
+  );
+  memory.close();
+  let modelId = 'fixture';
+  const modelConfiguration = async () => ({ providerId: 'fixture-provider', modelId });
+  const f = fixture(
+    true,
+    { vision: { providerId: 'vision', modelId: 'model' } },
+    {
+      research: true,
+      modelConfiguration,
+      prepare: async () => {
+        throw Error('metadata test must not run a model');
+      },
+      confirm: async (req) => {
+        req.assertCurrent();
+        return {
+          approved: true,
+          paths: [],
+          coverage: {
+            workspace: [path.join(root, 'workspace')],
+            notes: [path.join(root, 'notes')],
+            memory: [file],
+          },
+          legacyNamespace: 'mine',
+        };
+      },
+    },
+  );
+  const req = {
+    version: 1,
+    revision: 1,
+    principalId,
+    addressHashes: ['a'.repeat(64)],
+    source: { registry: 'b'.repeat(64), nativeConfig: 'c'.repeat(64), overlays: ['d'.repeat(64)] },
+    tools: [
+      'channel-history',
+      'native-code-analysis',
+      'readonly-research',
+      'workspace-read',
+      'workspace-search',
+      'notes-search',
+      'memory-read',
+      'memory-write',
+    ],
+    purposes: ['workspace', 'notes', 'memory'],
+    media: ['vision'],
+  };
+  try {
+    await f.call({ ...bind, requirements: req });
+    const before = await f.call({ operation: 'binding', principalId });
+    expect(before.missingRequirements).toEqual([]);
+    expect(before.tools).toContain('partner_research');
+    expect(before.coverage).toEqual({ workspace: 1, notes: 1, memory: 1 });
+    expect(before.modelRoute.modelId).toBe('fixture');
+    expect(before.media.vision).toBe(true);
+    modelId = 'changed';
+    expect((await f.call({ operation: 'binding', principalId })).missingRequirements).toContain(
+      'model-route',
+    );
+    modelId = 'fixture';
+    f.changeMedia({});
+    expect((await f.call({ operation: 'binding', principalId })).missingRequirements).toContain(
+      'vision',
+    );
+    expect(f.start).not.toHaveBeenCalled();
+  } finally {
+    f.sqlite.close();
+    await rm(root, { recursive: true, force: true });
   }
 });

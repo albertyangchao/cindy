@@ -1,3 +1,8 @@
+import {
+  validateRequirements,
+  type PartnerRequirements,
+  type ResourceCoverage,
+} from './restrictedPartnerRequirements.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { RESTRICTED_PARTNER, mintRestrictedPartnerInput } from '@cindy/maker-core';
 import type {
@@ -21,6 +26,10 @@ export interface RestrictedPartnerGrant {
   resources: Array<{ id: string; path: string }>;
   dispatchEpoch: number;
   dispatchEnabled: boolean;
+  modelRoute?: { providerId: string; modelId: string };
+  requirements?: PartnerRequirements;
+  resourceCoverage?: ResourceCoverage;
+  legacyMemory?: { resourceId: string; namespace: string | null };
   media?: Partial<
     Record<
       'vision' | 'draw' | 'edit' | 'stt' | 'tts',
@@ -134,9 +143,32 @@ const id = (value: unknown): value is string =>
 export function validGrant(
   g: RestrictedPartnerGrant | undefined,
 ): asserts g is RestrictedPartnerGrant {
+  if (!g) throw Error('RESTRICTED_PARTNER_GRANT_INVALID');
   if (
     !g ||
-    Object.keys(g).some(k=>!['version','id','revision','pluginId','principalId','partnerId','enabled','personaSha256','resourceIds','approvalRevision','resources','dispatchEpoch','dispatchEnabled','media'].includes(k)) ||
+    Object.keys(g).some(
+      (k) =>
+        ![
+          'version',
+          'id',
+          'revision',
+          'pluginId',
+          'principalId',
+          'partnerId',
+          'enabled',
+          'personaSha256',
+          'resourceIds',
+          'approvalRevision',
+          'resources',
+          'dispatchEpoch',
+          'dispatchEnabled',
+          'media',
+          'requirements',
+          'modelRoute',
+          'resourceCoverage',
+          'legacyMemory',
+        ].includes(k),
+    ) ||
     g.version !== 1 ||
     g.enabled !== true ||
     !Number.isSafeInteger(g.revision) ||
@@ -179,6 +211,41 @@ export function validGrant(
         !r.path ||
         r.path.includes('\0'),
     )
+  )
+    fail('RESTRICTED_PARTNER_GRANT_INVALID');
+  if (
+    g.legacyMemory &&
+    (Object.keys(g.legacyMemory).sort().join(',') !== 'namespace,resourceId' ||
+      !g.resourceIds.includes(g.legacyMemory.resourceId) ||
+      (g.legacyMemory.namespace !== null &&
+        (typeof g.legacyMemory.namespace !== 'string' ||
+          !g.legacyMemory.namespace.length ||
+          g.legacyMemory.namespace.length > 128 ||
+          /[\x00-\x1f]/.test(g.legacyMemory.namespace))))
+  )
+    fail('RESTRICTED_PARTNER_GRANT_INVALID');
+  if (
+    g.modelRoute &&
+    (Object.keys(g.modelRoute).sort().join(',') !== 'modelId,providerId' ||
+      !id(g.modelRoute.providerId) ||
+      typeof g.modelRoute.modelId !== 'string' ||
+      !g.modelRoute.modelId.length ||
+      g.modelRoute.modelId.length > 256)
+  )
+    fail('RESTRICTED_PARTNER_GRANT_INVALID');
+  if (g.requirements) {
+    validateRequirements(g.requirements);
+    if (g.requirements.principalId !== g.principalId) fail('RESTRICTED_PARTNER_GRANT_INVALID');
+  }
+  if (
+    g.resourceCoverage &&
+    (Object.keys(g.resourceCoverage).some((k) => !['workspace', 'notes', 'memory'].includes(k)) ||
+      Object.values(g.resourceCoverage).some(
+        (ids) =>
+          !Array.isArray(ids) ||
+          new Set(ids).size !== ids.length ||
+          ids.some((id) => !g.resourceIds.includes(id)),
+      ))
   )
     fail('RESTRICTED_PARTNER_GRANT_INVALID');
 }
@@ -250,7 +317,7 @@ export function createRestrictedPartnerExecution(ports: RestrictedPartnerPorts) 
       }
       const projection = await ports.project(grant);
       await current(grant);
-      if (projection.persona.length>16000 || sha(projection.persona) !== grant.personaSha256)
+      if (projection.persona.length > 16000 || sha(projection.persona) !== grant.personaSha256)
         fail('RESTRICTED_PARTNER_PERSONA_CHANGED');
       const route = await ports.route(grant.partnerId);
       await current(grant);

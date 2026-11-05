@@ -18,14 +18,19 @@ import {
 import { restrictedPartnerMedia } from '../restrictedPartnerMedia.js';
 const mocks = vi.hoisted(() => ({
   images: null as unknown,
+  vision: undefined as any,
   routes: {} as Record<string, unknown>,
   ingest: vi.fn(),
 }));
 vi.mock('../../cindy-brain/index.js', () => ({
   restrictedPartnerImageConfiguration: () => ({ images: mocks.images, routes: mocks.routes }),
+  getGhostLibrarySlot: () => ({
+    importStream: async () => ({ ok: true }),
+    resolvePanelFilePath: async (_plugin: string, rel: string) => '/managed/' + rel,
+  }),
 }));
 vi.mock('../../maker-host/index.js', () => ({
-  restrictedPartnerVisionConfiguration: async () => undefined,
+  restrictedPartnerVisionConfiguration: async () => mocks.vision,
 }));
 vi.mock('../../voice-input/index.js', () => ({
   restrictedPartnerTranscriptionConfiguration: () => undefined,
@@ -46,6 +51,7 @@ const png = Buffer.from(
 );
 function fixture() {
   mocks.ingest.mockClear();
+  mocks.vision = undefined;
   const sql = new Database(':memory:');
   sql.exec(`
       CREATE TABLE sessions (
@@ -387,6 +393,95 @@ it('missing/mismatched original scope cannot create a canonical lane or private 
       'DENIED',
     );
     expect(f.sql.prepare('SELECT count(*) n FROM bot_session_links').get()).toEqual({ n: 0 });
+  } finally {
+    f.sql.close();
+  }
+});
+
+it('exact input/edit pixels and distinct sequential/concurrent effects retain independent provenance and never recharge the same effect', async () => {
+  const f = fixture();
+  let paid = 0;
+  const registry = new ImageChannelRegistry();
+  registry.register('fake', {
+    ready: () => true,
+    generateImage: async () => {
+      paid++;
+      return { data: [{ b64_json: png.toString('base64') }] };
+    },
+    editImage: async () => {
+      paid++;
+      return { data: [{ b64_json: png.toString('base64') }] };
+    },
+  });
+  f.grant.media = {
+    draw: { providerId: 'fake', modelId: 'draw' },
+    edit: { providerId: 'fake', modelId: 'edit' },
+    vision: { providerId: 'fake', modelId: 'vision' },
+  };
+  mocks.images = registry;
+  mocks.routes = { draw: f.grant.media.draw, edit: f.grant.media.edit };
+  mocks.vision = { route: f.grant.media.vision, deps: {}, assertCurrent: f.current };
+  mocks.ingest.mockImplementation(async (p: any) => {
+    p.assertStillValid();
+    return { ext: '.png' };
+  });
+  const claim = {
+    version: 1,
+    runId: 'same-pixels',
+    inputId: 'new',
+    pluginId: 'plugin',
+    principalId: f.grant.principalId,
+    partnerId: 'bot',
+    grantId: 'grant',
+    grantRevision: 1,
+    inputSha256: sha('question'),
+    state: 'UNKNOWN',
+    channel: f.channel,
+  } as const;
+  try {
+    const media = await restrictedPartnerMedia(f.db, f.grant, claim as any, f.current, [
+      {
+        id: 'asset:' + sha(png),
+        sha256: sha(png),
+        mimeType: 'image/png',
+        base64: png.toString('base64'),
+        sourceSha256: sha(png),
+        partial: false,
+      },
+    ]);
+    const input = JSON.parse(media.context).authorizedRequestMedia[0].id,
+      tool = media.tools[0]!;
+    const invoke = (text: string, kind = 'draw', inputId?: string) =>
+      tool.invoke(
+        { kind, text, ...(inputId ? { inputId } : {}) },
+        { callId: text, runId: claim.runId },
+      );
+    await invoke('edit same pixels', 'edit', input);
+    await Promise.all([invoke('draw first'), invoke('draw second')]);
+    expect(paid).toBe(3);
+    const outputs = media.outputs();
+    expect(outputs).toHaveLength(3);
+    expect(new Set(outputs.map((a) => a.id)).size).toBe(3);
+    expect(new Set(outputs.map((a) => a.sha256)).size).toBe(1);
+    const saved = f.sql
+      .prepare("SELECT payload FROM plugin_task_requests WHERE target_id LIKE 'restricted:asset:%'")
+      .all() as Array<{ payload: string }>;
+    expect(saved).toHaveLength(4);
+    for (const out of outputs)
+      expect(
+        saved.some((r) => {
+          const b = JSON.parse(r.payload).binding;
+          return (
+            Object.keys(b).length === Object.keys(out.binding).length &&
+            Object.entries(out.binding).every(([k, v]) => b[k] === v)
+          );
+        }),
+      ).toBe(true);
+    await invoke('draw first');
+    expect(paid).toBe(3);
+    expect(media.outputs()).toHaveLength(3);
+    await expect(invoke('bad scope', 'edit', 'asset:' + sha('other'))).rejects.toThrow();
+    expect(paid).toBe(3);
   } finally {
     f.sql.close();
   }
