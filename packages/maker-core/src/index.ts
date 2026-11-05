@@ -108,3 +108,7 @@ export { MAKER_MEMORY_RULES } from './memory/system-prompt.js';
 
 export { LIBRARY_READ_ROOT, parseLibraryAssetRef, resolveLibraryAssetPath } from './agents/shared/library-native-read.js';
 export { VoiceCallContext, type VoiceCallRecord, type VoiceCallTurn, type VoiceCallHandoff } from './voice-call.js';
+
+export { RESTRICTED_PARTNER, mintRestrictedPartnerInput, type RestrictedPartnerIdentity, type RestrictedPartnerInput, type RestrictedPartnerTool } from './agents/shared/restricted-partner.js';
+
+export { callReviewReadTool as readApprovedLocalResource } from './agents/codex/review-read-tools.js';

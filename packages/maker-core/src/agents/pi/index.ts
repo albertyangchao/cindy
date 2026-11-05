@@ -1,3 +1,4 @@
+import { restrictedPartnerInput } from '../shared/restricted-partner.js';
 import { getPiExtensionUiCapability } from './extension-ui-capabilities.js';
 import { createPiCacheInputTracker } from './cache-input.js';
 import { parsePiManagementArgs, parsePiManagementText } from './managed-command.js';
@@ -2621,6 +2622,7 @@ export class PiAgent extends BaseAgent {
   }
 
   override async startSession(opts: StartSessionOptions): Promise<AgentSessionHandle> {
+    restrictedPartnerInput(opts, 'pi');
     if (this.disposeStarted) {
       throw new AgentStartupStoppedError(new Error('Pi agent is disposing; refusing to start a new session'));
     }

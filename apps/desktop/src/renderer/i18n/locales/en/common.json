@@ -19302,5 +19302,11 @@
     "rendered": "View document",
     "wrap": "Wrap lines",
     "lineNumbers": "Line numbers"
+  },
+  "restrictedPartner": {
+    "title": "Plugin access",
+    "message": "Allow external input to {{partner}}?",
+    "detail": "Only the selected partner persona and files you explicitly choose are available. Other task history, owner memory, credentials, network and general tools are not shared. This does not enable a messaging route.",
+    "resources": "Choose read-only resources for this external subject"
   }
 }

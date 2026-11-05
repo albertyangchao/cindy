@@ -1,3 +1,4 @@
+import { restrictedPartnerEgressGate } from './restrictedPartnerEgressGate.js';
 import { captureUsagePricing, createUsagePricingObserver } from './model-usage-pricing.js';
 import { rewriteFastModel } from './model-fast-mode.js';
 import { createAttachmentRecovery } from './oversized-attachment-recovery.js';
@@ -3437,6 +3438,7 @@ async function createCodexProxyHandle(
   frozenCustomProviderRoutes?: readonly CodexCustomProviderRoute[],
   guestProviderId?: string,
   guestSessionId?: string,
+  restrictedEgressGuard?: () => void,
 ): Promise<ProxyHandle> {
   const execAdapter = createCodexResponsesCompatibilityAdapter();
   let alive = true;
@@ -3529,6 +3531,7 @@ async function createCodexProxyHandle(
       return path.kind !== 'not-custom-provider-route'
         && !(path.kind === 'route' && path.pathKind === 'responses');
     },
+    ...(restrictedEgressGuard ? {revalidateBeforeDispatch:restrictedPartnerEgressGate(restrictedEgressGuard)} : {}),
     requestGuard: ctx => codexTextOnlyRequestGuard(isCodexTextOnly(selectedThreadIdFromHeaders(ctx.headers)), ctx, isChatGptUpstreamBase),
     // Accepted WebSockets route exclusively to CODEX_OAUTH_UPSTREAM (see resolver below).
     webSocketTransforms: ctx => codexTextOnlyWebSocketTransforms(() => isCodexTextOnly(selectedThreadIdFromHeaders(ctx.headers)), true, (message, signal) => {
@@ -3586,7 +3589,7 @@ async function createCodexProxyHandle(
     ),
     maxRequestBodyBytes: CODEX_PROXY_MAX_REQUEST_BODY_BYTES,
     oversizedRequestRecovery: attachmentRecovery,
-    debugDumpRequestBody: process.env.XDT_PROXY_DUMP_REQUEST_BODY === '1',
+    debugDumpRequestBody: !restrictedEgressGuard && process.env.XDT_PROXY_DUMP_REQUEST_BODY === '1',
     recoveryRules: [...CODEX_BODY_RECOVERY_RULES],
     logger: log,
     resolveOutboundProxy: resolveDesktopOutboundProxy,
@@ -3613,6 +3616,7 @@ async function createCodexProxyHandle(
      * thread 不预扫描、不降级，继续保留原生 WS 容量体验。
      */
     resolveWebSocketUpstream: ({ headers }) => {
+      if(restrictedEgressGuard)return null;
       // Member budgets and grants are evaluated for every request on the isolated guest proxy.
       if (guestProviderId) return null;
       if ((frozenAuthInjection ?? getCodexProxyAuthInjection()) !== 'oauth-bearer') return null;
@@ -3769,12 +3773,14 @@ export async function ensureCodexCustomContextProxyReady(
   /** 供应商分享受邀者的任务：proxy 只经这个供应商出站(见 createCodexGuestRoutingGuard)。 */
   guestProviderId?: string,
   guestSessionId?: string,
+  restrictedEgressGuard?: () => void,
 ): Promise<void> {
   const key = scopeKey.trim();
   if (!key) throw new Error('custom-context Codex proxy requires a scope key');
   if (guestProviderId && !guestSessionId?.trim()) throw new Error('shared-provider Codex proxy requires a guest session');
   const routeSignature = codexCustomProviderRoutesSignature(routes)
-    + (guestProviderId ? `\u0000guest:${guestProviderId}\u0000session:${guestSessionId}` : '');
+    + (guestProviderId ? `\u0000guest:${guestProviderId}\u0000session:${guestSessionId}` : '')
+    + (restrictedEgressGuard ? '\u0000restricted-partner' : '');
   const current = _customContextHandles.get(key);
   if (
     current?.authInjection === authInjection
@@ -3792,7 +3798,7 @@ export async function ensureCodexCustomContextProxyReady(
   let promise!: Promise<void>;
   promise = (async () => {
     try {
-      const handle = await createCodexProxyHandle(authInjection, [...routes], guestProviderId, guestSessionId);
+      const handle = await createCodexProxyHandle(authInjection, [...routes], guestProviderId, guestSessionId, restrictedEgressGuard);
       if (
         disposeGeneration !== _disposeGeneration
         || scopeGeneration !== (_customContextGenerations.get(key) ?? 0)

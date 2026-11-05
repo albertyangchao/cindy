@@ -1,3 +1,7 @@
+import { captureBotPermissionEpoch } from './botPermissionDispatch.js';
+import { captureRestrictedPartnerEpoch } from './restrictedPartnerEpoch.js';
+import { isTrustedAppRendererWindow } from '../security/trustedAppRenderer.js';
+import { createRestrictedPartnerHost } from './restrictedPartnerHost.js';
 import { registerRuntimeSettingsSection } from '../app-settings/runtime.js';
 import { z as settingsSchema } from 'zod';
 import { registerPreferenceControlIpc } from '../app-settings/preferences.js';
@@ -15226,7 +15230,54 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
   });
   invalidatePluginCompanions = () => companionHub?.invalidate();
   let pluginTargetReviewReady = false;
+  const restrictedPartnerHost = createRestrictedPartnerHost({
+    snapshot: () => {
+      const snapshot = getCurrentDbClientSnapshot();
+      if (!snapshot) throw new Error('HOST_NOT_READY');
+      return {client:snapshot.client,assertCurrent:()=>{if(getCurrentDbClientSnapshot()!==snapshot)throw new Error('PERMISSION_DENIED');}};
+    },
+    approvalRevision: pluginTargetAuthorizationRevision,
+    partnerAuthority:id=>{const profile=captureRestrictedPartnerEpoch(id),permissions=captureBotPermissionEpoch(id);return()=>{profile();permissions();};},
+    candidates: () => listPluginTargetCandidates('bot'),
+    partner: async id => {
+      const snapshot=getCurrentDbClientSnapshot();
+      if(!snapshot)throw new Error('HOST_NOT_READY');
+      if(!(await listPluginTargetCandidates('bot')).some(p=>p.id===id))throw new Error('TARGET_UNAVAILABLE');
+      const [row]=await snapshot.client.drizzle.select({persona:botProfileVersions.identitySource,version:botProfiles.currentVersion})
+        .from(botProfiles).innerJoin(botProfileVersions,and(eq(botProfileVersions.botId,botProfiles.id),eq(botProfileVersions.version,botProfiles.currentVersion)))
+        .where(eq(botProfiles.id,id)).limit(1);
+      if(getCurrentDbClientSnapshot()!==snapshot || !row || !row.persona.trim())throw new Error('TARGET_UNAVAILABLE');
+      return row;
+    },
+    route: async id => {
+      const sessionId=await resolvePluginTargetSession('bot',id);
+      const meta=await maker.getSessionMeta(sessionId);
+      if(!meta || meta.agentKind!=='codex' || meta.remoteHostId || meta.agentDeviceId)throw new Error('RESTRICTED_PARTNER_RUNNER_UNSUPPORTED');
+      const providerId=getSessionProvider(sessionId);
+      if(!providerId)throw new Error('ROUTE_UNAVAILABLE');
+      const execution=await resolveSessionExecution({agentKind:'codex',model:meta.model,providerId,effort:meta.effort},sessionId);
+      if(execution.agentKind!=='codex')throw new Error('RESTRICTED_PARTNER_RUNNER_UNSUPPORTED');
+      // A fresh Host-owned workspace, never the partner's private canonical cwd.
+      const workingDir=await fsp.mkdtemp(path.join(await (async()=>{
+        const root=ownerScopedUserDataPath('restricted-partner-inputs');await fsp.mkdir(root,{recursive:true,mode:0o700});return root;
+      })(), 'input-'));
+      return {workingDir,model:execution.model,providerId:execution.providerId,effort:execution.effort};
+    },
+    start: opts => maker.startRestrictedPartnerInput(opts),
+    confirm: async input => {
+      const win=getDeepLinkMainWindow();
+      if(!win || win.isDestroyed() || !isTrustedAppRendererWindow(win))return {approved:false,paths:[]};
+      const result=await dialog.showMessageBox(win,{type:'question',title:t('restrictedPartner.title'),
+        message:t('restrictedPartner.message').replace('{{partner}}',input.label),
+        detail:t('restrictedPartner.detail')+'\n\n'+(getInstalledGhostName(input.pluginId)??input.pluginId)+' / '+input.principalId,buttons:[t('pluginCompanionAnswer.allow'),t('pluginCompanionAnswer.cancel')],defaultId:1,cancelId:1});
+      if(result.response!==0)return {approved:false,paths:[]};
+      if(!input.chooseResources)return {approved:true,paths:[]};
+      const selected=await dialog.showOpenDialog(win,{title:t('restrictedPartner.resources'),properties:['openFile','openDirectory','multiSelections']});
+      return selected.canceled ? {approved:false,paths:[]} : {approved:true,paths:selected.filePaths};
+    },
+  });
   setPluginTargetAdapter({
+    restricted: restrictedPartnerHost,
     prepareInvocation: preparePluginInvocation,
     acceptInvocation: acceptPluginInvocation,
     scheduleAutoTitle: schedulePluginAutoTitle,

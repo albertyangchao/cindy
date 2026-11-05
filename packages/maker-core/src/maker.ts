@@ -1,3 +1,4 @@
+import { restrictedPartnerInput } from './agents/shared/restricted-partner.js';
 /**
  * Maker — Session 注册中心 + Agent 路由。
  *
@@ -1634,6 +1635,13 @@ export class Maker {
    * 设备托管：同账号另一台电脑上的任务让 Agent 在本机运行。直接用本机的 agent 启动会话，
    * 不建本机 Session 与持久化记录(任务、消息与状态都在对方电脑上)；opts.deviceHosted 必填。
    */
+  /** A Main-owned per-input partner transcript; never resumes the partner's private canonical thread. */
+  async startRestrictedPartnerInput(opts: StartSessionOptions): Promise<AgentSessionHandle> {
+    if (this.shutdownStarted) throw new Error('RESTRICTED_PARTNER_HOST_STOPPING');
+    if (!restrictedPartnerInput(opts, 'codex')) throw new Error('RESTRICTED_PARTNER_INVALID');
+    return this.requireAgent('codex').startSession(opts);
+  }
+
   async startHostedAgentSession(kind: AgentKind, opts: StartSessionOptions): Promise<AgentSessionHandle> {
     if (this.shutdownStarted) throw new Error('Maker is shutting down; refusing to start a hosted session');
     if (!opts.deviceHosted) throw new Error('hosted sessions require deviceHosted');

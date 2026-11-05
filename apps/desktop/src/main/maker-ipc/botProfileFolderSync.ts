@@ -1,3 +1,4 @@
+import { withRestrictedPartnerChange } from './restrictedPartnerEpoch.js';
 /**
  * 文件 → 冻结快照的对账。
  *
@@ -115,13 +116,13 @@ async function deriveFromFolder(
   snapshot: BotProfileSnapshot,
   deps: BotProfileFolderSyncDeps,
 ): Promise<void> {
-  await deps.deriveVersion({
+  await withRestrictedPartnerChange(botId, () => deps.deriveVersion({
     botId,
     identitySource: folder.identitySource,
     // 保留宿主冻结的能力策略，只接纳 Home 中真正属于 Bot 内容的用户画像。
     config: { ...snapshot.config, userContextSource: folder.userContextSource },
     expectedCurrentVersion: snapshot.currentVersion,
-  });
+  }));
 }
 
 function stripUserContext(config: Record<string, unknown>): Record<string, unknown> {

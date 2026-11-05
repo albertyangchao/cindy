@@ -41,6 +41,7 @@ export interface PluginTargetStore {
   accept(id: string, delivery: PluginTargetDelivery): Promise<void>;
 }
 export interface PluginTargetAdapter {
+  restricted?(pluginId:string,request:unknown,authorized:()=>void):Promise<unknown>;
   store(): PluginTargetStore;
   approvalRevision(pluginId: string): string | null;
   delegationRevision?(pluginId: string): string | null;
@@ -126,9 +127,14 @@ export class PluginTargetSlot {
     if (!this.adapter) return fail('HOST_NOT_READY');
     const adapter = this.adapter;
     const request = raw as PluginTargetRequest;
+    if (request?.kind === 'restricted') {
+      if (!adapter.restricted) return fail('UNSUPPORTED_CAPABILITY');
+      if (Object.keys(raw as object).some(k=>!['kind','type','request'].includes(k))) return fail('INVALID_PARAMS');
+      return adapter.restricted(pluginId,(raw as {request?:unknown}).request,authorized);
+    }
     if (!request || !['capabilities', 'list', 'resolve', 'send', 'get', 'cancel'].includes(request.kind))
       return fail('INVALID_PARAMS');
-    if (request.kind === 'capabilities') return { delegation: { version: 1, execution: this.supportsDelegationExecution(), targetKinds: ['bot'], delivery: ['queue'], receiptQuery: true, settled: true } };
+    if (request.kind === 'capabilities') return { ...(adapter.restricted ? {restrictedPartners:{version:1,execution:true}} : {}), delegation: { version: 1, execution: this.supportsDelegationExecution(), targetKinds: ['bot'], delivery: ['queue'], receiptQuery: true, settled: true } };
     const resolve = async (target: PluginTargetRef): Promise<PluginTargetView> => {
       const candidates = await adapter.candidates(target.kind);
       authorized();

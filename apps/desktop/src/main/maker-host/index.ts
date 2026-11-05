@@ -2027,9 +2027,10 @@ export function getMaker(): Maker {
             customContextProviderRoutes,
             guestProviderId,
             guestSessionId,
+            ctx.restrictedEgressGuard,
           );
           // 受邀者不走「proxy 不可用时直连网关」的退路：那条路不经受邀者守门。
-          if (guestProviderId && !isCodexCustomContextProxyHandleReady(scopedProxyKey)) {
+          if ((guestProviderId || ctx.restrictedEgressGuard) && !isCodexCustomContextProxyHandleReady(scopedProxyKey)) {
             await releaseCodexCustomContextProxy(scopedProxyKey);
             const error = new Error('shared-provider Codex host requires the local proxy, but the proxy is not ready');
             (error as { codexSpawnConfigFatal?: boolean }).codexSpawnConfigFatal = true;
@@ -2187,8 +2188,9 @@ export function getMaker(): Maker {
             : {}),
           ...(buildSessionMcpConfig ? { buildSessionMcpConfig } : {}),
           codexProxyActive: ready,
+          ...(ctx.restrictedEgressGuard && usesScopedProxy && ready ? {restrictedEgressGuarded:true as const} : {}),
           codexDefaultModelProviderId: CODEX_GATEWAY_PROVIDER_ID,
-          codexOpenAiWebSocketsEnabled: useOAuthBearer && ready,
+          codexOpenAiWebSocketsEnabled: !ctx.restrictedEgressGuard && useOAuthBearer && ready,
           codexSubagentRoutingProfile,
           ...(smartSubagentConfig
             ? { codexSubagentRoutingSignature: smartSubagentConfig.routingSignature }

@@ -95,3 +95,11 @@ export async function prepareBotPermissionDispatch(session: Session): Promise<()
     };
   }
 }
+
+/** Synchronous permission epoch for a restricted input's per-request HTTP/tool guard. */
+export function captureBotPermissionEpoch(botId:string):()=>void {
+  const owner=getCurrentDbClientSnapshot();if(!owner)throw Error('RESTRICTED_PARTNER_REVOKED');
+  const state=revisionFor(owner,botId),revision=state.revision;
+  const check=()=>{if(owner!==getCurrentDbClientSnapshot() || state.pending || state.revision!==revision)throw Error('RESTRICTED_PARTNER_REVOKED');};
+  check();return check;
+}

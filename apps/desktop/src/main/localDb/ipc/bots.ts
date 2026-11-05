@@ -1,3 +1,4 @@
+import { withRestrictedPartnerChange } from '../../maker-ipc/restrictedPartnerEpoch.js';
 import { emitSessionCreated } from './sessionCreatedBroadcast.js';
 import type { RoutineModel } from '@cindy/maker-scheduler';
 import { todoAccess } from '../../maker-ipc/botTodoAccess.js';
@@ -2043,6 +2044,7 @@ export async function updateBotProfile(raw: unknown, expectedVersion?: number,
   const body =
     raw && typeof raw === 'object' && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
   const id = readText(body.id, 'botId', 128, true);
+  return withRestrictedPartnerChange(id, async () => {
   const owner = captureBotOperationOwner();
   const client = getDbClient();
   if (body.retryInvitation === true) {
@@ -2311,6 +2313,7 @@ export async function updateBotProfile(raw: unknown, expectedVersion?: number,
   owner.assertCurrent();
   broadcastBotProfileChanged({ botId: id, change: 'updated' });
   return profile;
+  });
 }
 
 async function findExistingCindy(client: ReturnType<typeof getDbClient>) {
