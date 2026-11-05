@@ -308,6 +308,8 @@ export class RestrictedMediaAdapter {
               model: b.modelId,
               bytes: input!.bytes,
               mimeType: input!.mimeType,
+              signal: permit.signal,
+              maxResponseBytes: 65536,
             }),
           );
         } else if (request.kind === 'vision') {

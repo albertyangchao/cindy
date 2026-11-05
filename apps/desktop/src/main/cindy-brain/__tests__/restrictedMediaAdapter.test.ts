@@ -450,3 +450,55 @@ it('model cannot select an account-owned voice or cloning resource', async () =>
   expect(s.fetcher).not.toHaveBeenCalled();
   expect(s.ports.claim).not.toHaveBeenCalled();
 });
+
+it('STT active body receives permit signal and abort holds UNKNOWN without resubmit', async () => {
+  vi.useFakeTimers();
+  const s = setup('stt');
+  let signal!: AbortSignal;
+  const cancelled = vi.fn();
+  network.fetch.mockImplementation(async (_url, init) => {
+    signal = init.signal;
+    return new Response(new ReadableStream<Uint8Array>({ cancel: cancelled }));
+  });
+  const pending = s.adapter.execute(s.handle, s.request);
+  const rejected = expect(pending).rejects.toThrow('RESTRICTED_MEDIA_UNKNOWN');
+  await vi.advanceTimersByTimeAsync(0);
+  expect(signal.aborted).toBe(false);
+  s.controller.abort();
+  await rejected;
+  await vi.advanceTimersByTimeAsync(0);
+  expect(signal.aborted).toBe(true);
+  expect(cancelled).toHaveBeenCalledOnce();
+  expect(s.ports.complete).not.toHaveBeenCalled();
+  expect(await s.adapter.execute(s.handle, s.request).catch((error) => error.message)).toBe(
+    'RESTRICTED_MEDIA_DENIED',
+  );
+  expect(network.fetch).toHaveBeenCalledOnce();
+});
+it('STT provider JSON above adapter 64KiB budget becomes UNKNOWN and HELD', async () => {
+  const s = setup('stt');
+  network.fetch.mockResolvedValue(new Response(JSON.stringify({ text: 'x'.repeat(65536) })));
+  await expect(s.adapter.execute(s.handle, s.request)).rejects.toThrow('RESTRICTED_MEDIA_UNKNOWN');
+  expect(s.ports.complete).not.toHaveBeenCalled();
+  expect(await s.adapter.execute(s.handle, s.request)).toEqual({ state: 'HELD' });
+  expect(network.fetch).toHaveBeenCalledOnce();
+});
+it('STT deadline aborts pending body, ignores late completion and never dispatches twice', async () => {
+  vi.useFakeTimers();
+  const s = setup('stt');
+  const cancelled = vi.fn();
+  let signal!: AbortSignal;
+  network.fetch.mockImplementation(async (_url, init) => {
+    signal = init.signal;
+    return new Response(new ReadableStream<Uint8Array>({ cancel: cancelled }));
+  });
+  const pending = s.adapter.execute(s.handle, s.request);
+  const rejected = expect(pending).rejects.toThrow('RESTRICTED_MEDIA_UNKNOWN');
+  await vi.advanceTimersByTimeAsync(30001);
+  await rejected;
+  expect(signal.aborted).toBe(true);
+  expect(cancelled).toHaveBeenCalledOnce();
+  expect(s.ports.complete).not.toHaveBeenCalled();
+  expect(await s.adapter.execute(s.handle, s.request)).toEqual({ state: 'HELD' });
+  expect(network.fetch).toHaveBeenCalledOnce();
+});

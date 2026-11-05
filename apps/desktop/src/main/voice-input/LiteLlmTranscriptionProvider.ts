@@ -17,6 +17,9 @@ export type LiteLlmAudioFileTranscriptionInput = {
   model?: string;
   sourceLanguage?: string;
   bytes: Buffer | Uint8Array;
+  /** Trusted restricted-run transport fences; absent preserves existing callers. */
+  signal?: AbortSignal;
+  maxResponseBytes?: number;
   mimeType?: string;
   fileName?: string;
 };
@@ -93,12 +96,25 @@ export class LiteLlmTranscriptionProvider implements AsrProvider {
   }
 }
 
-export async function transcribeLiteLlmAudioFile(input: LiteLlmAudioFileTranscriptionInput): Promise<string> {
+export async function transcribeLiteLlmAudioFile(
+  input: LiteLlmAudioFileTranscriptionInput,
+): Promise<string> {
+  if (
+    input.maxResponseBytes !== undefined &&
+    (!Number.isSafeInteger(input.maxResponseBytes) ||
+      input.maxResponseBytes < 1024 ||
+      input.maxResponseBytes > 131072)
+  )
+    throw new Error('Invalid transcription response bound');
+  if (input.signal?.aborted) throw new Error('Transcription cancelled');
   if (!input.proxyApiKey) throw new Error('Missing XD Gateway API key');
   if (!input.baseUrl) throw new Error('Missing XD Gateway base URL');
   const bytes = input.bytes instanceof Buffer ? input.bytes : Buffer.from(input.bytes);
   if (bytes.byteLength === 0) return '';
-  const exact = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+  const exact = bytes.buffer.slice(
+    bytes.byteOffset,
+    bytes.byteOffset + bytes.byteLength,
+  ) as ArrayBuffer;
   const fileName = input.fileName?.trim() || fileNameForMimeType(input.mimeType);
   const mimeType = input.mimeType?.trim() || 'application/octet-stream';
   const form = new FormData();
@@ -113,12 +129,17 @@ export async function transcribeLiteLlmAudioFile(input: LiteLlmAudioFileTranscri
       Authorization: `Bearer ${input.proxyApiKey}`,
     },
     body: form,
+    ...(input.signal ? { signal: input.signal } : {}),
+    ...(input.maxResponseBytes ? { redirect: 'error' as const } : {}),
   });
 
   // proxyApiKey is the Cindy AI key sent to the Cindy gateway. Report on the status
   // before reading the body so an interrupted body read cannot drop the report.
   if (response.status === 401) reportCindyGatewayKeyRejected(input.proxyApiKey);
-  const text = await response.text();
+  const text =
+    input.maxResponseBytes !== undefined || input.signal
+      ? await boundedTranscriptionText(response, input.maxResponseBytes ?? Infinity, input.signal)
+      : await response.text();
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
@@ -130,9 +151,7 @@ export async function transcribeLiteLlmAudioFile(input: LiteLlmAudioFileTranscri
     throw new Error(transcriptionErrorMessage(parsed, text, response.status));
   }
 
-  return isRecord(parsed) && typeof parsed.text === 'string'
-    ? parsed.text.trim()
-    : '';
+  return isRecord(parsed) && typeof parsed.text === 'string' ? parsed.text.trim() : '';
 }
 
 function joinProxyPath(baseUrl: string, endpointPath: string): string {
@@ -140,8 +159,10 @@ function joinProxyPath(baseUrl: string, endpointPath: string): string {
 }
 
 function fileNameForMimeType(mimeType: string | undefined): string {
-  if (mimeType === 'audio/wav' || mimeType === 'audio/wave' || mimeType === 'audio/x-wav') return 'dictation.wav';
-  if (mimeType === 'audio/mp4' || mimeType === 'audio/m4a' || mimeType === 'audio/x-m4a') return 'dictation.m4a';
+  if (mimeType === 'audio/wav' || mimeType === 'audio/wave' || mimeType === 'audio/x-wav')
+    return 'dictation.wav';
+  if (mimeType === 'audio/mp4' || mimeType === 'audio/m4a' || mimeType === 'audio/x-m4a')
+    return 'dictation.m4a';
   if (mimeType === 'audio/mpeg') return 'dictation.mp3';
   if (mimeType === 'audio/webm') return 'dictation.webm';
   if (mimeType === 'audio/ogg') return 'dictation.ogg';
@@ -185,4 +206,51 @@ function transcriptionErrorMessage(parsed: unknown, raw: string, status: number)
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
+}
+
+async function boundedTranscriptionText(
+  response: Response,
+  max: number,
+  signal?: AbortSignal,
+): Promise<string> {
+  const reader = response.body?.getReader();
+  if (!reader) throw new Error('Missing transcription response');
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  let cancelled = false;
+  const cancel = () => {
+    if (cancelled) return;
+    cancelled = true;
+    // A provider's cleanup acknowledgement must not delay local cancellation.
+    void reader.cancel().catch(() => undefined);
+  };
+  let onAbort: (() => void) | undefined;
+  const aborted = signal
+    ? new Promise<never>((_resolve, reject) => {
+        onAbort = () => {
+          cancel();
+          reject(new Error('Transcription cancelled'));
+        };
+        signal.addEventListener('abort', onAbort, { once: true });
+        if (signal.aborted) onAbort();
+      })
+    : undefined;
+  try {
+    for (;;) {
+      const next = reader.read();
+      const part = await (aborted ? Promise.race([next, aborted]) : next);
+      if (signal?.aborted) throw new Error('Transcription cancelled');
+      if (part.value) {
+        size += part.value.byteLength;
+        if (size > max) throw new Error('Transcription response limit');
+        chunks.push(Uint8Array.from(part.value));
+      }
+      if (part.done) break;
+    }
+    return Buffer.concat(chunks).toString('utf8');
+  } finally {
+    if (onAbort) signal!.removeEventListener('abort', onAbort);
+    cancel();
+    reader.releaseLock();
+  }
 }
