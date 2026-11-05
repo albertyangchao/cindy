@@ -83,7 +83,7 @@ function fixture() {
         session_id TEXT REFERENCES sessions(id) ON DELETE SET NULL, event_type TEXT NOT NULL,
         payload_json TEXT NOT NULL, created_at INTEGER NOT NULL
       );
-    
+
  CREATE TABLE messages(id TEXT PRIMARY KEY,client_id TEXT,session_id TEXT,role TEXT,content TEXT,tool_use_id TEXT,agent_meta TEXT,agent_kind TEXT,created_at INTEGER,rewind_at INTEGER,UNIQUE(session_id,client_id));
  CREATE TABLE plugin_task_requests(id TEXT PRIMARY KEY,plugin_id TEXT,operation TEXT,target_id TEXT,request_key TEXT,fingerprint TEXT,payload TEXT,revision INTEGER,created_at INTEGER,UNIQUE(plugin_id,operation,target_id,request_key));
  INSERT INTO bot_profiles(id,display_name,description,avatar,avatar_color,status,current_version,created_at,updated_at)VALUES('bot','Synthetic','','','blue','active',1,1,1);
