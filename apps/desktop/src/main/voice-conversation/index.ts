@@ -382,3 +382,16 @@ export function registerVoiceConversationIpc(deps: {
     ),
   );
 }
+
+/** Main-only explicit per-partner speech preference; no new default/provider or credential channel. */
+export async function restrictedPartnerSpeechConfiguration(partnerId:string,current:()=>void=()=>{}){
+ current();
+ const {voiceInputDataStore}=await import('../voice-input/VoiceInputDataStore.js');
+ current();const selection=companionVoicePreference(voiceInputDataStore.getSettings(),partnerId).selection;
+ if(!selection||!selection.providerId||!selection.voice||isAppSessionBoundaryPending())return undefined;
+ const deps:SpeechCatalogDeps={catalog:getActiveCatalog(),gatewayAllowed:getAppCapabilities().canUseCindyGateway,disabled:isProviderModelRouteDisabled,
+  visibilityOverride:getModelVisibilityOverride,readKey:readCustomProviderKey,
+  readOAuthToken:(id,oauth)=>readCachedGenericOAuthAccessToken(storedCustomProviderId(id),oauth),
+  gatewayConnection:()=>({baseUrl:effectiveXdGatewayBaseUrl(),apiKey:getProviderSecretStore().get('xd')??''})};
+ try{if(resolveSpeechConnection(deps,selection).protocol!=='openai')return undefined;return {assertCurrent:()=>{if(JSON.stringify(companionVoicePreference(voiceInputDataStore.getSettings(),partnerId).selection)!==JSON.stringify(selection)||isProviderModelRouteDisabled(selection.providerId!,selection.modelId))throw Error('RESTRICTED_MEDIA_DENIED');},route:{providerId:selection.providerId,modelId:selection.modelId,voice:selection.voice},config:{connection:resolveSpeechConnection(deps,selection),fetch:outboundFetch,voice:selection.voice}};}catch{return undefined;}
+}

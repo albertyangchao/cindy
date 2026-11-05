@@ -15230,7 +15230,27 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
   });
   invalidatePluginCompanions = () => companionHub?.invalidate();
   let pluginTargetReviewReady = false;
+  const restrictedCompletions = new Map<string,(claim:import('./restrictedPartnerExecution.js').RestrictedPartnerClaim,text:string,current:()=>void)=>Promise<void>>();
   const restrictedPartnerHost = createRestrictedPartnerHost({
+    executionReady: async()=>{
+      const status=getCachedBinaryStatus('codex');if(process.platform!=='darwin'||!status.binaryReady||!status.binaryPath)return false;
+      const version=await (await import('../agent-binaries/binary-version-probe.js')).probeBinaryVersion(status.binaryPath);
+      const after=getCachedBinaryStatus('codex');return version==='0.166.0'&&after.binaryReady&&after.binaryPath===status.binaryPath;
+    },
+    mediaConfiguration: async (id,current) => {current();const media=await import('./restrictedPartnerMedia.js');current();return media.restrictedMediaConfiguration(id,current);},
+    prepare: async (grant,claim,route,current,assets) => {
+      const snapshot=getCurrentDbClientSnapshot(); if(!snapshot)throw Error('HOST_NOT_READY');
+      const guard=()=>{current();if(getCurrentDbClientSnapshot()!==snapshot)throw Error('PERMISSION_DENIED');};
+      const ownerScope=captureDataOwnerBroadcastScope();
+      const conversation=await (await import('./restrictedPartnerConversation.js')).restrictedConversation(snapshot.client,grant,claim,route,guard,{
+        created: id=>{guard();if(!isDataOwnerBroadcastScopeCurrent(ownerScope))throw Error('PERMISSION_DENIED');emitSessionCreated(id);},
+        message: async(id,row)=>{const {messageToCamel}=await import('../localDb/mapper.js');guard();const {broadcastMessageRow}=await import('../localDb/ipc/messages.js');guard();if(!isDataOwnerBroadcastScopeCurrent(ownerScope))throw Error('PERMISSION_DENIED');broadcastMessageRow(id,messageToCamel(row),ownerScope);},
+      });guard();
+      const media=await (await import('./restrictedPartnerMedia.js')).restrictedPartnerMedia(snapshot.client,grant,claim,guard,assets,conversation.laneSessionId);guard();
+      restrictedCompletions.set(claim.runId,conversation.append);
+      return {context:conversation.context+'\n'+media.context,tools:[...conversation.tools,...media.tools],laneSessionId:conversation.laneSessionId,outputs:media.outputs};
+    },
+    afterComplete: async(claim,text,current)=>{const append=restrictedCompletions.get(claim.runId);if(!append)throw Error('RESTRICTED_PARTNER_HISTORY_DENIED');try{await append(claim,text,current);}finally{restrictedCompletions.delete(claim.runId);}},
     snapshot: () => {
       const snapshot = getCurrentDbClientSnapshot();
       if (!snapshot) throw new Error('HOST_NOT_READY');
@@ -15238,7 +15258,15 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     },
     approvalRevision: pluginTargetAuthorizationRevision,
     partnerAuthority:id=>{const profile=captureRestrictedPartnerEpoch(id),permissions=captureBotPermissionEpoch(id);return()=>{profile();permissions();};},
-    candidates: () => listPluginTargetCandidates('bot'),
+    candidates: async () => {
+      const supported=[];
+      for(const candidate of await listPluginTargetCandidates('bot')) {
+        const sessionId=await resolvePluginTargetSession('bot',candidate.id);
+        const meta=await maker.getSessionMeta(sessionId);
+        if(meta?.agentKind==='codex' && !meta.remoteHostId && !meta.agentDeviceId && getSessionProvider(sessionId))supported.push(candidate);
+      }
+      return supported;
+    },
     partner: async id => {
       const snapshot=getCurrentDbClientSnapshot();
       if(!snapshot)throw new Error('HOST_NOT_READY');
@@ -15257,6 +15285,7 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       if(!providerId)throw new Error('ROUTE_UNAVAILABLE');
       const execution=await resolveSessionExecution({agentKind:'codex',model:meta.model,providerId,effort:meta.effort},sessionId);
       if(execution.agentKind!=='codex')throw new Error('RESTRICTED_PARTNER_RUNNER_UNSUPPORTED');
+      if(execution.providerId!==providerId)throw new Error('RESTRICTED_PARTNER_ROUTE_UNSUPPORTED');
       // A fresh Host-owned workspace, never the partner's private canonical cwd.
       const workingDir=await fsp.mkdtemp(path.join(await (async()=>{
         const root=ownerScopedUserDataPath('restricted-partner-inputs');await fsp.mkdir(root,{recursive:true,mode:0o700});return root;
@@ -15269,7 +15298,7 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       if(!win || win.isDestroyed() || !isTrustedAppRendererWindow(win))return {approved:false,paths:[]};
       const result=await dialog.showMessageBox(win,{type:'question',title:t('restrictedPartner.title'),
         message:t('restrictedPartner.message').replace('{{partner}}',input.label),
-        detail:t('restrictedPartner.detail')+'\n\n'+(getInstalledGhostName(input.pluginId)??input.pluginId)+' / '+input.principalId,buttons:[t('pluginCompanionAnswer.allow'),t('pluginCompanionAnswer.cancel')],defaultId:1,cancelId:1});
+        detail:t('restrictedPartner.detail')+'\nScoped channel history, subject memory CAS, approved resource readers and available configured Core media routes only. No shell or unscoped integrations.\n'+JSON.stringify(input.mediaRoutes??{})+'\n'+'\n\n'+(getInstalledGhostName(input.pluginId)??input.pluginId)+' / '+input.principalId,buttons:[t('pluginCompanionAnswer.allow'),t('pluginCompanionAnswer.cancel')],defaultId:1,cancelId:1});
       if(result.response!==0)return {approved:false,paths:[]};
       if(!input.chooseResources)return {approved:true,paths:[]};
       const selected=await dialog.showOpenDialog(win,{title:t('restrictedPartner.resources'),properties:['openFile','openDirectory','multiSelections']});

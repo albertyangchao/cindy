@@ -128,6 +128,7 @@ export interface SessionLifecycleHooks {
 }
 
 export interface MakerDeps {
+  assertOrdinarySession?: (sessionId:string)=>Promise<void>;
   agents: Partial<Record<AgentKind, BaseAgent>>;
   /**
    * 可选：在同账号另一台电脑上启动 Agent(CreateSessionOptions.agentDeviceId)。返回的句柄由
@@ -493,6 +494,7 @@ function isUnfinishedRemoteTurnEvent(evt: AgentEvent): boolean {
 }
 
 export class Maker {
+  private readonly assertOrdinarySession?: (sessionId:string)=>Promise<void>;
   protected readonly agents: Partial<Record<AgentKind, BaseAgent>>;
   protected readonly storage: SessionStorage;
   protected readonly logger: Logger;
@@ -551,6 +553,7 @@ export class Maker {
   private readonly startDeviceAgentSession: MakerDeps['startDeviceAgentSession'];
 
   constructor(deps: MakerDeps) {
+    this.assertOrdinarySession=deps.assertOrdinarySession;
     this.agents = deps.agents;
     this.storage = deps.storage;
     this.startDeviceAgentSession = deps.startDeviceAgentSession;
@@ -653,6 +656,7 @@ export class Maker {
    * 继续聊"以及多个后台入口同时恢复同一会话的场景。
    */
   async createSession(opts: CreateSessionOptions, signal?: AbortSignal): Promise<Session> {
+    if(opts.sessionId && this.assertOrdinarySession)await this.assertOrdinarySession(opts.sessionId);
     signal?.throwIfAborted();
     if (this.shutdownStarted) {
       throw new Error('Maker is shutting down; refusing to create a new session');

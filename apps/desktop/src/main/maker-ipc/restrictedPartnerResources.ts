@@ -79,7 +79,7 @@ export function restrictedPartnerResources(
   return {
     context: resources.length
       ? JSON.stringify({
-          approvedResources: resources.map((r) => ({ id: r.id, name: path.basename(r.path) })),
+          approvedResources: resources.map((r) => ({ id: r.id, name: path.basename(r.path).slice(0,80) })),
         })
       : '',
     tools: resources.length

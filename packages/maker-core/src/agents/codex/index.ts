@@ -11709,6 +11709,7 @@ assertRouteCurrent();
       deadTurnId: string | null,
       policy: TurnReplayRetryPolicy = CAPACITY_RETRY_POLICY,
     ): { attempt: number; maxAttempts: number } | null => {
+      if(restricted)return null; // A claimed external input is never automatically replayed.
       const state = overloadRetry;
       if (!state || closed) return null;
       // 本轮已被取消(sendOpts.signal 已 abort)→ 一律不接管, 让这条错误走原终态路径收口。
@@ -13805,7 +13806,7 @@ assertRouteCurrent();
           if (isLocalAcceptBoundaryError(e)) {
             throw e;
           }
-          if (/thread not found/i.test(String(e))) {
+          if (!restricted && /thread not found/i.test(String(e))) {
             log.info('turn/start hit "thread not found" — daemon likely restarted, attempting thread/resume + retry', {
               threadId,
             });

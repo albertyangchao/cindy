@@ -9738,7 +9738,7 @@ export function registerGhostIpc(): void {
       try { return { ok: true, data: await pluginTargetSlot.handle(id, payload, assertAuthorized) }; }
       catch (error) {
         const rawCode = (error as { code?: unknown })?.code ?? (error instanceof Error ? error.message : '');
-        const code = ['RESTRICTED_PARTNER_RUNNER_UNSUPPORTED', 'RESTRICTED_PARTNER_NO_RESUBMIT', 'RESTRICTED_PARTNER_INPUT_CONFLICT', 'RESTRICTED_PARTNER_REVOKED', 'RESTRICTED_PARTNER_GRANT_INVALID', 'RESTRICTED_PARTNER_PERSONA_CHANGED', 'PERMISSION_DENIED', 'HOST_NOT_READY', 'INVALID_PARAMS', 'INVALID_ATTACHMENTS', 'INVALID_INVOCATION', 'TASK_BUSY', 'TARGET_UNAVAILABLE', 'SUPERSEDED', 'REQUEST_KEY_CONFLICT', 'DELIVERY_UNCERTAIN', 'DELIVERY_REJECTED', 'STALE_REVISION', 'ROUTE_UNAVAILABLE'].includes(String(rawCode)) ? String(rawCode) : 'HOST_NOT_READY';
+        const code = ['RESTRICTED_MEDIA_DENIED','RESTRICTED_MEDIA_UNKNOWN','RESTRICTED_PARTNER_HISTORY_DENIED','RESTRICTED_PARTNER_CHANNEL_READ_ONLY','RESTRICTED_PARTNER_ROUTE_UNSUPPORTED', 'RESTRICTED_PARTNER_ASYNC_AUTHORITY', 'RESTRICTED_PARTNER_CLAIM_INVALID', 'RESTRICTED_PARTNER_CLEANUP_UNKNOWN', 'RESTRICTED_PARTNER_EGRESS_UNPROVEN', 'RESTRICTED_PARTNER_EXECUTION_IDENTITY_UNKNOWN', 'RESTRICTED_PARTNER_EXECUTION_UNKNOWN', 'RESTRICTED_PARTNER_GRANT_CONFLICT', 'RESTRICTED_PARTNER_GRANT_INVALID', 'RESTRICTED_PARTNER_INPUT_CONFLICT', 'RESTRICTED_PARTNER_INPUT_INVALID', 'RESTRICTED_PARTNER_INVALID', 'RESTRICTED_PARTNER_NATIVE_VERSION_UNVERIFIED', 'RESTRICTED_PARTNER_NO_RESUBMIT', 'RESTRICTED_PARTNER_OUTPUT_INVALID', 'RESTRICTED_PARTNER_OUTPUT_LIMIT', 'RESTRICTED_PARTNER_PAUSED', 'RESTRICTED_PARTNER_PERSONA_CHANGED', 'RESTRICTED_PARTNER_RESOURCE_DENIED', 'RESTRICTED_PARTNER_RESULT_CONFLICT', 'RESTRICTED_PARTNER_REVOKED', 'RESTRICTED_PARTNER_RUNNER_UNSUPPORTED', 'RESTRICTED_PARTNER_SCOPE_DENIED', 'RESTRICTED_PARTNER_TOOL_INVALID', 'PERMISSION_DENIED', 'HOST_NOT_READY', 'INVALID_PARAMS', 'INVALID_ATTACHMENTS', 'INVALID_INVOCATION', 'TASK_BUSY', 'TARGET_UNAVAILABLE', 'SUPERSEDED', 'REQUEST_KEY_CONFLICT', 'DELIVERY_UNCERTAIN', 'DELIVERY_REJECTED', 'STALE_REVISION', 'ROUTE_UNAVAILABLE'].includes(String(rawCode)) ? String(rawCode) : 'HOST_NOT_READY';
         return { ok: false, error: { code, message: code, retryable: code === 'TASK_BUSY' } };
       }
     }
@@ -11426,4 +11426,15 @@ function broadcastGhostRuntimeStates(): void {
 export function refreshInstalledPluginApps(): void {
   refreshPluginApps(getGhostManager().list(), { find: findGhostForInstanceId,
     evidence: id => getGhostManager().approvedInstallEvidence(id), available: () => !isGhostBoundaryPending() });
+}
+
+/** Main-only restricted media adapter reuses the existing executable Core registry. No IPC/exported secrets. */
+export function restrictedPartnerImageConfiguration() {
+  const routes: Partial<Record<'draw'|'edit',{providerId:string;modelId:string}>>={};
+  for(const [kind,capability] of [['draw','image.generate'],['edit','image.edit']] as const){
+    const config=getMediaPreferenceConfig(capability);
+    const chosen=config.models.find(m=>m.id===config.defaults?.standard);
+    if(chosen && chosen.providerId==='xd'){try{const channel=resolveImageChannelForModel(chosen.modelId,kind==='edit'?'edit':'generate',chosen.providerId);if(channel.legacyCompatible===false)continue;routes[kind]={providerId:chosen.providerId,modelId:chosen.modelId};}catch{/* Configured source is not currently executable; never advertise it. */}}
+  }
+  return {images:getImageChannelRegistry(),routes};
 }

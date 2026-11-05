@@ -166,6 +166,8 @@ describe.skipIf(!binaryPath || process.platform !== "darwin")(
               "-c",
               "model_providers.fixture.requires_openai_auth=false",
               "-c",
+              "model_providers.fixture.stream_max_retries=0",
+              "-c",
               "model_providers.fixture.request_max_retries=0",
             ],
             extraEnv: {},
@@ -293,5 +295,125 @@ describe.skipIf(!binaryPath || process.platform !== "darwin")(
         }
       }
     }, 30_000);
+  },
+);
+
+describe.skipIf(!binaryPath || process.platform !== "darwin")(
+  "restricted native uncertain provider",
+  () => {
+    it("does not resubmit a failed native model request or accept a duplicate input", async () => {
+      const root = await mkdtemp(
+        path.join(tmpdir(), "cindy-restricted-no-retry-"),
+      );
+      const home = path.join(root, "home"),
+        work = path.join(root, "work");
+      let calls = 0;
+      await mkdir(home);
+      await mkdir(work);
+      const server = createServer((req, res) => {
+        calls++;
+        req.resume();
+        res
+          .writeHead(503, { "content-type": "application/json" })
+          .end('{"error":{"message":"synthetic upstream failure"}}');
+      });
+      await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+      const endpoint = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+      const agent = new CodexAgent({
+        binaryPath: binaryPath!,
+        logger,
+        runtimeConfig: {},
+        resolveCodexLocalAuthPolicy: () => "isolated",
+        prepareCodexExtraSpawnConfig: async () => ({
+          codexProxyActive: true,
+          restrictedEgressGuarded: true,
+          extraEnv: {},
+          extraArgs: [
+            "-c",
+            'model_provider="fixture"',
+            "-c",
+            'model_providers.fixture.name="Fixture"',
+            "-c",
+            `model_providers.fixture.base_url="${endpoint}"`,
+            "-c",
+            'model_providers.fixture.wire_api="responses"',
+            "-c",
+            "model_providers.fixture.requires_openai_auth=false",
+            "-c",
+            "model_providers.fixture.request_max_retries=0",
+            "-c",
+            "model_providers.fixture.stream_max_retries=0",
+            "-c",
+            "model_providers.fixture.supports_websockets=false",
+          ],
+        }),
+        auth: {
+          getState: async () => ({ authenticated: true }),
+          triggerLogin: async () => ({ authenticated: true }),
+          logout: async () => {},
+          getAuthEnv: async () => ({
+            HOME: root,
+            USERPROFILE: root,
+            APPDATA: root,
+            LOCALAPPDATA: root,
+            CODEX_HOME: home,
+            TMPDIR: root,
+            OPENAI_API_KEY: "",
+            CODEX_API_KEY: "",
+            HTTP_PROXY: "http://127.0.0.1:1",
+            HTTPS_PROXY: "http://127.0.0.1:1",
+            ALL_PROXY: "http://127.0.0.1:1",
+            NO_PROXY: "127.0.0.1,localhost",
+          }),
+        },
+      });
+      try {
+        const handle = await agent.startSession({
+          sessionId: "uncertain-run",
+          model: "fixture-model",
+          providerId: "cprov-fixture",
+          workingDir: work,
+          [RESTRICTED_PARTNER]: mintRestrictedPartnerInput(
+            {
+              version: 1,
+              partnerId: "bot_existing",
+              principalId: "subject",
+              grantId: "grant",
+              grantRevision: 1,
+              inputId: "input",
+              runId: "uncertain-run",
+            },
+            { instructions: "Approved persona", readPaths: [] },
+            () => {},
+          ),
+        });
+        const terminal = (async () => {
+          for await (const e of handle.events())
+            if (e.type === "error" || e.type === "done") return;
+          throw Error("MISSING_TERMINAL");
+        })();
+        void terminal.catch(() => {});
+        try {
+          await handle.send(
+            { type: "user", content: "Synthetic question" },
+            { throwOnStartFailure: true },
+          );
+        } catch {}
+        await terminal;
+        expect(calls).toBe(1);
+        await expect(
+          handle.send(
+            { type: "user", content: "duplicate" },
+            { throwOnStartFailure: true },
+          ),
+        ).rejects.toThrow("NO_RESUBMIT");
+        expect(calls).toBe(1);
+        await handle.close();
+      } finally {
+        await agent.dispose();
+        await new Promise<void>((r) => server.close(() => r()));
+        await rm(root, { recursive: true, force: true });
+      }
+    }, 30000);
   },
 );

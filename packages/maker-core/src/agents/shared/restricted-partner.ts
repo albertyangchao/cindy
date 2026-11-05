@@ -141,6 +141,8 @@ export function restrictedPartnerInput(
 export const RESTRICTED_CODEX_CONFIG: Readonly<Record<string, unknown>> =
   Object.freeze({
     project_doc_max_bytes: 0,
+    check_for_update_on_startup: false,
+    "analytics.enabled": false,
     "features.shell_tool": false,
     "features.unified_exec": false,
     "features.shell_snapshot": false,

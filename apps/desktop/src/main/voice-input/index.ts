@@ -2679,3 +2679,11 @@ function logRefineSummary(event: VoiceTimelineEvent, context: DictationRefinemen
     });
   }
 }
+
+/** No fallback/realtime reinterpretation: only an explicitly selected existing batch transport. */
+export function restrictedPartnerTranscriptionConfiguration(current:()=>void=()=>{}){
+ current();
+ if(getVoiceInputModelSelection().asrProvider!=='litellm-batch')return undefined;
+ const configured=readLiteLlmProxyConfig();if(!configured.proxyApiKey||!configured.proxyBaseUrl)return undefined;
+ return {assertCurrent:()=>{if(getVoiceInputModelSelection().asrProvider!=='litellm-batch'||JSON.stringify(readLiteLlmProxyConfig())!==JSON.stringify(configured))throw Error('RESTRICTED_MEDIA_DENIED');},route:{providerId:'xd',modelId:getVoiceInputAsrProfile('litellm-batch').model},config:{proxyApiKey:configured.proxyApiKey,baseUrl:configured.proxyBaseUrl}};
+}

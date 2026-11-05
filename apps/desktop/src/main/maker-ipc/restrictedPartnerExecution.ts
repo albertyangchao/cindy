@@ -21,6 +21,41 @@ export interface RestrictedPartnerGrant {
   resources: Array<{ id: string; path: string }>;
   dispatchEpoch: number;
   dispatchEnabled: boolean;
+  media?: Partial<
+    Record<
+      'vision' | 'draw' | 'edit' | 'stt' | 'tts',
+      { providerId: string; modelId: string; voice?: string }
+    >
+  >;
+}
+export interface RestrictedChannelInput {
+  domainId: string;
+  principalId: string;
+  connectionId: string;
+  generation: string;
+  chatId: string;
+  eventId: string;
+  revision: number;
+  epoch: number;
+  memoryRead?: boolean;
+}
+export interface RestrictedInputAsset {
+  id: string;
+  sha256: string;
+  mimeType: string;
+  base64: string;
+  sourceSha256: string;
+  partial: boolean;
+}
+export interface RestrictedOutputAsset {
+  kind: 'draw' | 'edit' | 'tts';
+  id: string;
+  sha256: string;
+  mimeType: string;
+  base64: string;
+  binding: import('../cindy-brain/restrictedMediaAdapter.js').MediaBinding;
+  requestHash: string;
+  inputSha256: string;
 }
 export interface RestrictedPartnerClaim {
   version: 1;
@@ -37,15 +72,17 @@ export interface RestrictedPartnerClaim {
   routeFingerprint?: string;
   outputMessageId?: string;
   output?: string;
+  inputText?: string;
+  channel?: RestrictedChannelInput;
+  assets?: RestrictedOutputAsset[];
+  laneSessionId?: string;
 }
 export interface RestrictedPartnerPorts {
   /** Captured account/install identity; synchronous invalidation used by native dispatch/read handlers. */
   assertCurrent(grant: RestrictedPartnerGrant): void;
   readGrant(id: string): Promise<RestrictedPartnerGrant | undefined>;
   /** Exact existing active partner, approved persona and separately scoped memory/resources only. */
-  project(
-    grant: RestrictedPartnerGrant,
-  ): Promise<{
+  project(grant: RestrictedPartnerGrant): Promise<{
     persona: string;
     subjectContext: string;
     readPaths: string[];
@@ -56,6 +93,19 @@ export interface RestrictedPartnerPorts {
     partnerId: string,
   ): Promise<Pick<StartSessionOptions, 'model' | 'providerId' | 'workingDir' | 'effort'>>;
   start(opts: StartSessionOptions): Promise<AgentSessionHandle>;
+  prepare?(
+    grant: RestrictedPartnerGrant,
+    claim: RestrictedPartnerClaim,
+    route: Pick<StartSessionOptions, 'model' | 'providerId' | 'workingDir' | 'effort'>,
+    current: () => void,
+    assets: RestrictedInputAsset[],
+  ): Promise<{
+    context: string;
+    tools: RestrictedPartnerTool[];
+    outputs(): RestrictedOutputAsset[];
+    laneSessionId: string;
+  }>;
+  afterComplete?(claim: RestrictedPartnerClaim, text: string): Promise<void>;
   onReserved?(claim: RestrictedPartnerClaim): void;
   readClaim(pluginId: string, inputId: string): Promise<RestrictedPartnerClaim | undefined>;
   /** Unique durable insert; must commit UNKNOWN before start/turn effects. */
@@ -66,7 +116,13 @@ export interface RestrictedPartnerPorts {
     nativeThreadId: string,
     routeFingerprint: string,
   ): Promise<boolean>;
-  recordResult(runId: string, outputMessageId: string, output: string): Promise<boolean>;
+  recordResult(
+    runId: string,
+    outputMessageId: string,
+    output: string,
+    assets?: RestrictedOutputAsset[],
+    laneSessionId?: string,
+  ): Promise<boolean>;
   complete(runId: string): Promise<boolean>;
 }
 const sha = (value: string) => createHash('sha256').update(value).digest('hex');
@@ -75,9 +131,12 @@ const fail = (code: string): never => {
 };
 const id = (value: unknown): value is string =>
   typeof value === 'string' && /^[a-zA-Z0-9_.:-]{1,200}$/.test(value);
-export function validGrant(g: RestrictedPartnerGrant | undefined): asserts g is RestrictedPartnerGrant {
+export function validGrant(
+  g: RestrictedPartnerGrant | undefined,
+): asserts g is RestrictedPartnerGrant {
   if (
     !g ||
+    Object.keys(g).some(k=>!['version','id','revision','pluginId','principalId','partnerId','enabled','personaSha256','resourceIds','approvalRevision','resources','dispatchEpoch','dispatchEnabled','media'].includes(k)) ||
     g.version !== 1 ||
     g.enabled !== true ||
     !Number.isSafeInteger(g.revision) ||
@@ -91,10 +150,28 @@ export function validGrant(g: RestrictedPartnerGrant | undefined): asserts g is 
     !Number.isSafeInteger(g.dispatchEpoch) ||
     g.dispatchEpoch < 1 ||
     typeof g.dispatchEnabled !== 'boolean' ||
-    (typeof g.approvalRevision!=='string' || !g.approvalRevision || g.approvalRevision.length>256) ||
+    typeof g.approvalRevision !== 'string' ||
+    !g.approvalRevision ||
+    g.approvalRevision.length > 256 ||
     !Array.isArray(g.resources) ||
     g.resources.length !== g.resourceIds.length ||
     new Set(g.resources.map((r) => r.id)).size !== g.resourceIds.length ||
+    (g.media !== undefined &&
+      (!g.media ||
+        typeof g.media !== 'object' ||
+        Array.isArray(g.media) ||
+        Object.entries(g.media).some(
+          ([k, v]) =>
+            !['vision', 'draw', 'edit', 'stt', 'tts'].includes(k) ||
+            !v ||
+            Object.keys(v).some((f) => !['providerId', 'modelId', 'voice'].includes(f)) ||
+            !id(v.providerId) ||
+            typeof v.modelId !== 'string' ||
+            !v.modelId ||
+            v.modelId.length > 256 ||
+            (v.voice !== undefined &&
+              (k !== 'tts' || typeof v.voice !== 'string' || !v.voice || v.voice.length > 128)),
+        ))) ||
     g.resources.some(
       (r) =>
         !g.resourceIds.includes(r.id) ||
@@ -121,6 +198,8 @@ export function createRestrictedPartnerExecution(ports: RestrictedPartnerPorts) 
       partnerId: string;
       inputId: string;
       text: string;
+      channel?: RestrictedChannelInput;
+      assets?: RestrictedInputAsset[];
     }): Promise<RestrictedPartnerClaim> {
       if (
         ![
@@ -148,6 +227,8 @@ export function createRestrictedPartnerExecution(ports: RestrictedPartnerPorts) 
       const digest = sha(
         JSON.stringify([
           request.text,
+          request.channel ?? null,
+          request.assets ?? [],
           grant.id,
           grant.revision,
           grant.partnerId,
@@ -164,12 +245,12 @@ export function createRestrictedPartnerExecution(ports: RestrictedPartnerPorts) 
           old.principalId !== grant.principalId
         )
           fail('RESTRICTED_PARTNER_INPUT_CONFLICT');
-        const { output, ...metadata } = old;
+        const { output, assets, inputText, ...metadata } = old;
         return old.state === 'COMPLETE' ? old : metadata; // UNKNOWN never authorizes result release/replay.
       }
       const projection = await ports.project(grant);
       await current(grant);
-      if (sha(projection.persona) !== grant.personaSha256)
+      if (projection.persona.length>16000 || sha(projection.persona) !== grant.personaSha256)
         fail('RESTRICTED_PARTNER_PERSONA_CHANGED');
       const route = await ports.route(grant.partnerId);
       await current(grant);
@@ -184,7 +265,18 @@ export function createRestrictedPartnerExecution(ports: RestrictedPartnerPorts) 
         grantRevision: grant.revision,
         inputSha256: digest,
         state: 'UNKNOWN',
+        inputText: request.text,
+        ...(request.channel ? { channel: structuredClone(request.channel) } : {}),
       };
+      let runActive = true;
+      if (!(await ports.reserve(claim))) return fail('RESTRICTED_PARTNER_NO_RESUBMIT');
+      ports.onReserved?.(claim);
+      const assertRun = () => {
+        if (!runActive) fail('RESTRICTED_PARTNER_EXECUTION_UNKNOWN');
+        ports.assertCurrent(grant);
+      };
+      const prepared = await ports.prepare?.(grant, claim, route, assertRun, request.assets ?? []);
+      await current(grant);
       const input = mintRestrictedPartnerInput(
         {
           version: 1,
@@ -196,16 +288,26 @@ export function createRestrictedPartnerExecution(ports: RestrictedPartnerPorts) 
           runId: claim.runId,
         },
         {
-          instructions: [projection.persona, projection.subjectContext]
+          instructions: [projection.persona, projection.subjectContext, prepared?.context]
             .filter(Boolean)
             .join('\n\n'),
           readPaths: projection.readPaths,
-          tools: projection.tools,
+          tools: [...(projection.tools ?? []), ...(prepared?.tools ?? [])].map((tool) => ({
+            ...tool,
+            invoke: async (args: unknown, call: { callId: string; runId: string }) => {
+              try {
+                return await tool.invoke(args, call);
+              } catch {
+                throw Error('RESTRICTED_PARTNER_TOOL_UNCONFIRMED');
+              }
+            },
+          })),
         },
-        () => ports.assertCurrent(grant),
+        () => {
+          if (!runActive) fail('RESTRICTED_PARTNER_EXECUTION_UNKNOWN');
+          ports.assertCurrent(grant);
+        },
       );
-      if (!(await ports.reserve(claim))) return fail('RESTRICTED_PARTNER_NO_RESUBMIT');
-      ports.onReserved?.(claim);
       await current(grant);
       let handle: AgentSessionHandle | undefined;
       let primary: unknown;
@@ -247,7 +349,8 @@ export function createRestrictedPartnerExecution(ports: RestrictedPartnerPorts) 
               const data = event.data as {
                 text?: unknown;
                 agentMessageId?: unknown;
-                phase?: unknown; isFullText?:unknown;
+                phase?: unknown;
+                isFullText?: unknown;
               };
               if (
                 typeof data.text !== 'string' ||
@@ -260,11 +363,12 @@ export function createRestrictedPartnerExecution(ports: RestrictedPartnerPorts) 
               if (old.phase !== undefined && data.phase !== undefined && old.phase !== data.phase)
                 fail('RESTRICTED_PARTNER_OUTPUT_INVALID');
               old.phase = (data.phase as string | undefined) ?? old.phase;
-              const previousLength=old.text.length;
-              old.text=data.isFullText===true ? data.text as string : old.text+(data.text as string);
-              length+=old.text.length-previousLength;
+              const previousLength = old.text.length;
+              old.text =
+                data.isFullText === true ? (data.text as string) : old.text + (data.text as string);
+              length += old.text.length - previousLength;
               blocks.set(key, old);
-              if (length > 256_000) fail('RESTRICTED_PARTNER_OUTPUT_LIMIT');
+              if (length > 120_000) fail('RESTRICTED_PARTNER_OUTPUT_LIMIT');
             }
             if (event.type === 'done') {
               let finals = [...blocks].filter(([, v]) => v.phase === 'final');
@@ -279,16 +383,43 @@ export function createRestrictedPartnerExecution(ports: RestrictedPartnerPorts) 
         })();
         // Observe a rejected collector even if send itself fails; never leave an unhandled promise.
         void collecting.catch(() => undefined);
-        await handle.send({ type: 'user', content: request.text }, { throwOnStartFailure: true });
-        output = await collecting;
+        let deadline: ReturnType<typeof setTimeout> | undefined;
+        try {
+          output = await Promise.race([
+            (async () => {
+              await handle!.send(
+                { type: 'user', content: request.text },
+                { throwOnStartFailure: true },
+              );
+              return await collecting;
+            })(),
+            new Promise<never>((_resolve, reject) => {
+              deadline = setTimeout(() => {
+                runActive = false;
+                reject(Error('RESTRICTED_PARTNER_EXECUTION_UNKNOWN'));
+              }, 120_000);
+            }),
+          ]);
+        } finally {
+          if (deadline !== undefined) clearTimeout(deadline);
+        }
         await current(grant);
         if (!output.trim()) fail('RESTRICTED_PARTNER_EXECUTION_UNKNOWN');
-        if (!(await ports.recordResult(claim.runId, outputMessageId, output)))
+        if (
+          !(await ports.recordResult(
+            claim.runId,
+            outputMessageId,
+            output,
+            prepared?.outputs(),
+            prepared?.laneSessionId,
+          ))
+        )
           fail('RESTRICTED_PARTNER_RESULT_CONFLICT');
       } catch (error) {
         primary = error;
         throw error;
       } finally {
+        runActive = false;
         if (handle)
           try {
             await handle.close();
@@ -307,6 +438,8 @@ export function createRestrictedPartnerExecution(ports: RestrictedPartnerPorts) 
         stored.outputMessageId !== outputMessageId
       )
         fail('RESTRICTED_PARTNER_RESULT_CONFLICT');
+      await ports.afterComplete?.(stored!, request.text);
+      await current(grant);
       return stored!;
     },
   };

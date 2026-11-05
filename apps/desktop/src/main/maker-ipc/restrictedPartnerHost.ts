@@ -11,6 +11,17 @@ import {
 } from './restrictedPartnerExecution.js';
 
 export interface RestrictedPartnerHostDeps {
+  executionReady?(): Promise<boolean>;
+  mediaConfiguration?(
+    partnerId: string,
+    current:()=>void,
+  ): Promise<{ routes: NonNullable<RestrictedPartnerGrant['media']> }>;
+  prepare?: import('./restrictedPartnerExecution.js').RestrictedPartnerPorts['prepare'];
+  afterComplete?(
+    claim: import('./restrictedPartnerExecution.js').RestrictedPartnerClaim,
+    text: string,
+    current: () => void,
+  ): Promise<void>;
   snapshot(): { client: DbClient; assertCurrent(): void };
   approvalRevision(pluginId: string): string | null;
   candidates(): Promise<Array<{ id: string; label: string; detail: string }>>;
@@ -27,6 +38,7 @@ export interface RestrictedPartnerHostDeps {
     partnerId: string;
     label: string;
     chooseResources: boolean;
+    mediaRoutes?: RestrictedPartnerGrant['media'];
   }): Promise<{ approved: boolean; paths: string[] }>;
 }
 const sha = (x: string) => createHash('sha256').update(x).digest('hex');
@@ -45,6 +57,22 @@ const safeGrant = (g: RestrictedPartnerGrant) => ({
   dispatchEnabled: g.dispatchEnabled,
   resourceCount: g.resourceIds.length,
   personaSha256: g.personaSha256,
+  resourceFingerprint: sha(JSON.stringify([g.resourceIds, g.media ?? {}])),
+  mediaRoutes: g.media ?? {},
+  media: Object.fromEntries(
+    ['vision', 'draw', 'edit', 'stt', 'tts'].map((k) => [
+      k,
+      Boolean(g.media?.[k as keyof NonNullable<typeof g.media>]),
+    ]),
+  ),
+  tools: [
+    ...(g.resourceIds.length
+      ? ['partner_resource_read', 'partner_resource_list', 'partner_resource_image']
+      : []),
+    'partner_history',
+    'partner_memory',
+    ...(Object.keys(g.media ?? {}).length ? ['partner_media'] : []),
+  ],
 });
 /** Shared entry for the authorized targets pipe. No ordinary-task fallback. */
 export function createRestrictedPartnerHost(deps: RestrictedPartnerHostDeps) {
@@ -65,22 +93,27 @@ export function createRestrictedPartnerHost(deps: RestrictedPartnerHostDeps) {
     };
     current();
     const store = createRestrictedPartnerStore(snapshot.client, current);
-    if (a.operation === 'capabilities' && Object.keys(a).length === 1)
+    if (a.operation === 'capabilities' && Object.keys(a).length === 1) {
+      const ready = process.platform === 'darwin' && (await deps.executionReady?.()) === true;
+      current();
       return {
         version: 1,
-        execution: process.platform === 'darwin',
+        execution: ready,
         runner: 'codex',
-        verifiedNativeVersion: '0.166.0',
+        supportedNativeVersion: '0.166.0',
+        nativeVersionConfirmed: ready,
         nativeIsolation: true,
         files: 'explicit-owner-read-grants',
-        history: 'per-input-only',
-        memory: 'explicit-owner-read-grants',
-        tools: 'scoped-reads-only',
+        history: deps.prepare ? 'native-channel-scoped' : 'per-input-only',
+        memory: deps.prepare ? 'subject-persistent-cas' : 'explicit-owner-read-grants',
+        tools: deps.prepare ? 'scoped-core-tools' : 'scoped-reads-only',
         credentials: 'host-only',
         egress: 'original-caller-only',
-        media: false,
+        media: deps.mediaConfiguration ? 'owner-approved-core-routes' : false,
+        unsupported: ['unscoped-mcp', 'shell', 'remote-runner', 'claude-code', 'pi'],
         normalTasksFallback: false,
       };
+    }
     if (a.operation === 'list' && Object.keys(a).length === 1) {
       const partners = await deps.candidates();
       current();
@@ -90,6 +123,9 @@ export function createRestrictedPartnerHost(deps: RestrictedPartnerHostDeps) {
     if (!id(principalId)) return fail('INVALID_PARAMS');
     const grantId = sha(JSON.stringify([pluginId, principalId]));
     if (a.operation === 'bind') {
+      if (deps.executionReady && !(await deps.executionReady()))
+        return fail('RESTRICTED_PARTNER_NATIVE_VERSION_UNVERIFIED');
+      current();
       if (
         Object.keys(a).some(
           (k) =>
@@ -120,6 +156,9 @@ export function createRestrictedPartnerHost(deps: RestrictedPartnerHostDeps) {
         current();
         if ((old?.revision ?? 0) !== a.expectedRevision) return fail('STALE_REVISION');
         const profile = await deps.partner(partner.id);
+        if(profile.persona.length>16000)return fail('TARGET_UNAVAILABLE');
+        current();
+        const media = await deps.mediaConfiguration?.(partner.id, current);
         current();
         const decision = await deps.confirm({
           pluginId,
@@ -127,6 +166,7 @@ export function createRestrictedPartnerHost(deps: RestrictedPartnerHostDeps) {
           partnerId: partner.id,
           label: partner.label,
           chooseResources: a.chooseResources === true,
+          mediaRoutes: media?.routes,
         });
         current();
         if (!decision.approved) return fail('PERMISSION_DENIED');
@@ -152,6 +192,7 @@ export function createRestrictedPartnerHost(deps: RestrictedPartnerHostDeps) {
           resources,
           dispatchEpoch: 1,
           dispatchEnabled: false,
+          ...(media ? { media: media.routes } : {}),
         };
         if (!(await store.compareAndSwapGrant(grant, Number(a.expectedRevision))))
           return fail('STALE_REVISION');
@@ -186,8 +227,28 @@ export function createRestrictedPartnerHost(deps: RestrictedPartnerHostDeps) {
     if (
       a.operation === 'binding' &&
       Object.keys(a).every((k) => ['operation', 'principalId'].includes(k))
-    )
-      return safeGrant(grant);
+    ) {
+      const media = await deps.mediaConfiguration?.(grant.partnerId, () => assertGrant(grant));
+      assertGrant(grant);
+      const unresolvedCount = await store.unresolvedCount(pluginId, principalId);
+      assertGrant(grant);
+      return {
+        unresolvedCount,
+        ...safeGrant(grant),
+        media: Object.fromEntries(
+          ['vision', 'draw', 'edit', 'stt', 'tts'].map((kind) => {
+            const k = kind as keyof NonNullable<RestrictedPartnerGrant['media']>;
+            return [
+              kind,
+              Boolean(
+                grant.media?.[k] &&
+                JSON.stringify(grant.media[k]) === JSON.stringify(media?.routes[k]),
+              ),
+            ];
+          }),
+        ),
+      };
+    }
     if (
       ['fence', 'resume'].includes(String(a.operation)) &&
       Object.keys(a).every((k) => ['operation', 'principalId', 'expectedRevision'].includes(k))
@@ -243,9 +304,10 @@ export function createRestrictedPartnerHost(deps: RestrictedPartnerHostDeps) {
         claim.principalId !== principalId
       )
         return fail('PERMISSION_DENIED');
-      const { output, ...metadata } = claim;
+      const { output, assets, inputText, ...metadata } = claim;
+      const released = { ...metadata, output, assets };
       return {
-        ...(claim.state === 'COMPLETE' ? claim : metadata),
+        ...(claim.state === 'COMPLETE' ? released : metadata),
         runningObserved: jobs.has(claim.runId),
       };
     }
@@ -253,9 +315,16 @@ export function createRestrictedPartnerHost(deps: RestrictedPartnerHostDeps) {
       a.operation !== 'submit' ||
       Object.keys(a).some(
         (k) =>
-          !['operation', 'principalId', 'partnerId', 'grantRevision', 'inputId', 'text'].includes(
-            k,
-          ),
+          ![
+            'operation',
+            'principalId',
+            'partnerId',
+            'grantRevision',
+            'inputId',
+            'text',
+            'channel',
+            'assets',
+          ].includes(k),
       ) ||
       a.partnerId !== grant.partnerId ||
       a.grantRevision !== grant.revision ||
@@ -263,6 +332,69 @@ export function createRestrictedPartnerHost(deps: RestrictedPartnerHostDeps) {
       typeof a.text !== 'string'
     )
       return fail('INVALID_PARAMS');
+    if (deps.prepare) {
+      const c = a.channel as Record<string, unknown>;
+      if (
+        !c ||
+        Array.isArray(c) ||
+        Object.keys(c).some(
+          (k) =>
+            ![
+              'domainId',
+              'principalId',
+              'connectionId',
+              'generation',
+              'chatId',
+              'eventId',
+              'revision',
+              'epoch',
+              'memoryRead',
+            ].includes(k),
+        ) ||
+        ['domainId', 'principalId', 'connectionId', 'generation', 'chatId', 'eventId'].some(
+          (k) =>
+            typeof c[k] !== 'string' || !(c[k] as string).length || (c[k] as string).length > 256,
+        ) ||
+        typeof c.memoryRead !== 'boolean' ||
+        !Number.isSafeInteger(c.revision) ||
+        Number(c.revision) < 1 ||
+        !Number.isSafeInteger(c.epoch) ||
+        Number(c.epoch) < 1 ||
+        sha(JSON.stringify([c.domainId, c.principalId])) !== principalId ||
+        !Array.isArray(a.assets ?? []) ||
+        ((a.assets as unknown[]) ?? []).length > 4
+      )
+        return fail('INVALID_PARAMS');
+    }
+    if (a.assets !== undefined) {
+      if (
+        !Array.isArray(a.assets) ||
+        a.assets.some((x) => !x || typeof x !== 'object' || Array.isArray(x))
+      )
+        return fail('INVALID_PARAMS');
+      let bytes = 0;
+      for (const rawAsset of a.assets) {
+        const x = rawAsset as Record<string, unknown>;
+        if (
+          Object.keys(x).some(
+            (k) => !['id', 'sha256', 'mimeType', 'base64', 'sourceSha256', 'partial'].includes(k),
+          ) ||
+          typeof x.base64 !== 'string' ||
+          !x.base64.length ||
+          x.base64.length > 6 * 1024 * 1024 ||
+          !['image/png', 'audio/wav'].includes(String(x.mimeType)) ||
+          typeof x.sha256 !== 'string' ||
+          !/^asset:[a-f0-9]{64}$/.test(String(x.id)) ||
+          x.id !== 'asset:' + x.sha256 ||
+          typeof x.sourceSha256 !== 'string' ||
+          !/^[a-f0-9]{64}$/.test(x.sourceSha256) ||
+          typeof x.partial !== 'boolean'
+        )
+          return fail('INVALID_PARAMS');
+        bytes += x.base64.length;
+      }
+      if (bytes > 12 * 1024 * 1024) return fail('INVALID_PARAMS');
+    }
     assertGrant(grant);
     // Reservation resolves the pipe before execution; the job's durable UNKNOWN is queryable across calls/restart.
     return new Promise((resolve, reject) => {
@@ -289,6 +421,9 @@ export function createRestrictedPartnerHost(deps: RestrictedPartnerHostDeps) {
         },
         route: deps.route,
         start: deps.start,
+        prepare: deps.prepare,
+        afterComplete: (claim, text) =>
+          deps.afterComplete?.(claim, text, () => assertGrant(grant)) ?? Promise.resolve(),
         onReserved: (claim) => {
           reserved = true;
           reservedRun = claim.runId;
@@ -313,6 +448,10 @@ export function createRestrictedPartnerHost(deps: RestrictedPartnerHostDeps) {
           partnerId: grant.partnerId,
           inputId: a.inputId as string,
           text: a.text as string,
+          channel: a.channel as
+            import('./restrictedPartnerExecution.js').RestrictedChannelInput | undefined,
+          assets: a.assets as
+            import('./restrictedPartnerExecution.js').RestrictedInputAsset[] | undefined,
         })
         .then((claim) => {
           if (!reserved)

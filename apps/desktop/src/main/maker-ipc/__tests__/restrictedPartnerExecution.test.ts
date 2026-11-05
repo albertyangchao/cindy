@@ -2,7 +2,8 @@ import { createHash } from 'node:crypto';
 import Database from 'better-sqlite3';
 import { drizzle } from 'drizzle-orm/better-sqlite3';
 import { expect, it, vi } from 'vitest';
-import type { AgentEvent, AgentSessionHandle } from '@cindy/maker-core';
+import { RESTRICTED_PARTNER } from '@cindy/maker-core';
+import type { AgentEvent, AgentSessionHandle, StartSessionOptions } from '@cindy/maker-core';
 import type { DbClient } from '../../localDb/client/DbClient.js';
 import { createRestrictedPartnerStore } from '../restrictedPartnerStore.js';
 import {
@@ -224,13 +225,91 @@ it('fails stale owner/grant CAS without altering existing bytes', async () => {
   }
 });
 
-it('real Codex final-fulltext semantics replace deltas instead of duplicating the answer',async()=>{
- const f=await fixture();try{
-  f.events.splice(0, f.events.length,
-   {type:'text',data:{text:'safe ',agentMessageId:'native-output',phase:'final',isFinal:false}},
-   {type:'text',data:{text:'answer',agentMessageId:'native-output',phase:'final',isFinal:false}},
-   {type:'text',data:{text:'safe answer',agentMessageId:'native-output',phase:'final',isFullText:true,isFinal:true}},
-   {type:'done',data:{}});
-  expect((await createRestrictedPartnerExecution(f.ports).run(f.request)).output).toBe('safe answer');
- }finally{f.sqlite.close();}
+it('real Codex final-fulltext semantics replace deltas instead of duplicating the answer', async () => {
+  const f = await fixture();
+  try {
+    f.events.splice(
+      0,
+      f.events.length,
+      {
+        type: 'text',
+        data: { text: 'safe ', agentMessageId: 'native-output', phase: 'final', isFinal: false },
+      },
+      {
+        type: 'text',
+        data: { text: 'answer', agentMessageId: 'native-output', phase: 'final', isFinal: false },
+      },
+      {
+        type: 'text',
+        data: {
+          text: 'safe answer',
+          agentMessageId: 'native-output',
+          phase: 'final',
+          isFullText: true,
+          isFinal: true,
+        },
+      },
+      { type: 'done', data: {} },
+    );
+    expect((await createRestrictedPartnerExecution(f.ports).run(f.request)).output).toBe(
+      'safe answer',
+    );
+  } finally {
+    f.sqlite.close();
+  }
+});
+
+it('deadline fences the captured native authority and keeps UNKNOWN without retry', async () => {
+  const f = await fixture();
+  vi.useFakeTimers();
+  try {
+    let captured: StartSessionOptions | undefined;
+    f.start.mockImplementationOnce(async () => {
+      return {
+        id: 'native-thread',
+        send: f.send,
+        close: f.close,
+        async *events() {
+          await new Promise(() => {});
+        },
+      } as unknown as AgentSessionHandle;
+    });
+    const service = createRestrictedPartnerExecution({
+        ...f.ports,
+        start: async (opts) => {
+          captured = opts;
+          return f.start();
+        },
+      }),
+      pending = service.run(f.request);
+    void pending.catch(() => {});
+    await vi.advanceTimersByTimeAsync(120001);
+    await expect(pending).rejects.toThrow('EXECUTION_UNKNOWN');
+    expect(() => captured?.[RESTRICTED_PARTNER]?.assertCurrent('model')).toThrow(
+      'EXECUTION_UNKNOWN',
+    );
+    expect(f.close).toHaveBeenCalledOnce();
+    expect(await service.run(f.request)).toMatchObject({ state: 'UNKNOWN' });
+    expect(f.start).toHaveBeenCalledOnce();
+  } finally {
+    vi.useRealTimers();
+    f.sqlite.close();
+  }
+});
+
+it('never seals an oversized result that the bounded original-chat outbox cannot deliver', async () => {
+  const f = await fixture();
+  try {
+    f.events[0] = {
+      type: 'text',
+      data: { text: 'x'.repeat(120001), agentMessageId: 'native-output', phase: 'final' },
+    };
+    await expect(createRestrictedPartnerExecution(f.ports).run(f.request)).rejects.toThrow(
+      'OUTPUT_LIMIT',
+    );
+    expect(await f.store.readClaim('plugin', 'new-input')).toMatchObject({ state: 'UNKNOWN' });
+    expect(f.send).toHaveBeenCalledOnce();
+  } finally {
+    f.sqlite.close();
+  }
 });

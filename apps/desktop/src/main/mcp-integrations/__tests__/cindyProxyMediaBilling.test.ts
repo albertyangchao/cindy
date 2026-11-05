@@ -31,7 +31,12 @@ vi.mock('../../usage/gatewayMediaBilling.js', () => ({
   prepareGatewayMediaBilling: mocks.prepareBilling,
 }));
 
-import { getCindyProxyMediaService, getCindyVideoProviderRegistry, withCindyMediaBillingSession } from '../cindyProxyMedia.js';
+import {
+  getCindyProxyMediaService,
+  getCindyVideoProviderRegistry,
+  withCindyMediaBillingSession,
+  withCindyMediaCallGuard,
+} from '../cindyProxyMedia.js';
 
 describe('legacy Gateway media billing wiring', () => {
   beforeEach(() => {
@@ -40,7 +45,9 @@ describe('legacy Gateway media billing wiring', () => {
       mocks.serviceOptions = options;
       return { backend: {} };
     });
-    mocks.prepareBilling.mockResolvedValue(Object.assign(mocks.recordBilling, { finish: mocks.finishBilling }));
+    mocks.prepareBilling.mockResolvedValue(
+      Object.assign(mocks.recordBilling, { finish: mocks.finishBilling }),
+    );
     mocks.recordBilling.mockResolvedValue(undefined);
     vi.stubGlobal('fetch', mocks.fetch);
   });
@@ -72,8 +79,12 @@ describe('legacy Gateway media billing wiring', () => {
   it('records video create but skips polls and downloads even if they contain billing headers', async () => {
     const { provider } = getCindyVideoProviderRegistry().resolveByAlias('seedance-fast');
     mocks.fetch.mockResolvedValueOnce(Response.json({ id: 'paid-task' }));
-    const handle = await withCindyMediaBillingSession('video-task', () => provider.submit({ prompt: 'cat' }, 'seedance-fast'));
-    expect(mocks.prepareBilling).toHaveBeenCalledWith(expect.objectContaining({ sessionId: 'video-task' }));
+    const handle = await withCindyMediaBillingSession('video-task', () =>
+      provider.submit({ prompt: 'cat' }, 'seedance-fast'),
+    );
+    expect(mocks.prepareBilling).toHaveBeenCalledWith(
+      expect.objectContaining({ sessionId: 'video-task' }),
+    );
     expect(mocks.recordBilling).toHaveBeenCalledOnce();
     const headers = { 'X-Nova-AIGateway-Billing': Buffer.from('{"cost":1}').toString('base64url') };
     mocks.fetch.mockResolvedValueOnce(Response.json({ status: 'running' }, { headers }));
@@ -89,30 +100,81 @@ describe('legacy Gateway media billing wiring', () => {
     // The service is a singleton; reuse its installed fetch adapter.
     const doFetch = mocks.serviceOptions!.imageApi.fetchImplementation!;
     mocks.fetch.mockImplementation(async () => Response.json({ data: [] }));
-    const create = () => doFetch('https://gateway.example.invalid/v1/images/generations', {
-      method: 'POST', body: JSON.stringify({ model: 'image' }),
-    });
+    const create = () =>
+      doFetch('https://gateway.example.invalid/v1/images/generations', {
+        method: 'POST',
+        body: JSON.stringify({ model: 'image' }),
+      });
     const releases: Array<() => void> = [];
-    mocks.recordBilling.mockImplementation(() => new Promise<void>(resolve => { releases.push(resolve); }));
+    mocks.recordBilling.mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          releases.push(resolve);
+        }),
+    );
     // Vitest shares mock import callstacks. Settle each import before the next starts,
     // while keeping all three accounting operations in flight together.
-    const first = withCindyMediaBillingSession('task-a', async () => { await Promise.resolve(); return create(); });
+    const first = withCindyMediaBillingSession('task-a', async () => {
+      await Promise.resolve();
+      return create();
+    });
     await vi.waitFor(() => expect(releases).toHaveLength(1));
     const second = withCindyMediaBillingSession('task-b', create);
     await vi.waitFor(() => expect(releases).toHaveLength(2));
     const background = create();
     await vi.waitFor(() => expect(releases).toHaveLength(3));
-    releases.forEach(release => release());
+    releases.forEach((release) => release());
     await Promise.all([first, second, background]);
     expect(mocks.prepareBilling.mock.calls.map(([input]) => input.sessionId).sort()).toEqual([
-      'task-a', 'task-b', undefined,
+      'task-a',
+      'task-b',
+      undefined,
     ]);
+  });
+
+  it('restricted authority is rechecked after billing await, before real transport; normal contexts remain independent', async () => {
+    getCindyProxyMediaService();
+    const doFetch = mocks.serviceOptions!.imageApi.fetchImplementation!;
+    let current = true;
+    const guard = () => {
+      if (!current) throw Error('RESTRICTED_MEDIA_DENIED');
+    };
+    const scoped = vi.fn(async () => Response.json({ data: [] }));
+    mocks.prepareBilling.mockImplementationOnce(async () => {
+      current = false;
+      return Object.assign(mocks.recordBilling, { finish: mocks.finishBilling });
+    });
+    await expect(
+      withCindyMediaCallGuard(guard, scoped, () =>
+        doFetch('https://gateway.example.invalid/v1/images/generations', {
+          method: 'POST',
+          body: JSON.stringify({ model: 'image' }),
+        }),
+      ),
+    ).rejects.toThrow('RESTRICTED_MEDIA_DENIED');
+    expect(scoped).not.toHaveBeenCalled();
+    expect(mocks.fetch).not.toHaveBeenCalled();
+    expect(mocks.finishBilling).toHaveBeenCalledOnce();
+    current = true;
+    mocks.prepareBilling.mockResolvedValueOnce(
+      Object.assign(mocks.recordBilling, { finish: mocks.finishBilling }),
+    );
+    await withCindyMediaCallGuard(guard, scoped, () =>
+      doFetch('https://gateway.example.invalid/v1/images/generations', {
+        method: 'POST',
+        body: JSON.stringify({ model: 'image' }),
+      }),
+    );
+    expect(scoped).toHaveBeenCalledOnce();
+    expect(mocks.fetch).not.toHaveBeenCalled();
   });
 
   it('releases its accounting database when fetch fails', async () => {
     const { provider } = getCindyVideoProviderRegistry().resolveByAlias('seedance-fast');
     mocks.fetch.mockRejectedValueOnce(new Error('connection reset'));
-    await expect(provider.submit({ prompt: 'cat' }, 'seedance-fast')).rejects.toThrow('connection reset');
+    await expect(provider.submit({ prompt: 'cat' }, 'seedance-fast')).rejects.toThrow(
+      'connection reset',
+    );
     expect(mocks.recordBilling).not.toHaveBeenCalled();
     expect(mocks.finishBilling).toHaveBeenCalledOnce();
   });

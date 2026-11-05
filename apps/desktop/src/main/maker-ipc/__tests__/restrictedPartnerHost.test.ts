@@ -5,7 +5,10 @@ import { expect, it, vi } from 'vitest';
 import type { AgentSessionHandle } from '@cindy/maker-core';
 import type { DbClient } from '../../localDb/client/DbClient.js';
 import { createRestrictedPartnerHost } from '../restrictedPartnerHost.js';
-function fixture() {
+function fixture(
+  ready = true,
+  mediaRoutes: Record<string, { providerId: string; modelId: string }> = {},
+) {
   const sqlite = new Database(':memory:');
   sqlite.exec(
     `CREATE TABLE plugin_task_requests(id TEXT PRIMARY KEY,plugin_id TEXT,operation TEXT,target_id TEXT,request_key TEXT,fingerprint TEXT,payload TEXT,revision INTEGER,created_at INTEGER,UNIQUE(plugin_id,operation,target_id,request_key));`,
@@ -39,6 +42,8 @@ function fixture() {
   );
   const confirm = vi.fn(async () => ({ approved: true, paths: [] }));
   const host = createRestrictedPartnerHost({
+    executionReady: async () => ready,
+    mediaConfiguration: async () => ({ routes: mediaRoutes }),
     snapshot: () => ({ client: db, assertCurrent: guard }),
     approvalRevision: () => approval,
     candidates: async () => [{ id: 'bot_real', label: 'Existing synthetic partner', detail: '' }],
@@ -57,6 +62,9 @@ function fixture() {
   const call = (request: unknown) => host('plugin', request, guard) as Promise<any>;
   return {
     sqlite,
+    changeMedia: (next: typeof mediaRoutes) => {
+      mediaRoutes = next;
+    },
     start,
     confirm,
     call,
@@ -150,6 +158,39 @@ it('fence invalidates a reserved run before runner entry and preserves UNKNOWN',
     expect(payloads).toHaveLength(1);
     expect(JSON.parse(payloads[0]!.payload)).toMatchObject({ runId: ack.runId, state: 'UNKNOWN' });
     expect(f.start).not.toHaveBeenCalled();
+  } finally {
+    f.sqlite.close();
+  }
+});
+
+it('capabilities require a current verified native runtime and never infer readiness from source presence', async () => {
+  const f = fixture(false);
+  try {
+    expect(await f.call({ operation: 'capabilities' })).toMatchObject({
+      execution: false,
+      nativeVersionConfirmed: false,
+    });
+    await expect(f.call(bind)).rejects.toThrow('NATIVE_VERSION_UNVERIFIED');
+    expect(f.confirm).not.toHaveBeenCalled();
+    expect(f.start).not.toHaveBeenCalled();
+  } finally {
+    f.sqlite.close();
+  }
+});
+
+it('binding reports current configured media permission; withdrawal cannot sign batch readiness', async () => {
+  const f = fixture(true, { vision: { providerId: 'fake', modelId: 'vision' } });
+  try {
+    await f.call(bind);
+    expect(await f.call({ operation: 'binding', principalId })).toMatchObject({
+      media: { vision: true },
+    });
+    f.changeMedia({});
+    expect(await f.call({ operation: 'binding', principalId })).toMatchObject({
+      media: { vision: false },
+      revision: 1,
+      enabled: true,
+    });
   } finally {
     f.sqlite.close();
   }

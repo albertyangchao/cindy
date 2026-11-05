@@ -18,7 +18,7 @@ const identity = {
   inputId: "input",
   runId: "run",
 };
-const options = { sessionId:'run', model: "fixture", workingDir: "/fixture" };
+const options = { sessionId: "run", model: "fixture", workingDir: "/fixture" };
 const mint = (guard = () => {}) =>
   mintRestrictedPartnerInput(
     identity,

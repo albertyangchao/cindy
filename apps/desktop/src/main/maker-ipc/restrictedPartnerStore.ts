@@ -1,4 +1,4 @@
-import { and, eq } from 'drizzle-orm';
+import { and, eq, sql } from 'drizzle-orm';
 import type { DbClient } from '../localDb/client/DbClient.js';
 import { pluginTaskRequests } from '../localDb/schema.js';
 import type {
@@ -107,6 +107,26 @@ export function createRestrictedPartnerStore(db: DbClient, assertOwner: () => vo
       assertOwner();
       return row ? (JSON.parse(row.payload) as RestrictedPartnerClaim) : undefined;
     },
+    async unresolvedCount(pluginId: string, principalId: string) {
+      assertOwner();
+      const [row] = await db.drizzle
+        .select({ count: sql<number>`count(*)` })
+        .from(table)
+        .where(
+          and(
+            eq(table.pluginId, pluginId),
+            eq(table.operation, 'target'),
+            sql`${table.targetId} LIKE 'restricted:input:%'`,
+            sql`json_extract(${table.payload},'$.principalId') = ${principalId}`,
+            sql`coalesce(json_extract(${table.payload},'$.state'),'UNKNOWN') <> 'COMPLETE'`,
+          ),
+        );
+      assertOwner();
+      const count = Number(row?.count);
+      if (!Number.isSafeInteger(count) || count < 0)
+        throw Error('RESTRICTED_PARTNER_RESULT_CONFLICT');
+      return count;
+    },
     readClaim: (pluginId: string, inputId: string) =>
       read<RestrictedPartnerClaim>(pluginId, `restricted:input:${inputId}`),
     async reserve(claim: RestrictedPartnerClaim) {
@@ -164,7 +184,13 @@ export function createRestrictedPartnerStore(db: DbClient, assertOwner: () => vo
       assertOwner();
       return rows.length === 1;
     },
-    async recordResult(runId: string, outputMessageId: string, output: string) {
+    async recordResult(
+      runId: string,
+      outputMessageId: string,
+      output: string,
+      assets?: import('./restrictedPartnerExecution.js').RestrictedOutputAsset[],
+      laneSessionId?: string,
+    ) {
       assertOwner();
       const id = `restricted-run:${runId}`;
       const [row] = await db.drizzle
@@ -184,7 +210,16 @@ export function createRestrictedPartnerStore(db: DbClient, assertOwner: () => vo
         return false;
       const rows = await db.drizzle
         .update(table)
-        .set({ payload: JSON.stringify({ ...claim, outputMessageId, output }), revision: 3 })
+        .set({
+          payload: JSON.stringify({
+            ...claim,
+            outputMessageId,
+            output,
+            ...(assets?.length ? { assets } : {}),
+            ...(laneSessionId ? { laneSessionId } : {}),
+          }),
+          revision: 3,
+        })
         .where(and(eq(table.id, id), eq(table.operation, 'target'), eq(table.revision, 2)))
         .returning({ id: table.id });
       assertOwner();
