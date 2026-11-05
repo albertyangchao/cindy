@@ -41,7 +41,7 @@ export type ManagedMedia = Readonly<{
   bytes: Uint8Array;
   binding: MediaBinding;
 }>;
-export type MediaRequest = { kind: MediaKind; text: string; inputId?: string; voice?: string };
+export type MediaRequest = { kind: MediaKind; text: string; inputId?: string };
 export type MediaReceipt = {
   state: 'COMPLETE';
   binding: MediaBinding;
@@ -77,7 +77,11 @@ export type RestrictedMediaPorts = {
   vision?: (permit: MediaPermit) => VisionChannelDeps;
   /** Account configuration resolved by main, not payload or arbitrary URLs. */
   transcription?: (permit: MediaPermit) => { proxyApiKey: string; baseUrl: string };
-  speech?: (permit: MediaPermit) => { connection: SpeechConnection; fetch: typeof fetch };
+  speech?: (permit: MediaPermit) => {
+    connection: SpeechConnection;
+    fetch: typeof fetch;
+    voice: string;
+  };
   /** Core-only resolved original library blob path for edit; never returned to model. */
   editPath?: (permit: MediaPermit, asset: ManagedMedia) => Promise<string>;
 };
@@ -205,7 +209,7 @@ export class RestrictedMediaAdapter {
     if (
       !raw ||
       !['vision', 'draw', 'edit', 'stt', 'tts'].includes(raw.kind) ||
-      Object.keys(raw).some((k) => !['kind', 'text', 'inputId', 'voice'].includes(k))
+      Object.keys(raw).some((k) => !['kind', 'text', 'inputId'].includes(k))
     )
       deny();
     const request = Object.freeze({ ...raw, text: boundedText(raw.text) });
@@ -239,8 +243,7 @@ export class RestrictedMediaAdapter {
         (typeof request.inputId !== 'string' ||
           !request.inputId ||
           request.inputId.length > 256)) ||
-      needsInput !== (typeof request.inputId === 'string' && request.inputId.length > 0) ||
-      (request.kind !== 'tts' && request.voice !== undefined)
+      needsInput !== (typeof request.inputId === 'string' && request.inputId.length > 0)
     )
       deny();
     let input: ManagedMedia | undefined;
@@ -277,13 +280,15 @@ export class RestrictedMediaAdapter {
     if (
       request.kind === 'tts' &&
       (!speech ||
-        typeof request.voice !== 'string' ||
-        !request.voice ||
-        request.voice.length > 128 ||
+        typeof speech.voice !== 'string' ||
+        !speech.voice ||
+        speech.voice.length > 128 ||
         speechTextSegments(request.text, speech.connection.protocol).length !== 1)
     )
       deny();
-    const requestHash = sha(JSON.stringify({ binding: b, request, inputHash: input?.sha256 }));
+    const requestHash = sha(
+      JSON.stringify({ binding: b, request, inputHash: input?.sha256, speechVoice: speech?.voice }),
+    );
     current();
     if (!(await this.ports.claim(b, requestHash))) return { state: 'HELD' };
     // Claim is durable; any failure from this point holds UNKNOWN, never retries.
@@ -344,7 +349,7 @@ export class RestrictedMediaAdapter {
           const result = await session.start({
             requestId: b.effectSlot,
             modelId: b.modelId,
-            voice: request.voice!,
+            voice: speech.voice,
             text: request.text,
           });
           current();

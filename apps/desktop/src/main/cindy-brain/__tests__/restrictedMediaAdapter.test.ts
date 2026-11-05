@@ -114,13 +114,13 @@ function setup(kind: MediaKind = 'draw') {
     speech: () => ({
       connection: { baseUrl: 'https://synthetic.invalid/v1', protocol: 'openai', headers: {} },
       fetch: fetcher,
+      voice: 'alloy',
     }),
   };
   const request = {
     kind,
     text: 'hello',
     ...(['stt', 'vision', 'edit'].includes(kind) ? { inputId: 'input' } : {}),
-    ...(kind === 'tts' ? { voice: 'alloy' } : {}),
   };
   return {
     adapter: new RestrictedMediaAdapter(ports),
@@ -325,6 +325,7 @@ it('multiple TTS segments denied before paid claim', async () => {
   s.ports.speech = () => ({
     connection: { baseUrl: 'https://synthetic.invalid', protocol: 'qwen-tts', headers: {} },
     fetch: s.fetcher,
+    voice: 'alloy',
   });
   await expect(
     s.adapter.execute(s.handle, { ...s.request, text: 'a'.repeat(601) }),
@@ -439,4 +440,13 @@ it('vision response byte excess is bounded before Core JSON parsing', async () =
   const s = setup('vision');
   await expect(s.adapter.execute(s.handle, s.request)).rejects.toThrow('UNKNOWN');
   expect(s.ports.complete).not.toHaveBeenCalled();
+});
+
+it('model cannot select an account-owned voice or cloning resource', async () => {
+  const s = setup('tts');
+  await expect(
+    s.adapter.execute(s.handle, { ...s.request, voice: 'unapproved' } as any),
+  ).rejects.toThrow('DENIED');
+  expect(s.fetcher).not.toHaveBeenCalled();
+  expect(s.ports.claim).not.toHaveBeenCalled();
 });
