@@ -71,6 +71,12 @@ export type RestrictedMediaPorts = {
   /** Existing ingestMedia + original run ownership reference; never a free path.
    * Must check current permit atomically with attaching the ownership reference. */
   ingest(permit: MediaPermit, bytes: Uint8Array, mimeType: string): Promise<ManagedMedia>;
+  /** Main wires createRestrictedMediaUrlLoader with actual URL grant/egress/stage ports. */
+  urlImage?: (
+    permit: MediaPermit,
+    url: string,
+    role: 'output',
+  ) => Promise<{ bytes: Uint8Array; mimeType: string; sourceSha256: string }>;
   images: ImageChannelRegistry;
   /** Core Guide entry over ONLY the already-authorized bytes, not a general Agent.
    * Main wires its current restricted context; absence fails before claim. */
@@ -336,16 +342,20 @@ export class RestrictedMediaAdapter {
               ? await imageChannel.editImage({ ...args, imagePaths: [path!] })
               : await imageChannel.generateImage(args);
           current();
-          // Bound base64 BEFORE decoding; URL downloading stays Core's job, not a new free-fetch path.
-          if (
-            !response.data?.[0]?.b64_json ||
-            response.data.length !== 1 ||
-            response.data[0].b64_json.length > Math.ceil(MAX_BYTES / 3) * 4
-          )
-            deny();
-          const decoded = decodeImageResponse(response);
-          bytes = decoded.buffer;
-          mime = decoded.mimeType;
+          if (response.data?.length !== 1) deny();
+          const first = response.data[0];
+          if (first.b64_json && !first.url) {
+            if (first.b64_json.length > Math.ceil(MAX_BYTES / 3) * 4) deny();
+            const decoded = decodeImageResponse(response);
+            bytes = decoded.buffer;
+            mime = decoded.mimeType;
+          } else if (first.url && !first.b64_json && this.ports.urlImage) {
+            const downloaded = await this.ports.urlImage(permit, first.url, 'output');
+            current();
+            if (downloaded.sourceSha256 !== sha(first.url)) deny();
+            bytes = downloaded.bytes;
+            mime = downloaded.mimeType;
+          } else deny();
         } else if (speech) {
           session = new SpeechSynthesisSession({
             ...speech,
