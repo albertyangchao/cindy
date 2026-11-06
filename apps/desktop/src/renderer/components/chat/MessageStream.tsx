@@ -1,9 +1,10 @@
+import { PluginUiMessageContributions } from '@/cindy-brain/PluginUiMessageContributions';
 import { AttachmentCollectionContext, type AttachmentCollectionItem } from './AttachmentCollection';
 import { attachmentPreviewKind, previewSourceName } from '@cindy/maker-shared/attachment-preview';
 import { TeammateProcessStatus } from '@/features/bots/TeammateProcessStatus';
 import { scrollRangeIntoView } from '@/lib/scrollRangeIntoView';
 import { historyAfter } from './historyAfter';
-import { readMailCard } from '@cindy/maker-shared/ghost-card-form';
+import { readGhostCardSupersededBy, readMailCard } from '@cindy/maker-shared/ghost-card-form';
 import { animateFocusScroll } from './animateFocusScroll';
 import { botProcessItems } from '@/features/bots/botConversationPresentation';
 import { isVisibleVoiceCallMessage } from '@/features/bots/voice/voiceCallPresentation';
@@ -78,6 +79,7 @@ export type { RenderItem, WorkChildItem } from './messageWorkGroups';
 import { useTranslation } from 'react-i18next';
 import { richAnswerMediaSources } from '@cindy/maker-shared/rich-answer';
 import {
+  collectPluginUiTurnAnchors,
   findMessageTodoInsertions,
   getLatestMessageTodoState,
   isAgentPlanToolName,
@@ -1835,9 +1837,10 @@ export function buildRenderItems(
     : [];
   // Mail is a finished document, not plugin progress. Without an exact tool ID,
   // wait for its result rather than attach it to a schema/read call by guesswork.
+  // A card moved to a newer call belongs to an earlier call and must not claim this one.
   const guessableLiveCards = sessionLiveCards.filter((lc) => {
     const entry = ghostCards?.byCallId.get(lc.callId);
-    return !(entry?.status === 'ready' && readMailCard(entry.html));
+    return !(entry?.status === 'ready' && (readMailCard(entry.html) || readGhostCardSupersededBy(entry.html)));
   });
   // Old partial history may omit a tool result. It cannot claim a new card just
   // because the same plugin was used there. Exact IDs still work across turns.
@@ -2167,7 +2170,7 @@ export function buildRenderItems(
           suppressMediaForCard = true;
           hideRowForCard = true;
           if (entry?.status === 'ready') {
-            if (readMailCard(entry.html)?.supersededBy) return;
+            if (readGhostCardSupersededBy(entry.html)) return;
             const cardItem: Extract<RenderItem, { type: 'ghost_card' }> = {
               type: 'ghost_card',
               key: `ghostcard-${msg.clientId}`,
@@ -2212,7 +2215,7 @@ export function buildRenderItems(
         if (liveEntry?.status !== 'ready') return;
         claimedLiveCallIds.add(live.callId);
         hideRowForCard = true;
-        if (readMailCard(liveEntry.html)?.supersededBy) { suppressMediaForCard = true; return; }
+        if (readGhostCardSupersededBy(liveEntry.html)) { suppressMediaForCard = true; return; }
         const liveCardItem: Extract<RenderItem, { type: 'ghost_card' }> = {
           type: 'ghost_card',
           key: `ghostcard-${msg.clientId}`,
@@ -2875,6 +2878,7 @@ function renderWorkGroupChild(
     singleResultMap: Map<string, string>;
     assistantsWithFollowingUserBoundary: ReadonlySet<string>;
     turnFinalAssistantClientIds: ReadonlySet<string>;
+    pluginUiTurnAnchors?: ReadonlyMap<string, string>;
     subagentModelByToolUseId: ReadonlyMap<string, string>;
     userTurnUsageDetailsByAssistantId: ReadonlyMap<string, TurnUsageDetails>;
   },
@@ -2899,7 +2903,7 @@ function renderWorkGroupChild(
   }
 
   // 工作组里的中间过程文字不挂 assistantAvatar:折叠块里逐条画脸只会变噪音,
-  // 身份标记只属于对话流里真正的那句回复(见 MessageItem 的 assistantAvatar)。
+  // 过程区外层与最终回复各显示一次头像，展开明细不重复。
   return (
     <div data-message-client-id={item.message.clientId}>
       <MessageItem
@@ -2919,6 +2923,7 @@ function renderWorkGroupChild(
           props.assistantsWithFollowingUserBoundary,
         )}
         assistantIsTurnFinal={props.turnFinalAssistantClientIds.has(item.message.clientId)}
+        pluginUiTurnAnchor={props.pluginUiTurnAnchors?.get(item.message.clientId)}
         userTurnUsageDetails={props.userTurnUsageDetailsByAssistantId.get(item.message.clientId)}
         isFirstUserMessage={item.message.clientId === props.firstUserMessageClientId}
         isLastUserMessage={item.message.clientId === props.lastUserMessageClientId}
@@ -2945,13 +2950,13 @@ export const WorkGroupRenderItemView = memo(function WorkGroupRenderItemView({
   item,
   context,
   compact,
-  replyColumnSpacer,
+  companionAvatar,
 }: {
   item: Extract<RenderItem, { type: 'work_group' }>;
   context: WorkGroupRenderContext;
   compact: boolean;
-  /** 伙伴聊天：隐形头像占位，让工作过程与回复正文同列对齐。 */
-  replyColumnSpacer?: ReactNode;
+  /** 伙伴聊天：过程区与最终回复各显示一个头像，正文保持同列。 */
+  companionAvatar?: ReactNode;
 }) {
   // 完成态外层时间线可包含内层 work_group。递归只负责形状映射,
   // 具体折叠 / 直接详情逻辑全部复用 WorkGroupBlock。
@@ -2999,7 +3004,7 @@ export const WorkGroupRenderItemView = memo(function WorkGroupRenderItemView({
       childItems={childItems}
       compact={compact}
       deferred={item.deferred}
-      fitHeader={Boolean(replyColumnSpacer)}
+      fitHeader={Boolean(companionAvatar)}
       journal={item.teammateJournal}
       journalTitle={item.isStreaming ? (elapsed) => (
               <TeammateProcessStatus sessionId={context.sessionId}>{elapsed}</TeammateProcessStatus>
@@ -3018,7 +3023,7 @@ export const WorkGroupRenderItemView = memo(function WorkGroupRenderItemView({
       className="scroll-mt-20"
       data-message-client-ids={collectWorkGroupClientIds(item.children).join(' ')}
     >
-      {replyColumnSpacer ? withAssistantAvatar(replyColumnSpacer, block) : block}
+      {companionAvatar ? withAssistantAvatar(companionAvatar, block) : block}
     </div>
   );
 });
@@ -3404,6 +3409,7 @@ export function MessageStream({
     () => collectTurnFinalAssistantClientIds(visibleMetadataMessages),
     [visibleMetadataMessages],
   );
+  const pluginUiTurnAnchors = useMemo(() => collectPluginUiTurnAnchors(visibleMetadataMessages), [visibleMetadataMessages]);
   // subagent-model-chip: parentToolUseId(Agent/Task 行 id)→ 子代理模型,
   // 供 AgentActionsBlock 给 Agent/Task 行反查并渲染模型 chip。
   const subagentModelByToolUseId = useMemo(() => {
@@ -6352,8 +6358,7 @@ export function MessageStream({
     previousLocalFileRefsRef.current = localFileRefs;
   }, [localFileRefs]);
 
-  // 伙伴聊天的工作过程、成果与回复正文同列：只占头像宽度，不重复画脸。memo 住以保持
-  // WorkGroupRenderItemView 的 memo 比较成立。
+  // 成果与回复正文同列，只占头像宽度；过程区单独显示伙伴头像。
   const botReplyColumnSpacer = useMemo(
     () =>
       simplifiedBotConversation && assistantAvatar ? (
@@ -6390,6 +6395,7 @@ export function MessageStream({
       singleResultMap,
       assistantsWithFollowingUserBoundary,
       turnFinalAssistantClientIds,
+      pluginUiTurnAnchors,
       subagentModelByToolUseId,
       userTurnUsageDetailsByAssistantId,
     }),
@@ -6411,6 +6417,7 @@ export function MessageStream({
       singleResultMap,
       assistantsWithFollowingUserBoundary,
       turnFinalAssistantClientIds,
+      pluginUiTurnAnchors,
       subagentModelByToolUseId,
       userTurnUsageDetailsByAssistantId,
     ],
@@ -6707,7 +6714,7 @@ export function MessageStream({
                           // 伙伴聊天与普通任务同一套工作过程：运行中露最近 5 条活动与计时，
                           // 组头按内容宽；最终答复后保留折叠过程，按需展开。
                           compact={false}
-                          replyColumnSpacer={botReplyColumnSpacer}
+                          companionAvatar={simplifiedBotConversation ? assistantAvatar : undefined}
                         />
                       );
                     }
@@ -6719,7 +6726,7 @@ export function MessageStream({
                       // 下一次 store 变更自愈。
                       const entry = ghostCardSnapshot.byCallId.get(item.callId);
                       if (!entry || entry.status !== 'ready') return null;
-                      if (readMailCard(entry.html)?.supersededBy) return null;
+                      if (readGhostCardSupersededBy(entry.html)) return null;
                       // 常态包一层 div(结构稳定,回锚媒体到达时卡片 iframe 不重挂);
                       // 回锚媒体(如 mivo 视频)挂卡正下方,与 tool_media 同款间距。
                       return (
@@ -6808,6 +6815,7 @@ export function MessageStream({
                           assistantsWithFollowingUserBoundary,
                         )}
                         assistantIsTurnFinal={turnFinalAssistantClientIds.has(msg.clientId)}
+                        pluginUiTurnAnchor={pluginUiTurnAnchors.get(msg.clientId)}
                         userTurnUsageDetails={userTurnUsageDetailsByAssistantId.get(msg.clientId)}
                         isFirstUserMessage={msg.clientId === firstUserMessageClientId}
                         isLastUserMessage={msg.clientId === lastUserMessageClientId}
@@ -7010,6 +7018,7 @@ const MessageItem = memo(function MessageItem({
   sessionRunning,
   assistantForkBlocked,
   assistantIsTurnFinal,
+  pluginUiTurnAnchor,
   userTurnUsageDetails,
   isFirstUserMessage,
   isLastUserMessage,
@@ -7047,6 +7056,7 @@ const MessageItem = memo(function MessageItem({
    *  (collectTurnFinalAssistantClientIds). Gates the hover action bar —
    *  mid-turn texts don't mount it, keeping the stream compact. */
   assistantIsTurnFinal?: boolean;
+  pluginUiTurnAnchor?: string;
   /** Aggregated token/cache/model details for this assistant's visible user turn. */
   userTurnUsageDetails?: TurnUsageDetails;
   /** True iff this message is the first user message in the visible list.
@@ -7141,6 +7151,7 @@ const MessageItem = memo(function MessageItem({
             simplifiedBotConversation={simplifiedBotConversation}
             replyQuote={message.replyQuote}
           />
+          {sessionId ? <PluginUiMessageContributions sessionId={sessionId} messageClientId={message.clientId} /> : null}
           {message.usageLimitAutoResumeInfo && (
             <SystemCard
               cardType="auto-resume"
@@ -7221,6 +7232,8 @@ const MessageItem = memo(function MessageItem({
             starterOptionsLocked={starterOptionsLocked}
             botTaskResults={message.turnCompleted === true ? message.botTaskResults : undefined}
           />
+          {sessionId && !message.isStreaming ? <PluginUiMessageContributions sessionId={sessionId} messageClientId={message.clientId}
+            turnAnchor={assistantIsTurnFinal && !assistantForkBlocked ? pluginUiTurnAnchor : undefined} /> : null}
         </>,
       );
     case 'tool_use':
@@ -7270,6 +7283,7 @@ const MessageItem = memo(function MessageItem({
           reason={message.errorReason}
           providerId={message.errorProviderId}
           toolLoop={message.toolLoop}
+          outputLimit={message.outputLimit}
           sessionSource={sessionSource}
           onDiagnose={onDiagnoseError}
         />

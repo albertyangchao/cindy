@@ -1,5 +1,43 @@
 ## 4.11 发起 Agent 新回合(agent 能力)
 
+### 受限原生伙伴输入（新增可选合同；须宿主真实宣告支持）
+
+普通 `targets.send` / `delegation`、任务工作目录或 prompt 不构成外部用户隔离。
+本候选提供独立 `cindy.targets.restricted({request})`，只在执行端实现并批准后使用，
+不可据源码存在推断已发布版本。先查 `targets.capabilities()` 的
+`restrictedPartners.version === 1`，再查受限端的实际 readiness：
+
+```js
+const transport = await cindy.targets.capabilities();
+if (transport.restrictedPartners?.version !== 1) throw new Error('UNSUPPORTED_CAPABILITY');
+const capability = await cindy.targets.restricted({ request: { operation: 'capabilities' } });
+if (!capability.execution || !capability.nativeVersionConfirmed) {
+  throw new Error('RESTRICTED_PARTNER_NATIVE_VERSION_UNVERIFIED');
+}
+```
+
+须声明 `agent.tasks` 和 `agent.targets`，保当前物理插件实例/账号/批准绑定。
+这不继承旧 delegation、任务或其它插件的授权，不改变普通接口的原行为。
+`list` 只返回实际已有伙伴元数据；`bind` 必须指定列出的准确 `partnerId`、调用方
+独立 `principalId` 与 `expectedRevision`。资源路径及原持久记忆 namespace 只能由
+宿主原生 owner 确认选择，不接受模型传来的任意路径、SQL、凭据或“已批准”声明。
+`chooseResources:true` 请求该确认流程，不代表已获准。新 grant 默认 closed；
+`binding` 返回当前事实和缺项，`resume` 只有真实能力齐备才准入。
+
+`submit` 绑定准确 grant revision、不可重复 inputId 和原 channel：
+domain/principal/connection/generation/chat/event、配置 revision、epoch、memoryRead。
+这些都是待核数据，不是序列化权限。`requirements` 与资产描述同样须 Main 严格核验，
+不能通过 JSON 携带函数 authority。只读资料、历史、记忆与媒体均受当前 scope 约束；
+不会加载主人的跨任务私有上下文。当前唯一验证的 native runner 是 macOS Codex0.166.0，
+其它版本/runner/provider 不支持时明确拒绝，禁止退回普通 tasks/ask/shell/MCP。
+
+宿主在模型/收费效果之前持久 UNKNOWN claim，`get` 按原 run 查询明确收据及输出关联。
+调用失败或超时不能重复 submit、退票或自行宣告远端已取消。`fence`/`revoke` 保原未知，
+只阻止未来准入，不抹除已派效果。逐次 await、资源读取、媒体落仓和原 chat 发送前
+仍复核当前授权。完整执行、资源和供应商限制见 Host 的
+`src/main/maker-ipc/RESTRICTED-PARTNERS.md`；安装、真实服务配置、用户批准、自然验收
+与官方发布必须分别核证，不从 capability 名称推断全部可用。
+
 新建与管理普通任务见独立章节 §4.11.3，可调用 `ghost_forge_guide({section:"4.11.3"})` 读取。
 
 `main.js` 可把文字作为**普通用户消息**交给 Cindy Agent，支持用户点卡片后让 Agent 继续。
@@ -287,7 +325,7 @@ autoTitle 与 title 互斥，task/bot
 不改权限、目录或其它任务。返回 `{status,task}`；配置相同返回 unchanged，不反复切换。
 后续 send 使用返回 task.revision。须先处理已接受/结果不确定的旧请求，再同步下一次输入，
 不得修改旧请求的回执或为模型变化重发。旧 Host 未声明此能力时保留原任务行为，不传入该 route。
-暂不支持接管任意现有任务、远程/伙伴任务、其它配置修改、归档、队列暂停或事件订阅。
+暂不支持接管任意现有任务、远程/伙伴任务、其它配置修改、队列暂停或事件订阅。
 旧 `agent.errand` 接口不变。
 
 **后台任务（可选，需声明 `hiddenTasks`）**。任务默认可见。只有身份卡写了

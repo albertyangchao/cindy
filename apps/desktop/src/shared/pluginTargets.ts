@@ -19,10 +19,22 @@ export interface PluginTargetCandidate {
   label: string;
   detail: string;
 }
+/** Data binding only. Main verifies grant, scope, revision and effects independently. */
+export interface PluginRestrictedPartnerChannel {
+  domainId: string;
+  principalId: string;
+  connectionId: string;
+  generation: string;
+  chatId: string;
+  eventId: string;
+  revision: number;
+  epoch: number;
+  memoryRead: boolean;
+}
 export type PluginTargetRequest =
   | { kind: 'capabilities' }
   /** Candidate protocol: explicit owner-approved per-input isolation, not ordinary bot delegation. */
-  | { kind: 'restricted'; request: {operation:'capabilities'|'list'|'binding'|'bind'|'revoke'|'fence'|'resume'|'submit'|'get'; principalId?:string; partnerId?:string; expectedRevision?:number; grantRevision?:number; chooseResources?:boolean; inputId?:string; runId?:string; text?:string} }
+  | { kind: 'restricted'; request: {operation:'capabilities'|'list'|'binding'|'bind'|'revoke'|'fence'|'resume'|'submit'|'get'; principalId?:string; partnerId?:string; expectedRevision?:number; grantRevision?:number; chooseResources?:boolean; inputId?:string; runId?:string; text?:string; requirements?:unknown; channel?:PluginRestrictedPartnerChannel; assets?:unknown[]} }
   | { kind: 'list'; targetKind: PluginTargetKind }
   | { kind: 'resolve'; target: PluginTargetRef }
   | {

@@ -12,6 +12,7 @@ import { resolveCompanionRuntimeEnvironment } from '../bot-import/runtime.js';
 import { registerCodexTextOnlyPolicy } from './codex-text-only-policy.js';
 import { ensureCodexCliLauncher } from '../agent-binaries/codex-cli-launcher.js';
 import { readDisabledSkillPaths } from '../skillhub/activationPreferences';
+import { resolveLocalMcpDuplicateChoices } from './mcp-duplicate-preferences.js';
 import { cindyMakeManager } from '../cindy-make/manager.js';
 import { makeSourceRoot } from '../cindy-make/sourcePaths.js';
 import { clearCodexAccountUsageSnapshot } from '../usageBroadcaster.js';
@@ -140,7 +141,10 @@ import { readProviderGroupBinding } from '../provider-group/bindings.js';
 import { createSubscriptionFastPolicy } from './subscription-fast-policy.js';
 import { getProviderGroupGuestSwitch } from '../provider-group/guestSwitch.js';
 import { tapWindowBroadcast } from '../device-link/broadcast-tap.js';
-import { openRemoteLink, remoteBackgroundInvoke, remoteInvoke } from '../device-link/index.js';
+import { isSharedTaskAvailable, isSharedTaskRelayOnline, openRemoteLink, remoteBackgroundInvoke, remoteInvoke, waitForSharedTaskRelay } from '../device-link/index.js';
+import { captureSharedTaskAgentCommand } from '../device-link/sharedTaskCommands.js';
+import { tryGetSharedTaskHost } from '../device-link/sharedTaskRuntime.js';
+import { runWithSharedTaskCallerGuard } from '../device-link/sharedTaskApi.js';
 import { isCrossRegionProviderShareTarget, renewCrossRegionProviderShareLink } from '../device-link/providerShareCrossRegion.js';
 import { handleListDevices, defaultDeps as deviceDirectoryDeps } from '../device-link/ipc.js';
 import { parseProviderShareAgentDeviceId } from '../device-link/providerShareGuest.js';
@@ -1092,6 +1096,10 @@ export function getMaker(): Maker {
       lspPool: getLspPool(),
       pluginRegistry,
       invokeRemote: remoteInvoke,
+      captureSharedTaskCommand: (sessionId: string, assertCurrent: () => void) => captureSharedTaskAgentCommand(sessionId, assertCurrent, {
+        ready: waitForSharedTaskRelay, online: isSharedTaskRelayOnline, available: isSharedTaskAvailable,
+        host: tryGetSharedTaskHost, runScoped: runWithSharedTaskCallerGuard,
+      }),
       machineDirectory: {
         listDevices: async () => (await handleListDevices(deviceDirectoryDeps())).devices,
         // Reading a status must not put the other computer under control, old versions included.
@@ -1416,6 +1424,7 @@ export function getMaker(): Maker {
       log: desktopMakerLogger.child('command-gate'),
     });
     const claudeAgent = new ClaudeCodeAgent({
+      resolveLocalMcpDuplicateChoices,
       resolveSessionEnvironment: resolveCompanionRuntimeEnvironment,
       getDisabledSkillPaths: readDisabledSkillPaths,
       getManagedSkills: listCindyManagedSkills,

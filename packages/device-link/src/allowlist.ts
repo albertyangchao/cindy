@@ -328,6 +328,7 @@ const CORE_INVOKE_CHANNELS: readonly string[] = [
   'git-context:pr-refs:list',
   'git-context:pr-refs:manage',
   'git-context:pr-status',
+  'git-context:mr-status',
   'git-context:github-read',
   // —— 通用远程资源面——
   // 固定的 manifest / list / get / invoke 入口。业务模块只在被控端 provider
@@ -598,6 +599,7 @@ const EXTENDED_INVOKE_CHANNELS: readonly string[] = [
   // Same-account read-only Kimi quota; no secrets, arbitrary endpoints, shared-task or share guests.
   // Old hosts reject the channel; callers never fall back to their local account.
   'maker:usage:kimi-coding',
+  'maker:usage:opencode-go',
   // cc 默认路由会话的生效计费路由观察值(只读,'gateway' | 'subscription' | null):
   // 控制端远程会话据此判定订阅 / 网关显示形态 —— 路由真值在被控端 proxy 的按请求
   // 观察 registry 里,控制端拿本机凭证状态重算必然张冠李戴。入参 sessionId,无
