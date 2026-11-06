@@ -26,6 +26,95 @@ export function createRestrictedPartnerStore(db: DbClient, assertOwner: () => vo
     return row ? (JSON.parse(row.payload) as T) : undefined;
   };
   return {
+    /** Main-private coverage receipts share this account's existing table. No public SQL port. */
+    consumerGuardReceiptIdentity: db,
+    async unresolvedConsumerGuardAdmissions(pluginId: string, accountScopeRef: string) {
+      assertOwner();
+      const [row] = await db.drizzle
+        .select({ count: sql<number>`count(*)` })
+        .from(table)
+        .where(
+          and(
+            eq(table.operation, 'target'),
+            eq(table.pluginId, pluginId),
+            sql`${table.targetId} LIKE ${`publication-coverage:${accountScopeRef}:%`}`,
+            sql`json_extract(${table.payload}, '$.schema') = 'publication-coverage-admission/v1'`,
+            sql`coalesce(json_extract(${table.payload}, '$.state'), 'UNKNOWN') <> 'COMPLETE'`,
+          ),
+        );
+      assertOwner();
+      const count = Number(row?.count);
+      if (!Number.isSafeInteger(count) || count < 0)
+        throw Error('PUBLICATION_COVERAGE_RECEIPT_UNKNOWN');
+      return count;
+    },
+    async readConsumerGuardReceipt(pluginId: string, accountScopeRef: string, key: string) {
+      assertOwner();
+      const target = `publication-coverage:${accountScopeRef}:${key}`;
+      const [row] = await db.drizzle
+        .select()
+        .from(table)
+        .where(
+          and(
+            eq(table.operation, 'target'),
+            eq(table.pluginId, pluginId),
+            eq(table.targetId, target),
+          ),
+        )
+        .limit(1);
+      assertOwner();
+      return row ? { revision: row.revision, payload: row.payload } : undefined;
+    },
+    async compareAndSwapConsumerGuardReceipt(
+      pluginId: string,
+      accountScopeRef: string,
+      key: string,
+      previous: { revision: number; payload: string } | undefined,
+      payload: string,
+    ) {
+      assertOwner();
+      if (
+        !/^[a-f0-9]{64}$/.test(accountScopeRef) ||
+        !/^[a-f0-9]{64}$/.test(key) ||
+        Buffer.byteLength(payload) > 65536 ||
+        (previous && (!Number.isSafeInteger(previous.revision) || previous.revision < 1))
+      )
+        throw Error('PUBLICATION_COVERAGE_RECEIPT_INVALID');
+      const target = `publication-coverage:${accountScopeRef}:${key}`;
+      const nextRevision = (previous?.revision ?? 0) + 1;
+      if (!Number.isSafeInteger(nextRevision)) throw Error('PUBLICATION_COVERAGE_RECEIPT_INVALID');
+      const result = previous
+        ? await db.drizzle
+            .update(table)
+            .set({ payload, revision: nextRevision })
+            .where(
+              and(
+                eq(table.operation, 'target'),
+                eq(table.pluginId, pluginId),
+                eq(table.targetId, target),
+                eq(table.revision, previous.revision),
+                eq(table.payload, previous.payload),
+              ),
+            )
+            .returning({ id: table.id })
+        : await db.drizzle
+            .insert(table)
+            .values({
+              id: `publication-coverage:${pluginId}:${accountScopeRef}:${key}`,
+              pluginId,
+              operation: 'target',
+              targetId: target,
+              requestKey: key,
+              fingerprint: accountScopeRef,
+              payload,
+              revision: nextRevision,
+              createdAt: Date.now(),
+            })
+            .onConflictDoNothing()
+            .returning({ id: table.id });
+      assertOwner();
+      return result.length === 1;
+    },
     readGrant: (pluginId: string, grantId: string) =>
       read<RestrictedPartnerGrant>(pluginId, `restricted:grant:${grantId}`),
     /** Main owner UI only; the production caller must validate local consent + exact existing partner first. */

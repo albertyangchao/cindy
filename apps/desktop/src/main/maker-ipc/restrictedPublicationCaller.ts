@@ -6,6 +6,10 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { publicationPython } from './restrictedPublicationPython.js';
 import {
+  isConsumerGuardCoverageAuthority,
+  type ConsumerGuardCoverageAuthority,
+} from './restrictedPublicationConsumerGuardAuthority.js';
+import {
   canonical,
   digest,
   wireBinding,
@@ -44,6 +48,9 @@ export interface RegisteredPublicationRoot {
   /** Existing canonical consumer owner must supply actual current guarded-runtime evidence.
    * File pinning or a public Host version alone never proves older live consumers guarded. */
   assertConsumerGuards(): Promise<void>;
+  /** Main-private authority, not an Agent proof/boolean or the preflight callback above. */
+  consumerCoverage: ConsumerGuardCoverageAuthority;
+  consumerRootIdentity: string;
 }
 /** No supported installed root/consumer attestation is currently registered. No production enqueue. */
 export const supportedPublicationRoot: RegisteredPublicationRoot | undefined = undefined;
@@ -146,6 +153,8 @@ export function controlledPublicationRuntime(
     !path.isAbsolute(pin.dispatchRoot) ||
     !path.isAbsolute(pin.queueRoot) ||
     typeof pin.assertConsumerGuards !== 'function' ||
+    !isConsumerGuardCoverageAuthority(pin.consumerCoverage) ||
+    !/^[a-f0-9]{64}$/.test(pin.consumerRootIdentity) ||
     !/^[a-f0-9]{64}$/.test(pin.sourceIdentity) ||
     !pin.files[entry] ||
     !pin.files['bridge_core/native_html_release.py'] ||
@@ -163,6 +172,29 @@ export function controlledPublicationRuntime(
   )
     denied();
   const files = Object.freeze({ ...pin.files });
+  const coverage = pin.consumerCoverage,
+    coverageRoot = pin.consumerRootIdentity;
+  const rootDefinition = () =>
+    digest([
+      pin.sourceIdentity,
+      pin.root,
+      pin.artifactRoot,
+      pin.queueRoot,
+      pin.dispatchRoot,
+      pin.publicOrigin,
+      files,
+      pin.python,
+    ]);
+  const registeredDefinition = rootDefinition();
+  const coverageBindingCurrent = () => {
+    if (
+      rootDefinition() !== registeredDefinition ||
+      pin.consumerCoverage !== coverage ||
+      pin.consumerRootIdentity !== coverageRoot
+    )
+      denied();
+    coverage.assertRootBinding(coverageRoot, registeredDefinition);
+  };
   const readFixed = async (root: string, rel: string, limit = 12 * 1024 * 1024) => {
     if (
       !rel ||
@@ -255,8 +287,12 @@ export function controlledPublicationRuntime(
     a?: NativePublicationRecord,
     extra: Record<string, unknown> = {},
     readonly = false,
+    coverageCurrent?: () => void,
   ) => {
-    const current = readonly ? guards.readCurrent : guards.effectCurrent;
+    const current = () => {
+      (readonly ? guards.readCurrent : guards.effectCurrent)();
+      coverageCurrent?.();
+    };
     await verifyFiles();
     current();
     const result = await boundedProcess(
@@ -278,6 +314,8 @@ export function controlledPublicationRuntime(
   const verify = async () => {
     await verifyFiles();
     await pin.assertConsumerGuards();
+    await coverage.readCurrent(coverageRoot, coverage.freshChallenge(coverageRoot));
+    coverageBindingCurrent();
     guards.readCurrent();
     const c = await pure('contract', undefined, {}, true);
     if (
@@ -663,9 +701,23 @@ export function controlledPublicationRuntime(
     stage: async (a, text, control) => {
       await verify();
       guards.effectCurrent();
-      await pure('stage', a, { text });
-      guards.effectCurrent();
-      await control.stageBind();
+      await coverage.withAdmission(
+        coverageRoot,
+        a.nativeActionId + ':' + a.actionRevision,
+        'stage',
+        async (fence) => {
+          const current = () => {
+            guards.effectCurrent();
+            coverageBindingCurrent();
+            fence.assertCurrent();
+          };
+          current();
+          await pure('stage', a, { text }, false, current);
+          current();
+          await control.stageBind();
+          current();
+        },
+      );
     },
     apply: (a, control) => session(a, control),
     reconcile: (a) => session(a, undefined, true),
@@ -695,15 +747,29 @@ export function controlledPublicationRuntime(
         guards.effectCurrent();
       }
       // No argv/host/path is taken from a root packet; only pinned canonical pure builders.
-      if (effect === 'remote-staging-prepare')
-        await io.execute('/usr/bin/ssh', [plan.host, plan.bootstrap], guards.effectCurrent);
-      else if (effect === 'remote-staging-upload')
-        await io.execute(
-          '/usr/bin/scp',
-          [...pair.map(([name]) => path.join(dir!, name)), plan.host + ':' + plan.upload],
-          guards.effectCurrent,
-        );
-      else await io.execute('/usr/bin/ssh', [plan.host, plan.transaction], guards.effectCurrent);
+      await coverage.withAdmission(
+        coverageRoot,
+        a.nativeActionId + ':' + a.actionRevision,
+        effect,
+        async (fence) => {
+          const current = () => {
+            guards.effectCurrent();
+            coverageBindingCurrent();
+            fence.assertCurrent();
+          };
+          current();
+          if (effect === 'remote-staging-prepare')
+            await io.execute('/usr/bin/ssh', [plan.host, plan.bootstrap], current);
+          else if (effect === 'remote-staging-upload')
+            await io.execute(
+              '/usr/bin/scp',
+              [...pair.map(([name]) => path.join(dir!, name)), plan.host + ':' + plan.upload],
+              current,
+            );
+          else await io.execute('/usr/bin/ssh', [plan.host, plan.transaction], current);
+          current();
+        },
+      );
       guards.effectCurrent();
       next.push(effect);
       completed.set(a.nativeActionId, next);
