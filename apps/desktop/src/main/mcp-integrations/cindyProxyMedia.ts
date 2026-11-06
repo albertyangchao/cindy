@@ -18,6 +18,21 @@ import { getAppCapabilities } from '../appCapabilities.js';
 
 const log = createLogger('art');
 const billingSession = new AsyncLocalStorage<string | undefined>();
+const restrictedCall = new AsyncLocalStorage<{ current(): void; fetch: typeof fetch }>();
+/** Main-only, opt-in authority across the existing Core media await chain. Never an RPC argument. */
+export function withCindyMediaCallGuard<T>(
+  current: () => void,
+  fetcher: typeof fetch,
+  run: () => T,
+): T {
+  current();
+  return restrictedCall.run({ current, fetch: fetcher }, run);
+}
+const assertRestrictedCall = () => restrictedCall.getStore()?.current();
+const currentFetch = (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+  assertRestrictedCall();
+  return (restrictedCall.getStore()?.fetch ?? fetch)(input, init);
+};
 
 /** The session comes from the Host's active same-plugin call, never plugin arguments. */
 export function withCindyMediaBillingSession<T>(sessionId: string | undefined, run: () => T): T {
@@ -29,12 +44,14 @@ let artService: CindyProxyMediaService | null = null;
 let artServiceBaseUrl: string | null = null;
 
 function readApiKey(): string | null {
+  assertRestrictedCall();
   // 本地 only:经统一的 providerSecretStore 读 XD 网关 key。
   if (!getAppCapabilities().canUseCindyGateway) return null;
   return getProviderSecretStore().get('xd');
 }
 
 function getGatewayBaseUrl(): string {
+  assertRestrictedCall();
   // 与 key 同源的生效 endpoint(model-access 下发值优先,回落端点清单)。
   return effectiveXdGatewayBaseUrl();
 }
@@ -44,22 +61,30 @@ function getGatewayBaseUrl(): string {
  * Keep Gateway 401 key-rejection reporting for all requests carrying Authorization.
  */
 const gatewayMediaFetch = withCindyGatewayKeyRejectionReport(async (input, init) => {
-  if (init?.method?.toUpperCase() !== 'POST') return fetch(input, init);
+  assertRestrictedCall();
+  if (init?.method?.toUpperCase() !== 'POST') return currentFetch(input, init);
   let model = 'unknown';
   if (typeof init.body === 'string') {
     try {
       const body = JSON.parse(init.body) as { model?: unknown };
       if (typeof body?.model === 'string') model = body.model;
-    } catch { /* The response header remains the authoritative model. */ }
+    } catch {
+      /* The response header remains the authoritative model. */
+    }
   } else if (init.body instanceof FormData) {
     const value = init.body.get('model');
     if (typeof value === 'string') model = value;
   }
   const { prepareGatewayMediaBilling } = await import('../usage/gatewayMediaBilling.js');
-  const recordBilling = await prepareGatewayMediaBilling({ model, sessionId: billingSession.getStore() });
+  const recordBilling = await prepareGatewayMediaBilling({
+    model,
+    sessionId: billingSession.getStore(),
+  });
   try {
-    const response = await fetch(input, init);
+    assertRestrictedCall();
+    const response = await currentFetch(input, init);
     await recordBilling(response);
+    assertRestrictedCall();
     return response;
   } finally {
     recordBilling.finish();

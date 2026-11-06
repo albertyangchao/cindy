@@ -21,6 +21,8 @@ export interface PluginTargetCandidate {
 }
 export type PluginTargetRequest =
   | { kind: 'capabilities' }
+  /** Candidate protocol: explicit owner-approved per-input isolation, not ordinary bot delegation. */
+  | { kind: 'restricted'; request: {operation:'capabilities'|'list'|'binding'|'bind'|'revoke'|'fence'|'resume'|'submit'|'get'; principalId?:string; partnerId?:string; expectedRevision?:number; grantRevision?:number; chooseResources?:boolean; inputId?:string; runId?:string; text?:string} }
   | { kind: 'list'; targetKind: PluginTargetKind }
   | { kind: 'resolve'; target: PluginTargetRef }
   | {

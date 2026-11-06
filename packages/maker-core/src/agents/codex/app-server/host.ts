@@ -283,6 +283,7 @@ export interface AppServerHostOptions {
    * 本机 codex proxy。session 级 prompt gate 只读这个值,不再 live 读取全局状态。
    */
   codexProxyActive?: boolean;
+  restrictedEgressGuarded?: boolean;
   /** Host creation snapshot: this exact process received the Browser companion. */
   codexBrowserUseAvailable?: boolean;
   /** Exact verified Chrome plugin version provisioned into this process. */
@@ -413,6 +414,8 @@ export class AppServerHost {
     this.threadUnsubscribeTimeoutMs =
       opts.threadUnsubscribeTimeoutMs ?? DEFAULT_THREAD_UNSUBSCRIBE_TIMEOUT_MS;
   }
+
+  isRestrictedEgressGuarded(): boolean { return this.opts.restrictedEgressGuarded === true; }
 
   isCodexProxyActive(): boolean {
     return this.opts.codexProxyActive === true;

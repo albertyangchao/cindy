@@ -76,7 +76,11 @@ export type RestrictedMediaPorts = {
    * Main wires its current restricted context; absence fails before claim. */
   vision?: (permit: MediaPermit) => VisionChannelDeps;
   /** Account configuration resolved by main, not payload or arbitrary URLs. */
-  transcription?: (permit: MediaPermit) => { proxyApiKey: string; baseUrl: string };
+  transcription?: (permit: MediaPermit) => {
+    proxyApiKey: string;
+    baseUrl: string;
+    fetch?: typeof fetch;
+  };
   speech?: (permit: MediaPermit) => {
     connection: SpeechConnection;
     fetch: typeof fetch;

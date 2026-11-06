@@ -1,3 +1,4 @@
+import { restrictedPartnerSpawnArgs } from './restrictedPartnerEgressGate.js';
 import { refreshInstalledPluginApps } from '../cindy-brain/index.js';
 import { configureSessionModelInterfaceStorage, sessionModelInterface } from './session-model-interface.js';
 import { readGeneratedImageEpoch } from '../cindy-media/generatedImageStorage';
@@ -2027,9 +2028,10 @@ export function getMaker(): Maker {
             customContextProviderRoutes,
             guestProviderId,
             guestSessionId,
+            ctx.restrictedEgressGuard,
           );
           // 受邀者不走「proxy 不可用时直连网关」的退路：那条路不经受邀者守门。
-          if (guestProviderId && !isCodexCustomContextProxyHandleReady(scopedProxyKey)) {
+          if ((guestProviderId || ctx.restrictedEgressGuard) && !isCodexCustomContextProxyHandleReady(scopedProxyKey)) {
             await releaseCodexCustomContextProxy(scopedProxyKey);
             const error = new Error('shared-provider Codex host requires the local proxy, but the proxy is not ready');
             (error as { codexSpawnConfigFatal?: boolean }).codexSpawnConfigFatal = true;
@@ -2180,6 +2182,7 @@ export function getMaker(): Maker {
             ...customContextCatalogArgs,
             ...buildCodexProxySpawnArgs(endpoint, authInjection),
             ...codexCustomProviderSpawn.extraArgs,
+            ...(ctx.restrictedEgressGuard ? restrictedPartnerSpawnArgs([CODEX_GATEWAY_PROVIDER_ID,CODEX_SUMMARY_COMPACT_PROVIDER_ID,CODEX_OPENAI_COMPACT_PROVIDER_ID,'cindy_codex',...codexCustomProviderRoutes.map(r=>r.modelProviderId)]) : []),
           ],
           extraEnv: { ...mcpExtraEnv, ...codexCustomProviderSpawn.extraEnv },
           ...(smartSubagentConfig
@@ -2187,8 +2190,9 @@ export function getMaker(): Maker {
             : {}),
           ...(buildSessionMcpConfig ? { buildSessionMcpConfig } : {}),
           codexProxyActive: ready,
+          ...(ctx.restrictedEgressGuard && usesScopedProxy && ready ? {restrictedEgressGuarded:true as const} : {}),
           codexDefaultModelProviderId: CODEX_GATEWAY_PROVIDER_ID,
-          codexOpenAiWebSocketsEnabled: useOAuthBearer && ready,
+          codexOpenAiWebSocketsEnabled: !ctx.restrictedEgressGuard && useOAuthBearer && ready,
           codexSubagentRoutingProfile,
           ...(smartSubagentConfig
             ? { codexSubagentRoutingSignature: smartSubagentConfig.routingSignature }
@@ -2909,6 +2913,7 @@ export function getMaker(): Maker {
 
     _maker = new Maker({
       agents: makerAgents,
+      assertOrdinarySession: async id => { const snapshot=getCurrentDbClientSnapshot(); if(!snapshot)throw Error('HOST_NOT_READY'); await (await import('../maker-ipc/restrictedPartnerConversation.js')).assertOrdinaryPartnerLane(snapshot.client,id); },
       storage: desktopSessionStorage,
       logger: desktopMakerLogger,
       // Agent 在同账号另一台电脑上运行、任务与文件留在本机(见 remote-agent/)。
@@ -3735,3 +3740,19 @@ export { desktopClaudeAuthAdapter, desktopCodexAuthAdapter };
 
 // Lazy path lookup follows owner changes; installing the reader performs no IO.
 configureSessionModelInterfaceStorage(() => ownerScopedUserDataPath('model-interface-snapshots'));
+
+/** Main-only Guide route, resolved from the owner's existing explicit vision setting. */
+export async function restrictedPartnerVisionConfiguration(current:()=>void=()=>{}){
+ current();
+ const settingsReader=(await import('../vision-bridge/vision-bridge-settings-store.js')).readVisionBridgeSettings;
+ current();const settings=settingsReader();
+ if(!settings.enabled||!settings.primary)return undefined;
+ const {providerId,modelId}=settings.primary;
+ if(!resolveVisionBackendRoute(providerId,modelId,effectiveXdGatewayBaseUrl()||null))return undefined;
+ return {route:{providerId,modelId},assertCurrent:()=>{const now=settingsReader();if(!now.enabled||JSON.stringify(now.primary)!==JSON.stringify(settings.primary)||!resolveVisionBackendRoute(providerId,modelId,effectiveXdGatewayBaseUrl()||null))throw Error('RESTRICTED_MEDIA_DENIED');},deps:{
+  getProviderById:(id:string)=>getActiveCatalog().providers.find(p=>p.id===id)??null,
+  readCustomProviderKey,readGatewayKey:readClaudeApiKey,resolveGatewayEndpoint:()=>effectiveXdGatewayBaseUrl()||null,
+  resolveBackendRoute:(p:string,m:string)=>p===providerId&&m===modelId?resolveVisionBackendRoute(p,m,effectiveXdGatewayBaseUrl()||null):null,
+  fetch:outboundFetch,
+ }};
+}

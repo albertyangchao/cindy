@@ -1,3 +1,4 @@
+import { RESTRICTED_PARTNER, type RestrictedPartnerInput } from './shared/restricted-partner.js';
 /**
  * BaseAgent — Claude Code / Codex 等具体 agent 的统一抽象。
  *
@@ -378,6 +379,8 @@ export interface CodexSessionMcpConfigInput {
 }
 
 export interface CodexExtraSpawnConfig {
+  /** Main attestation: this unique proxy revalidates every model HTTP dispatch and forbids WS bypass. */
+  restrictedEgressGuarded?: true;
   extraArgs: string[];
   extraEnv: Record<string, string>;
   /** Host 路由要求更强的 Codex 进程凭证时，冷启动以该模式重建 app-server。 */
@@ -1070,6 +1073,8 @@ export interface AgentDeps {
       codexHome?: string;
       /** Actual native config/history root; credential/catalog preparation keeps codexHome above. */
       runtimeCodexHome?: string;
+      /** Main-only live authority, never serialized into a native config or model request. */
+      restrictedEgressGuard?: () => void;
       accountHostKey?: string;
       remoteHostId?: string;
       credentialMode?: AgentCredentialMode;
@@ -1898,6 +1903,8 @@ export interface LocalAgentClient {
 }
 
 export interface StartSessionOptions {
+  /** Host-minted external subject boundary; never accepted from wire/task JSON. */
+  [RESTRICTED_PARTNER]?: RestrictedPartnerInput;
   [LOCAL_AGENT_CLIENT]?: LocalAgentClient;
   /**
    * Business 层 session id (host 调用 maker.createSession 时传的 opts.id, 由

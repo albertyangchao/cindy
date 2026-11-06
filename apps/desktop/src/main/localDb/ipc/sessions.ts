@@ -1,3 +1,4 @@
+import { withRestrictedPartnerChange } from '../../maker-ipc/restrictedPartnerEpoch.js';
 import { captureSessionCreationCancellation } from '../sessionRuntimeCleanup.js';
 import { pagePermissionSessionChanged } from '../../mcp-apps/pagePermissions.js';
 import { removeSessionModelInterface } from '../../maker-host/session-model-interface.js';
@@ -3066,6 +3067,7 @@ export async function deleteBotProfileAndDetachSessionsInDb(
   sessionIds: string[],
   keepTaskHistory: boolean,
 ): Promise<void> {
+  return withRestrictedPartnerChange(botId, async () => {
   const ids = [...new Set(sessionIds)];
   const ownerScope = captureOwnerScope();
   const dbClient = getDbClient();
@@ -3127,6 +3129,7 @@ export async function deleteBotProfileAndDetachSessionsInDb(
       });
     }
   }
+  });
 }
 
 /**

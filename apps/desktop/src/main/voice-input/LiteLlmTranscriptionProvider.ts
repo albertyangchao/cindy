@@ -12,6 +12,8 @@ type LiteLlmTranscriptionProviderOptions = {
 };
 
 export type LiteLlmAudioFileTranscriptionInput = {
+  /** Main-only scoped transport; ordinary dictation keeps its existing default. */
+  fetch?: typeof fetch;
   proxyApiKey: string;
   baseUrl: string;
   model?: string;
@@ -123,15 +125,18 @@ export async function transcribeLiteLlmAudioFile(
   if (language) form.set('language', language);
   form.set('file', new Blob([exact], { type: mimeType }), fileName);
 
-  const response = await outboundFetch(joinProxyPath(input.baseUrl, '/v1/audio/transcriptions'), {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${input.proxyApiKey}`,
+  const response = await (input.fetch ?? outboundFetch)(
+    joinProxyPath(input.baseUrl, '/v1/audio/transcriptions'),
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${input.proxyApiKey}`,
+      },
+      body: form,
+      ...(input.signal ? { signal: input.signal } : {}),
+      ...(input.maxResponseBytes ? { redirect: 'error' as const } : {}),
     },
-    body: form,
-    ...(input.signal ? { signal: input.signal } : {}),
-    ...(input.maxResponseBytes ? { redirect: 'error' as const } : {}),
-  });
+  );
 
   // proxyApiKey is the Cindy AI key sent to the Cindy gateway. Report on the status
   // before reading the body so an interrupted body read cannot drop the report.

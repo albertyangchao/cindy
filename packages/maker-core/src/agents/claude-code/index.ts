@@ -1,3 +1,4 @@
+import { restrictedPartnerInput } from '../shared/restricted-partner.js';
 /**
  * ClaudeCodeAgent — Claude Code 的 maker-core 一等公民实现。
  *
@@ -1358,6 +1359,7 @@ export class ClaudeCodeAgent extends BaseAgent {
   }
 
   async startSession(opts: StartSessionOptions): Promise<AgentSessionHandle> {
+    restrictedPartnerInput(opts, 'claude-code');
     let runtimeStartAttempted = false;
     try {
       return await this.startSessionInternal(opts, () => { runtimeStartAttempted = true; });

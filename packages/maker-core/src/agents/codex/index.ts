@@ -1,3 +1,4 @@
+import { restrictedPartnerInput, RESTRICTED_CODEX_CONFIG } from '../shared/restricted-partner.js';
 /**
  * CodexAgent — 路线 A 完整版 (Phase 1+2+3+4 全打通)。
  *
@@ -2464,6 +2465,7 @@ export class CodexAgent extends BaseAgent {
       customContextProviderId?: string | null;
       sqliteHome?: string;
       historyHome?: string;
+      restrictedEgressGuard?: () => void;
       /** 受邀者任务的 app-server：值是分享给它的供应商(见 prepareCodexExtraSpawnConfig)。 */
       deviceHostedGuestProviderId?: string;
       deviceHostedGuestSessionId?: string;
@@ -2700,6 +2702,7 @@ assertRouteCurrent();
         opts.deviceHostedGuestModelIds,
         opts.localToolCatalog,
         opts.customContextProviderId,
+        opts.restrictedEgressGuard,
       ).finally(() => {
         // 成功: this.hosts 已赋值, 后续走快路径; 失败: 清掉 promise 让下次调用能重试
         const current = this.hostPromises.get(key);
@@ -2953,6 +2956,7 @@ assertRouteCurrent();
     deviceHostedGuestModelIds?: readonly string[],
     localToolCatalog?: string,
     customContextProviderId?: string | null,
+    restrictedEgressGuard?: () => void,
   ): Promise<AppServerHost> {
     const seq = (this.createHostSeqByKey.get(key) ?? 0) + 1;
     this.createHostSeqByKey.set(key, seq);
@@ -3015,6 +3019,7 @@ assertRouteCurrent();
     let env: Record<string, string> = {};
     let extraArgs = [...baseExtraArgs];
     let codexProxyActive = false;
+    let restrictedEgressGuarded = false;
     let codexBrowserUseAvailable = false;
     let codexBrowserUseVersion: string | undefined;
     let codexBrowserUseStartupTimeoutMs: number | undefined;
@@ -3079,6 +3084,7 @@ assertRouteCurrent();
               ...(providerId ? { providerId } : {}),
               ...(key.startsWith('local-account:') ? { codexHome: env.CODEX_HOME } : {}),
               ...(!remoteHostId && historyHome ? { runtimeCodexHome: historyHome } : {}),
+              ...(restrictedEgressGuard ? {restrictedEgressGuard} : {}),
               // 受邀者任务的 app-server 与账号会话一样走按 host 分开的 proxy(鉴权注入方式冻结在这个 host 上)，
               // 不改写本机用户任务共用的 proxy 状态。
               ...(key.startsWith('local-account:') || key.startsWith(LOCAL_GUEST_HOST_PREFIX) || deviceHostedGuestProviderId || localToolCatalog
@@ -3138,6 +3144,7 @@ assertRouteCurrent();
           codexOpenAiWebSocketsEnabled = cfg.codexOpenAiWebSocketsEnabled !== false;
           codexSubagentRoutingProfile = cfg.codexSubagentRoutingProfile ?? 'default';
           codexProxyActive = cfg.codexProxyActive === true && !remoteHostId;
+          restrictedEgressGuarded = cfg.restrictedEgressGuarded === true && codexProxyActive;
           defaultModelProviderId = codexProxyActive ? cfg.codexDefaultModelProviderId : undefined;
           // Remote daemons own their browser companion and its CODEX_HOME;
           // preserve the host-provided availability snapshot instead of
@@ -3296,6 +3303,7 @@ assertRouteCurrent();
       // (2026-07-17 随品牌翻转改 cindy;上游 gating 走 originator,与此无关)。
       clientInfo: { name: 'cindy', version: '0.0.0' },
       codexProxyActive,
+      restrictedEgressGuarded,
       codexBrowserUseAvailable,
       codexBrowserUseVersion,
       codexBrowserUseStartupTimeoutMs,
@@ -3574,7 +3582,10 @@ assertRouteCurrent();
     // 路由到 sessions/<id>/<date>.ndjson (logger.ts extractSessionId / sessionAgentSlot)。
     const sid = opts.sessionId ?? '';
     const log = this.deps.logger.child(sid ? `s:${sid}/codex` : 'codex');
-    const reviewMode = opts.reviewMode === true;
+    const restricted = restrictedPartnerInput(opts, 'codex');
+    // Reuse the audited fresh-history/no-MCP/read-only isolation machinery.
+    // A restricted partner is not a Review product/task and has its own persona below.
+    const reviewMode = opts.reviewMode === true || restricted !== undefined;
     // 设备托管：Codex 在本机运行(本机的登录与供应商)，项目、文件与命令在任务所在电脑上。
     // 那台电脑经隧道提供 Codex 原生的 exec-server 环境，命令、读写与补丁都在那里执行；
     // Cindy 工具也经隧道。opts.workingDir 是本机影子目录。
@@ -4895,11 +4906,13 @@ assertRouteCurrent();
     if (reviewMode) {
       try {
         if (process.platform === 'win32') {
-          if ([opts.workingDir, ...(opts.reviewReadPaths ?? [])].some((candidate) => !isWindowsReviewLocalPath(candidate, opts.workingDir))) {
+          if ([opts.workingDir, ...(restricted?.readPaths ? [...restricted.readPaths] : opts.reviewReadPaths ?? [])].some((candidate) => !isWindowsReviewLocalPath(candidate, opts.workingDir))) {
             throw new Error('Windows Cindy Review requires local drive paths; UNC shares, device paths and alternate data streams are not supported. Use a local copy before retrying Review.');
           }
         }
-        reviewReadGrants = await buildReviewReadGrants(opts.workingDir, opts.reviewReadPaths ?? []);
+        reviewReadGrants = restricted
+          ? (await Promise.all(restricted.readPaths.map(p => buildReviewReadGrants(path.resolve(opts.workingDir, p), [])))).flat()
+          : await buildReviewReadGrants(opts.workingDir, opts.reviewReadPaths ?? []);
         if (process.platform === 'win32' && reviewReadGrants.some((grant) => !isWindowsReviewLocalPath(grant.realPath, opts.workingDir))) {
           throw new Error('Windows Cindy Review requires evidence paths that resolve to a local drive. Use a local copy before retrying Review.');
         }
@@ -4966,7 +4979,7 @@ assertRouteCurrent();
     const sessionDynamicTools = [
       // Windows Review requires 0.156+ and exposes flat function tools. The legacy
       // ordinary provider gate concerns namespace tools, not these scoped reads.
-      ...(reviewMode && process.platform === 'win32' ? REVIEW_READ_TOOLS : []),
+      ...(restricted ? [...restricted.tools.map(t=>({type:'function' as const,name:t.name,description:t.description,inputSchema:t.inputSchema})), ...REVIEW_READ_TOOLS.map(t=>({...t,name:t.name.replace(/^review_/,'partner_'),description:t.description.replaceAll('Review','partner')}))] : reviewMode && process.platform==='win32' ? REVIEW_READ_TOOLS : []),
       ...(!reviewMode && !opts[LOCAL_AGENT_CLIENT]?.hostToolsOnly && shouldRegisterAskUserDynamicTool(opts) ? [ASK_USER_DYNAMIC_TOOL] : []),
     ];
     const accountProviderId = this.deps.isCodexAccountProvider?.(opts.providerId) ? opts.providerId! : undefined;
@@ -4983,7 +4996,7 @@ assertRouteCurrent();
           providerId: opts.providerId,
           model: opts.model,
         });
-    let localAuthPolicy = routeSelection.policy;
+    let localAuthPolicy = restricted ? 'isolated' as const : routeSelection.policy;
     let credentialMode = requestedCredentialMode
       ?? (localAuthPolicy === 'isolated' ? 'provider-oauth' : undefined);
     const resolveCodexThreadContextWindow = this.deps.resolveCodexThreadContextWindow;
@@ -5053,7 +5066,13 @@ assertRouteCurrent();
       ? path.join(hosted.guestHome, 'codex')
       : undefined;
     if (guestCodexHome) await fs.mkdir(guestCodexHome, { recursive: true, mode: 0o700 });
-    const sessionStorage = localApplicationHome
+    // A named profile cannot prevent Codex itself loading CODEX_HOME/AGENTS.md.
+    // Give restricted input a fresh native history/config home BEFORE app-server startup;
+    // authentication stays in the selected account's existing external-auth bridge.
+    const restrictedHistoryHome = restricted ? await fs.mkdtemp(path.join(opts.workingDir, '.partner-history-')) : undefined;
+    const sessionStorage = restrictedHistoryHome
+      ? {historyHome:restrictedHistoryHome,sqliteHome:restrictedHistoryHome}
+      : localApplicationHome
       ? {historyHome:localApplicationHome,sqliteHome:localApplicationHome}
       : guestCodexHome
       ? { historyHome: guestCodexHome, sqliteHome: guestCodexHome }
@@ -5094,6 +5113,7 @@ assertRouteCurrent();
         ...(accountProviderId ? { providerId: accountProviderId } : {}),
         ...(sessionSqliteHome ? { sqliteHome: sessionSqliteHome } : {}),
         ...(sessionStorage ? { historyHome: sessionStorage.historyHome } : {}),
+        ...(restricted ? {restrictedEgressGuard:()=>{try{restricted.assertCurrent('model');}catch{throw new Error('RESTRICTED_PARTNER_REVOKED');}}} : {}),
         ...(accountSessionHost || reviewMode || usesCustomContextHost || sessionSqliteHome ? { keyOverride: currentHostKey } : {}),
         ignoreBindingLeases: 1,
         routeIsCurrent: () => { companionEnvironment?.assertCurrent?.(); return routeSelection.isCurrent(); },
@@ -5127,7 +5147,7 @@ assertRouteCurrent();
             throw new CodexRouteSelectionChangedError('Codex route changed repeatedly during host preparation', false);
           }
           routeSelection = await this.resolveLocalAuthSelection(opts.providerId, opts.model);
-          localAuthPolicy = routeSelection.policy;
+          localAuthPolicy = restricted ? 'isolated' as const : routeSelection.policy;
           credentialMode = requestedCredentialMode ?? (localAuthPolicy === 'isolated' ? 'provider-oauth' : undefined);
           initialCustomContextWindow = !reviewMode
             ? await resolveCodexThreadContextWindow?.(opts.providerId, opts.model) ?? null : null;
@@ -5177,6 +5197,10 @@ assertRouteCurrent();
         });
       }
     };
+    if(restricted && !host.isRestrictedEgressGuarded()) {
+      releaseHostBindingLeaseIfNeeded();
+      throw new Error('RESTRICTED_PARTNER_EGRESS_UNPROVEN');
+    }
     const connectionId = host.getConnectionId();
     // JSON-RPC IDs are connection-local (often 0). Desktop indexes interaction
     // requests across sessions, so never expose a raw server ID as a UI ID.
@@ -5191,6 +5215,7 @@ assertRouteCurrent();
     const staleHostError = (operation: string): Error =>
       new Error(`Codex session expired because its app-server was replaced before ${operation}; restart the session`);
     const assertCurrentHost = (operation: string): void => {
+      restricted?.assertCurrent('model');
       if (!startup.threadDispatched) {
         startup.signal.throwIfAborted();
         if (!routeSelection.isCurrent()) throw new CodexRouteSelectionChangedError();
@@ -5369,6 +5394,10 @@ assertRouteCurrent();
     );
     const capabilityRoutingProtocolSupported =
       supportsCodexCapabilityRoutingProtocol(initResp.userAgent);
+    if(restricted && (!codexUserAgentAtLeast(initResp.userAgent,[0,166,0]) || codexUserAgentAtLeast(initResp.userAgent,[0,166,1]))) {
+      releaseHostBindingLeaseIfNeeded();
+      throw new Error('RESTRICTED_PARTNER_NATIVE_VERSION_UNVERIFIED');
+    }
     if (reviewMode && !capabilityRoutingProtocolSupported) {
       releaseHostBindingLeaseIfNeeded();
       throw new Error(
@@ -5641,7 +5670,7 @@ assertRouteCurrent();
     const resumeExcludeTurnsSupported = supportsCodexResumeExcludeTurns(initResp.userAgent);
     // Verified with 0.156.0: features.view_image removes the native reader.
     // 0.145.0 ignores this flag and reads images outside the permission scope.
-    if (reviewMode && process.platform === 'win32' && !codexUserAgentAtLeast(initResp.userAgent, [0, 156, 0])) {
+    if (reviewMode && (process.platform === 'win32' || restricted) && !codexUserAgentAtLeast(initResp.userAgent, [0, 156, 0])) {
       releaseHostBindingLeaseIfNeeded();
       throw new Error(
         `Windows Cindy Review requires Codex app-server 0.156.0 or newer to enforce scoped reads (current: ${initResp.userAgent ?? 'unknown'})`,
@@ -6517,6 +6546,13 @@ assertRouteCurrent();
           ? readonlyReferencesConfig()
           : {}),
         ...(reviewMode ? reviewPermissionsConfig : {}),
+        ...(restricted ? {
+          ...RESTRICTED_CODEX_CONFIG,
+          [`permissions.${REVIEW_PERMISSION_PROFILE}`]: {
+            filesystem: { ':root': 'deny', ':minimal': 'read', ':tmpdir': 'deny', ':slash_tmp': 'deny', ':workspace_roots': 'deny' },
+            network: { enabled: false },
+          },
+        } : {}),
         // Workspace routing reloads retained config without thread/start's RPC
         // overrides (Codex 0.156+). Keep the selected permission syntax in that
         // config too, otherwise our profile definitions have no default and
@@ -6905,6 +6941,8 @@ assertRouteCurrent();
       });
     };
 
+    let restrictedInputClaimed = false;
+
     // ── thread/start 或 thread/resume ────────────────────────────────────────
     // 防御: resumeSessionId 偶尔会是上次失败 session 残留的占位 ('<failed>' / '<pending>')
     // 或非 UUID 格式 — server 直接 -32600 invalid thread id, 整个 session 起不来。
@@ -6925,7 +6963,7 @@ assertRouteCurrent();
       : hosted
         ? deviceHostedGhostRoster(hosted, opts.ghostRosterSnapshot, localGhostRoster)
         : localGhostRoster();
-    const developerInstructions = buildCodexDeveloperInstructions({
+    const developerInstructions = restricted ? restricted.instructions : buildCodexDeveloperInstructions({
       answerDeliveryPrompt: reviewMode ? undefined : this.deps.runtimeConfig.answerDeliveryPrompt,
       makerMemoryRules,
       ghostRosterPrompt,
@@ -10042,7 +10080,7 @@ assertRouteCurrent();
       params: DynamicToolCallParams,
       meta: { requestId: string | number },
     ): Promise<DynamicToolCallResponse> => {
-      if (reviewMode && process.platform !== 'win32') {
+      if (reviewMode && process.platform !== 'win32' && !restricted) {
         return {
           contentItems: [{ type: 'inputText', text: 'Cindy Review does not allow dynamic tools.' }],
           success: false,
@@ -10072,7 +10110,20 @@ assertRouteCurrent();
           && !turnInterruptOrigins.has(params.turnId)
           && !resolvedWhileBufferedRequestIds.has(String(meta.requestId));
         if (!readIsActive() || params.namespace) return reviewReadDenied();
-        const response = await callReviewReadTool(params.tool, params.arguments, opts.workingDir, reviewReadGrants);
+        restricted?.assertCurrent('resource');
+        if (restricted) {
+          const custom=restricted.tools.find(t=>t.name===params.tool);
+          if(custom) {
+            try {
+              const result=await custom.invoke(params.arguments,{callId:String(meta.requestId),runId:restricted.identity.runId});
+              restricted.assertCurrent('resource');
+              return readIsActive() ? result : reviewReadDenied();
+            } catch {return reviewReadDenied();}
+          }
+          if(!params.tool.startsWith('partner_'))return reviewReadDenied();
+        }
+        const response = await callReviewReadTool(restricted ? params.tool.replace(/^partner_/,'review_') : params.tool, params.arguments, opts.workingDir, reviewReadGrants);
+        restricted?.assertCurrent('resource');
         return await gateServerRequestTurn(params.turnId, params.threadId) && readIsActive()
           ? response : reviewReadDenied();
       }
@@ -11658,6 +11709,7 @@ assertRouteCurrent();
       deadTurnId: string | null,
       policy: TurnReplayRetryPolicy = CAPACITY_RETRY_POLICY,
     ): { attempt: number; maxAttempts: number } | null => {
+      if(restricted)return null; // A claimed external input is never automatically replayed.
       const state = overloadRetry;
       if (!state || closed) return null;
       // 本轮已被取消(sendOpts.signal 已 abort)→ 一律不接管, 让这条错误走原终态路径收口。
@@ -13177,6 +13229,11 @@ assertRouteCurrent();
       },
 
       async send(message: UserMessage, sendOpts?: SendOptions) {
+        if (restricted) {
+          restricted.assertCurrent('model');
+          if (restrictedInputClaimed) throw new Error('RESTRICTED_PARTNER_NO_RESUBMIT');
+          restrictedInputClaimed = true;
+        }
         if (rejectClosedOrCancelledSend(sendOpts, 'before start')) {
           return;
         }
@@ -13749,7 +13806,7 @@ assertRouteCurrent();
           if (isLocalAcceptBoundaryError(e)) {
             throw e;
           }
-          if (/thread not found/i.test(String(e))) {
+          if (!restricted && /thread not found/i.test(String(e))) {
             log.info('turn/start hit "thread not found" — daemon likely restarted, attempting thread/resume + retry', {
               threadId,
             });
@@ -13943,6 +14000,7 @@ assertRouteCurrent();
       },
 
       async steer(message: UserMessage, sendOpts?: SendOptions) {
+        if (restricted) throw new Error('RESTRICTED_PARTNER_NO_RESUBMIT');
         rejectIfCancelled(sendOpts, 'steer');
         assertCurrentHost('turn/steer');
         if (closed) {

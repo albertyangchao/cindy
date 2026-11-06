@@ -1,3 +1,7 @@
+import { captureBotPermissionEpoch } from './botPermissionDispatch.js';
+import { captureRestrictedPartnerEpoch } from './restrictedPartnerEpoch.js';
+import { isTrustedAppRendererWindow } from '../security/trustedAppRenderer.js';
+import { createRestrictedPartnerHost } from './restrictedPartnerHost.js';
 import { registerRuntimeSettingsSection } from '../app-settings/runtime.js';
 import { z as settingsSchema } from 'zod';
 import { registerPreferenceControlIpc } from '../app-settings/preferences.js';
@@ -15226,7 +15230,104 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
   });
   invalidatePluginCompanions = () => companionHub?.invalidate();
   let pluginTargetReviewReady = false;
+  const restrictedCompletions = new Map<string,(claim:import('./restrictedPartnerExecution.js').RestrictedPartnerClaim,text:string,current:()=>void)=>Promise<void>>();
+  const restrictedPartnerHost = createRestrictedPartnerHost({
+    research:true,
+    modelConfiguration:async(id,current)=>{current();const sessionId=await resolvePluginTargetSession('bot',id);current();const meta=await maker.getSessionMeta(sessionId);current();if(!meta||meta.agentKind!=='codex'||meta.remoteHostId||meta.agentDeviceId)throw Error('RESTRICTED_PARTNER_RUNNER_UNSUPPORTED');const providerId=getSessionProvider(sessionId);if(!providerId)throw Error('ROUTE_UNAVAILABLE');const execution=await resolveSessionExecution({agentKind:'codex',model:meta.model,providerId,effort:meta.effort},sessionId);current();if(execution.agentKind!=='codex'||execution.providerId!==providerId)throw Error('RESTRICTED_PARTNER_ROUTE_UNSUPPORTED');return {providerId:execution.providerId,modelId:execution.model};},
+    executionReady: async()=>{
+      const status=getCachedBinaryStatus('codex');if(process.platform!=='darwin'||!status.binaryReady||!status.binaryPath)return false;
+      const version=await (await import('../agent-binaries/binary-version-probe.js')).probeBinaryVersion(status.binaryPath);
+      const after=getCachedBinaryStatus('codex');return version==='0.166.0'&&after.binaryReady&&after.binaryPath===status.binaryPath;
+    },
+    mediaConfiguration: async (id,current) => {current();const media=await import('./restrictedPartnerMedia.js');current();return media.restrictedMediaConfiguration(id,current);},
+    prepare: async (grant,claim,route,current,assets) => {
+      const snapshot=getCurrentDbClientSnapshot(); if(!snapshot)throw Error('HOST_NOT_READY');
+      const guard=()=>{current();if(getCurrentDbClientSnapshot()!==snapshot)throw Error('PERMISSION_DENIED');};
+      const ownerScope=captureDataOwnerBroadcastScope();
+      const conversation=await (await import('./restrictedPartnerConversation.js')).restrictedConversation(snapshot.client,grant,claim,route,guard,{
+        created: id=>{guard();if(!isDataOwnerBroadcastScopeCurrent(ownerScope))throw Error('PERMISSION_DENIED');emitSessionCreated(id);},
+        message: async(id,row)=>{const {messageToCamel}=await import('../localDb/mapper.js');guard();const {broadcastMessageRow}=await import('../localDb/ipc/messages.js');guard();if(!isDataOwnerBroadcastScopeCurrent(ownerScope))throw Error('PERMISSION_DENIED');broadcastMessageRow(id,messageToCamel(row),ownerScope);},
+      });guard();
+      const media=await (await import('./restrictedPartnerMedia.js')).restrictedPartnerMedia(snapshot.client,grant,claim,guard,assets,conversation.laneSessionId);guard();
+      const research=(await import('./restrictedPartnerResearch.js')).restrictedPartnerResearch(snapshot.client,grant,claim,guard,{
+        route:async()=>route,start:opts=>maker.startRestrictedPartnerInput(opts),
+        project:async g=>{guard();const [profile]=await snapshot.client.drizzle.select({persona:botProfileVersions.identitySource}).from(botProfiles).innerJoin(botProfileVersions,and(eq(botProfileVersions.botId,botProfiles.id),eq(botProfileVersions.version,botProfiles.currentVersion))).where(eq(botProfiles.id,g.partnerId)).limit(1);guard();if(!profile)throw Error('TARGET_UNAVAILABLE');const resources=(await import('./restrictedPartnerResources.js')).restrictedPartnerResources(g,guard);guard();return {persona:profile.persona,subjectContext:resources.context,readPaths:[],tools:[...resources.tools,...conversation.tools.filter(t=>t.name==='partner_history')]};},
+      });guard();
+      restrictedCompletions.set(claim.runId,conversation.append);
+      return {context:conversation.context+'\n'+media.context,tools:[...conversation.tools,...media.tools,research.tool],laneSessionId:conversation.laneSessionId,outputs:()=>{research.assertResolved();return media.outputs();}};
+    },
+    afterComplete: async(claim,text,current)=>{const append=restrictedCompletions.get(claim.runId);if(!append)throw Error('RESTRICTED_PARTNER_HISTORY_DENIED');try{await append(claim,text,current);}finally{restrictedCompletions.delete(claim.runId);}},
+    snapshot: () => {
+      const snapshot = getCurrentDbClientSnapshot();
+      if (!snapshot) throw new Error('HOST_NOT_READY');
+      return {client:snapshot.client,assertCurrent:()=>{if(getCurrentDbClientSnapshot()!==snapshot)throw new Error('PERMISSION_DENIED');}};
+    },
+    approvalRevision: pluginTargetAuthorizationRevision,
+    partnerAuthority:id=>{const profile=captureRestrictedPartnerEpoch(id),permissions=captureBotPermissionEpoch(id);return()=>{profile();permissions();};},
+    candidates: async () => {
+      const supported=[];
+      for(const candidate of await listPluginTargetCandidates('bot')) {
+        const sessionId=await resolvePluginTargetSession('bot',candidate.id);
+        const meta=await maker.getSessionMeta(sessionId);
+        if(meta?.agentKind==='codex' && !meta.remoteHostId && !meta.agentDeviceId && getSessionProvider(sessionId))supported.push(candidate);
+      }
+      return supported;
+    },
+    partner: async id => {
+      const snapshot=getCurrentDbClientSnapshot();
+      if(!snapshot)throw new Error('HOST_NOT_READY');
+      if(!(await listPluginTargetCandidates('bot')).some(p=>p.id===id))throw new Error('TARGET_UNAVAILABLE');
+      const [row]=await snapshot.client.drizzle.select({persona:botProfileVersions.identitySource,version:botProfiles.currentVersion})
+        .from(botProfiles).innerJoin(botProfileVersions,and(eq(botProfileVersions.botId,botProfiles.id),eq(botProfileVersions.version,botProfiles.currentVersion)))
+        .where(eq(botProfiles.id,id)).limit(1);
+      if(getCurrentDbClientSnapshot()!==snapshot || !row || !row.persona.trim())throw new Error('TARGET_UNAVAILABLE');
+      return row;
+    },
+    route: async id => {
+      const sessionId=await resolvePluginTargetSession('bot',id);
+      const meta=await maker.getSessionMeta(sessionId);
+      if(!meta || meta.agentKind!=='codex' || meta.remoteHostId || meta.agentDeviceId)throw new Error('RESTRICTED_PARTNER_RUNNER_UNSUPPORTED');
+      const providerId=getSessionProvider(sessionId);
+      if(!providerId)throw new Error('ROUTE_UNAVAILABLE');
+      const execution=await resolveSessionExecution({agentKind:'codex',model:meta.model,providerId,effort:meta.effort},sessionId);
+      if(execution.agentKind!=='codex')throw new Error('RESTRICTED_PARTNER_RUNNER_UNSUPPORTED');
+      if(execution.providerId!==providerId)throw new Error('RESTRICTED_PARTNER_ROUTE_UNSUPPORTED');
+      // A fresh Host-owned workspace, never the partner's private canonical cwd.
+      const workingDir=await fsp.mkdtemp(path.join(await (async()=>{
+        const root=ownerScopedUserDataPath('restricted-partner-inputs');await fsp.mkdir(root,{recursive:true,mode:0o700});return root;
+      })(), 'input-'));
+      return {workingDir,model:execution.model,providerId:execution.providerId,effort:execution.effort};
+    },
+    start: opts => maker.startRestrictedPartnerInput(opts),
+    confirm: async input => {
+      const win=getDeepLinkMainWindow();
+      if(!win || win.isDestroyed() || !isTrustedAppRendererWindow(win))return {approved:false,paths:[]};
+      const result=await dialog.showMessageBox(win,{type:'question',title:t('restrictedPartner.title'),
+        message:t('restrictedPartner.message').replace('{{partner}}',input.label),
+        detail:t('restrictedPartner.detail')+'\nScoped channel history, subject memory CAS, approved resource readers and available configured Core media routes only. No shell or unscoped integrations.\n'+JSON.stringify({media:input.mediaRoutes??{},model:input.modelRoute??null})+'\n'+'\n\n'+(getInstalledGhostName(input.pluginId)??input.pluginId)+' / '+input.principalId,buttons:[t('pluginCompanionAnswer.allow'),t('pluginCompanionAnswer.cancel')],defaultId:1,cancelId:1});
+      if(result.response!==0)return {approved:false,paths:[]};
+      if(input.requirements){
+        const coverage:Partial<Record<'workspace'|'notes'|'memory',string[]>>={};
+        for(const purpose of input.requirements.purposes){
+          const selection=await dialog.showOpenDialog(win,{title:'Original subject '+purpose+' — approve only this subject’s existing source',properties:purpose==='memory'?['openFile']:['openDirectory','multiSelections']});
+          input.assertCurrent();if(selection.canceled||!selection.filePaths.length)return {approved:false,paths:[]};coverage[purpose as keyof typeof coverage]=selection.filePaths;
+        }
+        input.assertCurrent();const memorySource=coverage.memory;
+        if(!memorySource||memorySource.length!==1)return {approved:false,paths:[]};
+        memorySource[0]=await fsp.realpath(memorySource[0]);input.assertCurrent();
+        const names=(await import('./restrictedPartnerLegacyMemory.js')).legacyMemoryNamespaces(memorySource[0],input.assertCurrent);input.assertCurrent();
+        let legacyNamespace:string|null=null;
+        if(names.length){const picked=await dialog.showMessageBox(win,{type:'question',title:'Original persistent-memory namespace',message:'Select this exact subject’s existing namespace. This never imports old request intents or summaries.',buttons:[...names,'Cancel'],defaultId:names.length,cancelId:names.length});input.assertCurrent();if(picked.response>=names.length)return {approved:false,paths:[]};legacyNamespace=names[picked.response];}
+        const review=await dialog.showMessageBox(win,{type:'question',title:'Confirm original capability sources',message:'These selected folders are the original approved workspace / notes / durable memory for this exact subject.',detail:JSON.stringify(input.requirements)+'\nThis approval binds only these resource purposes. Missing research/services remain blocked; approval never fabricates a provider or cancels old effects.',buttons:['Confirm original sources','Cancel'],defaultId:1,cancelId:1});
+        if(review.response!==0)return {approved:false,paths:[]};return {approved:true,paths:[],coverage,legacyNamespace};
+      }
+      if(!input.chooseResources)return {approved:true,paths:[]};
+      const selected=await dialog.showOpenDialog(win,{title:t('restrictedPartner.resources'),properties:['openFile','openDirectory','multiSelections']});
+      return selected.canceled ? {approved:false,paths:[]} : {approved:true,paths:selected.filePaths};
+    },
+  });
   setPluginTargetAdapter({
+    restricted: restrictedPartnerHost,
     prepareInvocation: preparePluginInvocation,
     acceptInvocation: acceptPluginInvocation,
     scheduleAutoTitle: schedulePluginAutoTitle,
