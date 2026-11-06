@@ -49,6 +49,7 @@ export interface RestrictedChannelInput {
   revision: number;
   epoch: number;
   memoryRead?: boolean;
+  addressHash?: string;
 }
 export interface RestrictedByteInputAsset {
   type?: never;
@@ -60,6 +61,7 @@ export interface RestrictedByteInputAsset {
   partial: boolean;
 }
 export type RestrictedInputAsset =
+  | import('./restrictedPartnerUrlInput.js').RestrictedUrlInputAsset
   | RestrictedByteInputAsset
   | {
       type: 'video';
@@ -121,6 +123,7 @@ export interface RestrictedPartnerPorts {
     assets: RestrictedInputAsset[],
   ): Promise<{
     context: string;
+    inputText?: string;
     tools: RestrictedPartnerTool[];
     outputs(): RestrictedOutputAsset[];
     laneSessionId: string;
@@ -481,7 +484,7 @@ export function createRestrictedPartnerExecution(ports: RestrictedPartnerPorts) 
           output = await Promise.race([
             (async () => {
               await handle!.send(
-                { type: 'user', content: request.text },
+                { type: 'user', content: prepared?.inputText ?? request.text },
                 { throwOnStartFailure: true },
               );
               return await collecting;

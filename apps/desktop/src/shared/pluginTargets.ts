@@ -30,11 +30,12 @@ export interface PluginRestrictedPartnerChannel {
   revision: number;
   epoch: number;
   memoryRead: boolean;
+  addressHash?:string;
 }
 export type PluginTargetRequest =
   | { kind: 'capabilities' }
   /** Candidate protocol: explicit owner-approved per-input isolation, not ordinary bot delegation. */
-  | { kind: 'restricted'; request: {operation:'capabilities'|'list'|'binding'|'bind'|'revoke'|'fence'|'resume'|'submit'|'get'; principalId?:string; partnerId?:string; expectedRevision?:number; grantRevision?:number; chooseResources?:boolean; inputId?:string; runId?:string; text?:string; requirements?:unknown; channel?:PluginRestrictedPartnerChannel; assets?:unknown[]} }
+  | { kind: 'restricted'; request: {operation:'capabilities'|'list'|'binding'|'bind'|'revoke'|'fence'|'resume'|'submit'|'get'|'publication'; action?:'prepare'|'run'|'read'|'lookup'|'reconcile'; nativeActionId?:string; principalId?:string; partnerId?:string; expectedRevision?:number; grantRevision?:number; chooseResources?:boolean; inputId?:string; runId?:string; text?:string; requirements?:unknown; channel?:PluginRestrictedPartnerChannel; assets?:unknown[]} }
   | { kind: 'list'; targetKind: PluginTargetKind }
   | { kind: 'resolve'; target: PluginTargetRef }
   | {

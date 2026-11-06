@@ -1,3 +1,5 @@
+import {approveNativePublicRelease} from './restrictedPublicationApproval.js';
+import {controlledPublicationRuntime,supportedPublicationRoot} from './restrictedPublicationCaller.js';
 import { captureBotPermissionEpoch } from './botPermissionDispatch.js';
 import { captureRestrictedPartnerEpoch } from './restrictedPartnerEpoch.js';
 import { isTrustedAppRendererWindow } from '../security/trustedAppRenderer.js';
@@ -15298,6 +15300,8 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
   let pluginTargetReviewReady = false;
   const restrictedCompletions = new Map<string,(claim:import('./restrictedPartnerExecution.js').RestrictedPartnerClaim,text:string,current:()=>void)=>Promise<void>>();
   const restrictedPartnerHost = createRestrictedPartnerHost({
+    inputUrls:true,
+    publication:{approve:input=>approveNativePublicRelease(input,{window:getDeepLinkMainWindow,trusted:isTrustedAppRendererWindow,show:(win,options)=>dialog.showMessageBox(win,options)}),runtime:(effectCurrent,readCurrent)=>supportedPublicationRoot?controlledPublicationRuntime(supportedPublicationRoot,{effectCurrent,readCurrent}):undefined},
     research:true,
     modelConfiguration:async(id,current)=>{current();const sessionId=await resolvePluginTargetSession('bot',id);current();const meta=await maker.getSessionMeta(sessionId);current();if(!meta||meta.agentKind!=='codex'||meta.remoteHostId||meta.agentDeviceId)throw Error('RESTRICTED_PARTNER_RUNNER_UNSUPPORTED');const providerId=getSessionProvider(sessionId);if(!providerId)throw Error('ROUTE_UNAVAILABLE');const execution=await resolveSessionExecution({agentKind:'codex',model:meta.model,providerId,effort:meta.effort},sessionId);current();if(execution.agentKind!=='codex'||execution.providerId!==providerId)throw Error('RESTRICTED_PARTNER_ROUTE_UNSUPPORTED');return {providerId:execution.providerId,modelId:execution.model};},
     executionReady: async()=>{
@@ -15314,9 +15318,10 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
         if (getCurrentDbClientSnapshot() !== snapshot) throw Error('PERMISSION_DENIED');
       };
       const ownerScope = captureDataOwnerBroadcastScope();
+      const projected=(await import('./restrictedPartnerUrlInput.js')).projectedUrlInput(grant,claim,assets);guard();
       const conversation = await (
         await import('./restrictedPartnerConversation.js')
-      ).restrictedConversation(snapshot.client, grant, claim, route, guard, {
+      ).restrictedConversation(snapshot.client, grant, {...claim,inputText:projected}, route, guard, {
         created: (id) => {
           guard();
           if (!isDataOwnerBroadcastScopeCurrent(ownerScope)) throw Error('PERMISSION_DENIED');
@@ -15332,105 +15337,7 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
         },
       });
       guard();
-      const approvedUrls = new Map<
-        string,
-        import('../cindy-brain/restrictedMediaUrl.js').MediaUrlGrant
-      >();
-      const urlKey = (
-        p: import('../cindy-brain/restrictedMediaAdapter.js').MediaPermit,
-        url: string,
-      ) =>
-        pluginTaskConfigHash('sha256')
-          .update(JSON.stringify([p.binding, url]))
-          .digest('hex');
-      const urlAuthority = {
-        approve: async (
-          p: import('../cindy-brain/restrictedMediaAdapter.js').MediaPermit,
-          raw: string,
-          role: 'input' | 'output',
-        ) => {
-          guard();
-          p.assertCurrent();
-          if (role !== 'output' || raw.length > 8192) throw Error('RESTRICTED_MEDIA_URL_DENIED');
-          const u = new URL(raw);
-          if (
-            u.protocol !== 'https:' ||
-            u.username ||
-            u.password ||
-            u.hash ||
-            !u.hostname.includes('.') ||
-            /[\[\]:]/.test(u.hostname) ||
-            /^\d+(\.\d+){3}$/.test(u.hostname) ||
-            u.hostname.endsWith('.') ||
-            (u.port && u.port !== '443')
-          )
-            throw Error('RESTRICTED_MEDIA_URL_DENIED');
-          const key = urlKey(p, raw);
-          if (approvedUrls.has(key)) return;
-          const win = getDeepLinkMainWindow();
-          if (!win || win.isDestroyed() || !isTrustedAppRendererWindow(win))
-            throw Error('RESTRICTED_MEDIA_URL_DENIED');
-          const sourceSha256 = pluginTaskConfigHash('sha256').update(raw).digest('hex');
-          let timer: ReturnType<typeof setTimeout> | undefined;
-          try {
-            const answer = await Promise.race([
-              dialog.showMessageBox(win, {
-                type: 'warning',
-                title: 'Restricted image download',
-                message: 'Download this generated image from the exact provider host?',
-                detail:
-                  'Host: ' +
-                  u.hostname +
-                  '\nURL digest: ' +
-                  sourceSha256 +
-                  '\nThis approves one bounded download only. Generation may already have incurred cost. No retry on unknown.',
-                buttons: ['Cancel', 'Approve download'],
-                defaultId: 0,
-                cancelId: 0,
-              }),
-              new Promise<never>((_, reject) => {
-                timer = setTimeout(() => reject(Error('RESTRICTED_MEDIA_URL_DENIED')), 30000);
-              }),
-            ]);
-            guard();
-            p.assertCurrent();
-            if (answer.response !== 1) throw Error('RESTRICTED_MEDIA_URL_DENIED');
-            approvedUrls.set(key, {
-              binding: { ...p.binding },
-              role,
-              sourceSha256,
-              hosts: [u.hostname],
-              revision: grant.revision,
-            });
-          } finally {
-            if (timer) clearTimeout(timer);
-          }
-        },
-        authorize: (
-          p: import('../cindy-brain/restrictedMediaAdapter.js').MediaPermit,
-          url: string,
-          role: 'input' | 'output',
-        ) => {
-          guard();
-          p.assertCurrent();
-          const a = approvedUrls.get(urlKey(p, url));
-          if (!a || a.role !== role) throw Error('RESTRICTED_MEDIA_URL_DENIED');
-          return a;
-        },
-        assertCurrent: (
-          p: import('../cindy-brain/restrictedMediaAdapter.js').MediaPermit,
-          a: import('../cindy-brain/restrictedMediaUrl.js').MediaUrlGrant,
-        ) => {
-          guard();
-          p.assertCurrent();
-          if (
-            ![...approvedUrls.values()].some(
-              (v) => v === a || JSON.stringify(v) === JSON.stringify(a),
-            )
-          )
-            throw Error('RESTRICTED_MEDIA_URL_DENIED');
-        },
-      };
+      const urlAuthority=(await import('./restrictedPartnerUrlApproval.js')).nativeImageUrlAuthority(grant,guard,{window:getDeepLinkMainWindow,trusted:isTrustedAppRendererWindow,show:(win,options)=>dialog.showMessageBox(win,options)});
       const media = await (
         await import('./restrictedPartnerMedia.js')
       ).restrictedPartnerMedia(
@@ -15487,6 +15394,7 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       restrictedCompletions.set(claim.runId, conversation.append);
       return {
         context: conversation.context + '\n' + media.context,
+        inputText:media.inputText,
         tools: [...conversation.tools, ...media.tools, research.tool],
         laneSessionId: conversation.laneSessionId,
         outputs: () => {

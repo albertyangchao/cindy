@@ -1,3 +1,4 @@
+import {validateRestrictedUrlInput,projectedUrlInput,normalizeRestrictedUrlImage} from './restrictedPartnerUrlInput.js';
 import {
   analyzeRestrictedVideo,
   validatePreparedVideo,
@@ -96,6 +97,7 @@ export async function restrictedPartnerMedia(
     approve?(permit: MediaPermit, url: string, role: 'input' | 'output'): Promise<void>;
   },
 ) {
+  const inputText=projectedUrlInput(g,claim,inputs);
   const config = await restrictedMediaConfiguration(g.partnerId, current);
   current();
   const routes = g.media ?? {};
@@ -289,15 +291,14 @@ export async function restrictedPartnerMedia(
   const handles = new WeakMap<object, MediaPermit>();
   const receipts = new Map<string, MediaReceipt>();
   // Main-only explicit approval port; absence keeps URL routes closed.
-  const urlStageKey = (p: MediaPermit, source: string) =>
-    'restricted:url:' + sha(JSON.stringify([claim.runId, p.binding.effectSlot, source, 'output']));
+  const urlStageKey = (p: MediaPermit, source: string, role:'input'|'output') =>
+    'restricted:url:' + sha(JSON.stringify([claim.runId, p.binding.effectSlot, source, role]));
   const resultUrlLoader = urlAuthorization
     ? createRestrictedMediaUrlLoader({
         ...urlAuthorization,
         claim: async (p, source, role) => {
           p.assertCurrent();
-          if (role !== 'output') fail();
-          return insert(urlStageKey(p, source), {
+          return insert(urlStageKey(p, source,p.binding.effectSlot.startsWith('input-url:')?'input':'output'), {
             state: 'UNKNOWN',
             binding: p.binding,
             sourceSha256: source,
@@ -306,7 +307,7 @@ export async function restrictedPartnerMedia(
         },
         complete: async (p, source, hash) => {
           p.assertCurrent();
-          const old = await readRow(urlStageKey(p, source));
+          const old = await readRow(urlStageKey(p, source,p.binding.effectSlot.startsWith('input-url:')?'input':'output'));
           p.assertCurrent();
           if (!old) fail();
           const record = JSON.parse(old!.payload);
@@ -472,6 +473,20 @@ export async function restrictedPartnerMedia(
   let total = 0;
   for (const item of inputs) {
     current();
+    if(item.type==='image-url'){
+      if(!resultUrlLoader||!urlAuthorization?.approve)fail();
+      validateRestrictedUrlInput(g,claim,item);
+      const selected=g.media?.vision?'vision':'edit',b=makeBinding(selected,'input-url:'+item.urlSha256);
+      const permit:MediaPermit={binding:b,kind:selected,signal:signal.signal,assertCurrent:current};
+      await urlAuthorization.approve(permit,item.url,'input');current();
+      const downloaded=await resultUrlLoader(permit,item.url,'input');current();
+      if(downloaded.sourceSha256!==item.urlSha256||!sameBinding(downloaded.binding,b))fail();
+      const bytes=await normalizeRestrictedUrlImage(downloaded.bytes,downloaded.mimeType,current);current();
+      total+=bytes.length;if(total>8*1024*1024)fail();
+      const prepared=await ingest(permit,bytes,'image/png');current();
+      context.push({id:prepared.id,mimeType:'image/png',sourceSha256:downloaded.sha256,normalizedSha256:prepared.sha256,partial:false});
+      continue;
+    }
     if (item.type === 'video') {
       if (!routes.vision || !claim.inputId) fail();
       const prepared = item.video,
@@ -774,6 +789,7 @@ export async function restrictedPartnerMedia(
     },
   };
   return {
+    inputText,
     context: JSON.stringify({
       authorizedRequestMedia: context,
       approvedMediaRoutes: routes,

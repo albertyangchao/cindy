@@ -1,3 +1,5 @@
+import {createNativePublicationAuthority,type NativePublisherRuntime,type NativePublicationOwnerInput} from './restrictedPartnerPublication.js';
+import {validateRestrictedUrlInput} from './restrictedPartnerUrlInput.js';
 import {
   legacyMemoryNamespaces,
   approveMemorySources,
@@ -24,6 +26,8 @@ import {
 } from './restrictedPartnerExecution.js';
 
 export interface RestrictedPartnerHostDeps {
+  inputUrls?: boolean;
+  publication?:{approve(input:NativePublicationOwnerInput):Promise<{approved:boolean;publicNonPersonal:boolean}>;runtime(effectCurrent:()=>void,readCurrent:()=>void):NativePublisherRuntime|undefined};
   executionReady?(): Promise<boolean>;
   research?: true;
   modelConfiguration?(
@@ -160,6 +164,8 @@ export function createRestrictedPartnerHost(deps: RestrictedPartnerHostDeps) {
         credentials: 'host-only',
         egress: 'original-caller-only',
         media: deps.mediaConfiguration ? 'owner-approved-core-routes' : false,
+        imageUrlInput:deps.inputUrls&&deps.prepare?'native-owner-per-inbox-source':false,
+        publicReleaseAuthority:deps.publication?'native-owner-action/v1':false,
         unsupported: ['unscoped-mcp', 'shell', 'remote-runner', 'claude-code', 'pi'],
         normalTasksFallback: false,
       };
@@ -314,7 +320,8 @@ export function createRestrictedPartnerHost(deps: RestrictedPartnerHostDeps) {
     const grant = await store.readGrant(pluginId, grantId);
     current();
     validGrant(grant);
-    if (!grant || !grant.enabled || grant.approvalRevision !== approval || binding.has(grantId))
+    const historicalPublication=a.operation==='publication'&&['read','lookup','reconcile'].includes(String(a.action));
+    if (!grant || (!historicalPublication&&(!grant.enabled||grant.approvalRevision!==approval||binding.has(grantId))))
       return fail('PERMISSION_DENIED');
     const executionEpoch = epochs.get(grantId) ?? 0;
     const partnerCurrent = deps.partnerAuthority(grant.partnerId);
@@ -323,7 +330,7 @@ export function createRestrictedPartnerHost(deps: RestrictedPartnerHostDeps) {
       current();
       partnerCurrent();
       if (
-        (epochs.get(g.id) ?? 0) !== executionEpoch ||
+        !g.enabled || (epochs.get(g.id) ?? 0) !== executionEpoch ||
         binding.has(g.id) ||
         revisions.get(g.id) !== g.revision ||
         g.approvalRevision !== approval
@@ -429,6 +436,17 @@ export function createRestrictedPartnerHost(deps: RestrictedPartnerHostDeps) {
     if (revisions.has(grantId) && revisions.get(grantId) !== grant.revision)
       return fail('STALE_REVISION');
     revisions.set(grantId, grant.revision);
+    if(a.operation==='publication'){
+      if(!deps.publication||!['prepare','run','read','lookup','reconcile'].includes(String(a.action))||Object.keys(a).some(k=>!['operation','principalId','action','runId','nativeActionId','expectedRevision'].includes(k))||
+       (['prepare','lookup'].includes(String(a.action))?(!id(a.runId)||a.nativeActionId!==undefined):(!/^[a-f0-9-]{36}$/.test(String(a.nativeActionId))||a.runId!==undefined))||
+       (!historicalPublication&&a.expectedRevision!==grant.revision))return fail('INVALID_PARAMS');
+      const service=createNativePublicationAuthority(snapshot.client,pluginId,current,assertGrant,{readGrant:id=>store.readGrant(pluginId,id),readRun:id=>store.byRun(pluginId,id),approve:deps.publication.approve,runtime:()=>deps.publication!.runtime(()=>assertGrant(grant),current)});
+      if(a.action==='lookup')return service.lookup(grant,a.runId as string);
+      if(a.action==='prepare'){sourceRequired=true;assertGrant(grant);const action=await service.prepare(grant,a.runId as string);return service.read(grant,action.nativeActionId);}
+      if(a.action==='run'){sourceRequired=true;assertGrant(grant);await service.run(grant,a.nativeActionId as string);return service.read(grant,a.nativeActionId as string);}
+      if(a.action==='reconcile')await service.reconcile(grant,a.nativeActionId as string);
+      return service.read(grant,a.nativeActionId as string);
+    }
     if (
       a.operation === 'binding' &&
       Object.keys(a).every((k) => ['operation', 'principalId'].includes(k))
@@ -549,6 +567,7 @@ export function createRestrictedPartnerHost(deps: RestrictedPartnerHostDeps) {
               'revision',
               'epoch',
               'memoryRead',
+              'addressHash',
             ].includes(k),
         ) ||
         ['domainId', 'principalId', 'connectionId', 'generation', 'chatId', 'eventId'].some(
@@ -556,6 +575,7 @@ export function createRestrictedPartnerHost(deps: RestrictedPartnerHostDeps) {
             typeof c[k] !== 'string' || !(c[k] as string).length || (c[k] as string).length > 256,
         ) ||
         typeof c.memoryRead !== 'boolean' ||
+        (c.addressHash!==undefined && (typeof c.addressHash!=='string'||!/^[a-f0-9]{64}$/.test(c.addressHash))) ||
         !Number.isSafeInteger(c.revision) ||
         Number(c.revision) < 1 ||
         !Number.isSafeInteger(c.epoch) ||
@@ -575,6 +595,8 @@ export function createRestrictedPartnerHost(deps: RestrictedPartnerHostDeps) {
       let bytes = 0;
       for (const rawAsset of a.assets) {
         const x = rawAsset as Record<string, unknown>;
+        if(x.type==='image-url'){try{validateRestrictedUrlInput(grant,{inputId:a.inputId as string,inputText:a.text as string,channel:a.channel as import('./restrictedPartnerExecution.js').RestrictedChannelInput},x as unknown as import('./restrictedPartnerUrlInput.js').RestrictedUrlInputAsset);}catch{return fail('INVALID_PARAMS');}continue;}
+
         if (x.type === 'video') {
           if (
             Object.keys(x).some((k) => !['type', 'id', 'sourceSha256', 'video'].includes(k)) ||

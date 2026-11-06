@@ -1,3 +1,4 @@
+import {withoutRawImageUrls} from './restrictedPartnerUrlInput.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { and, eq, desc } from 'drizzle-orm';
 import type { DbClient } from '../localDb/client/DbClient.js';
@@ -20,11 +21,11 @@ function userQuestion(text: string): string {
       Array.isArray(p.documents) &&
       Object.keys(p).every((k) => ['question', 'facts', 'documents'].includes(k))
     )
-      return p.question;
+      return withoutRawImageUrls(p.question);
   } catch {
     /* Direct native API callers may supply plain text. */
   }
-  return text;
+  return withoutRawImageUrls(text);
 }
 const sha = (x: string) => createHash('sha256').update(x).digest('hex');
 function fail(): never {

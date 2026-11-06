@@ -781,3 +781,37 @@ it('actual Main URL-result stage requires exact approval before one bounded down
     f.sql.close();
   }
 });
+
+for(const scenario of ['complete','cancel','late-revoke','network-unknown'] as const)it('real SQL/native approval/Core URL input chain '+scenario+' preserves claim and never re-fetches unknown',async()=>{
+ const validPng=await (await import('sharp')).default({create:{width:8,height:6,channels:3,background:'#445566'}}).png().toBuffer();
+ const f=fixture();const {grantResourceFingerprint}=await import('../restrictedPartnerRequirements.js');
+ const {nativeImageUrlAuthority}=await import('../restrictedPartnerUrlApproval.js');
+ const {projectedUrlInput}=await import('../restrictedPartnerUrlInput.js');
+ const addressHash=sha('synthetic-address');f.channel={...f.channel,addressHash} as any;
+ f.grant.media={vision:{providerId:'fake',modelId:'vision'},edit:{providerId:'fake',modelId:'edit'}};
+ f.grant.requirements={version:1,revision:2,principalId:f.grant.principalId,addressHashes:[addressHash],source:{registry:'a'.repeat(64),nativeConfig:'b'.repeat(64),overlays:['c'.repeat(64)]},tools:['workspace-read'],purposes:['workspace'],media:['vision','edit']};
+ const resource={id:sha('/synthetic'),path:'/synthetic'};f.grant.resources=[resource];f.grant.resourceIds=[resource.id];f.grant.resourceCoverage={workspace:[resource.id]};
+ const registry=new ImageChannelRegistry();let edits=0,models=0,network=0,approvals=0;
+ registry.register('fake',{ready:()=>true,generateImage:async()=>{throw Error('unused');},editImage:async()=>{edits++;return {data:[{b64_json:png.toString('base64')}]};}});mocks.images=registry;mocks.routes={edit:f.grant.media.edit};
+ mocks.vision={route:f.grant.media.vision,assertCurrent:f.current,deps:{getProviderById:()=>null,resolveBackendRoute:()=>({upstream:'https://provider.example.invalid/v1',requestPath:'/chat/completions',model:'vision',authorization:null,headers:{},wireProtocol:'openai-chat'})}};
+ mocks.network.mockReset();mocks.network.mockImplementation(async(_url:string,init:any)=>{network++;if(init.method==='GET'){if(scenario==='network-unknown')throw Error('SYNTHETIC_DISCONNECT');if(scenario==='late-revoke')f.revoke();return new Response(validPng,{headers:{'content-type':'image/png'}});}return Response.json({choices:[{message:{content:'Scoped image description'}}]});});
+ mocks.ingest.mockImplementation(async(p:any)=>{p.assertStillValid();return {ext:'.png'};});
+ await f.store.compareAndSwapGrant(f.grant,0);
+ const url='https://images.example.invalid/source.png?marker=SYNTHETIC_PRIVATE';const question='Describe and edit '+url;const inputId='inbound-url',text=JSON.stringify({question,facts:[],documents:[]});
+ const binding={domainId:f.channel.domainId,connectionId:f.channel.connectionId,generation:f.channel.generation,chatId:f.channel.chatId,eventId:f.channel.eventId,revision:f.channel.revision,epoch:1,principalId:f.grant.principalId,partnerId:f.grant.partnerId,runId:'input:'+inputId,resourceFingerprint:grantResourceFingerprint(f.grant),providerId:'fake',modelId:'vision',effectSlot:'input-url:'+sha(url)};
+ const a:any={type:'image-url',id:'url:'+sha(JSON.stringify([Object.entries(binding).sort(([a],[b])=>a.localeCompare(b)),addressHash,sha(question),sha(url)])),url,urlSha256:sha(url),questionSha256:sha(question),addressHash,binding};
+ const request={grantId:'grant',pluginId:'plugin',principalId:f.grant.principalId,partnerId:'bot',inputId,text,channel:f.channel,assets:[a]};
+ const service=createRestrictedPartnerExecution({assertCurrent:f.current,readGrant:()=>f.store.readGrant('plugin','grant'),readClaim:f.store.readClaim,reserve:f.store.reserve,recordExecution:f.store.recordExecution,recordResult:f.store.recordResult,complete:f.store.complete,project:async()=>({persona:'Approved persona',subjectContext:'',readPaths:[]}),route:async()=>f.route,
+  prepare:async(g,claim,route,current,assets)=>{
+   const native=nativeImageUrlAuthority(g,current,{window:()=>({isDestroyed:()=>false}) as any,trusted:()=>true,show:async(_win,options)=>{approvals++;expect(options.defaultId).toBe(0);expect(options.detail).not.toContain(url);return {response:scenario==='cancel'?0:1,checkboxChecked:false};}});
+   const media=await restrictedPartnerMedia(f.db,g,claim,current,assets,undefined,native);
+   const conversation=await restrictedConversation(f.db,g,{...claim,inputText:projectedUrlInput(g,claim,assets)},route,current);
+   return {context:conversation.context+'\n'+media.context,inputText:media.inputText,tools:media.tools,laneSessionId:conversation.laneSessionId,outputs:media.outputs};
+  },
+  start:async opts=>{models++;let done!:()=>void;const finished=new Promise<void>(r=>{done=r;});return {id:'url-native-thread',send:async(m:any)=>{expect(m.content).not.toContain(url);expect(m.content).not.toContain('SYNTHETIC_PRIVATE');const input=opts[RESTRICTED_PARTNER]!;const media=JSON.parse(input.instructions.split('\n').at(-1)!).authorizedRequestMedia[0];const tool=input.tools.find(t=>t.name==='partner_media')!;expect(media.mimeType).toBe('image/png');expect(media.id).toMatch(/^asset:/);await tool.invoke({kind:'vision',text:'describe',inputId:media.id},{runId:opts.sessionId!,callId:'vision'});await tool.invoke({kind:'edit',text:'edit',inputId:media.id},{runId:opts.sessionId!,callId:'edit'});done();},close:async()=>{},async *events(){await finished;yield {type:'text',data:{text:'Scoped result',agentMessageId:'url-output',phase:'final'}};yield {type:'done',data:{}};}} as unknown as AgentSessionHandle;},
+ });
+ try{
+  if(scenario==='complete'){const result=await service.run(request);expect(result.state).toBe('COMPLETE');expect(result.assets).toHaveLength(1);expect(result.assets![0].binding.chatId).toBe('original');expect(edits).toBe(1);expect(models).toBe(1);expect(network).toBe(2);expect(approvals).toBe(1);await service.run(request);expect(network).toBe(2);expect(models).toBe(1);}
+  else {await expect(service.run(request)).rejects.toThrow();expect(models).toBe(0);expect(mocks.ingest).not.toHaveBeenCalled();const snapshot=f.sql.prepare('SELECT payload FROM plugin_task_requests WHERE target_id LIKE ?').all('restricted:input:%');expect(snapshot.length).toBe(1);if(scenario!=='late-revoke'){await service.run(request);expect(network).toBe(scenario==='cancel'?0:1);expect(approvals).toBe(1);}expect(edits).toBe(0);}
+ }finally{f.sql.close();}
+});
