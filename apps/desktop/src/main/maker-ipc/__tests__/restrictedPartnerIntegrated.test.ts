@@ -486,3 +486,62 @@ it('exact input/edit pixels and distinct sequential/concurrent effects retain in
     f.sql.close();
   }
 });
+
+import { originalMemoryFixture } from './originalMemoryFixture.js';
+import { assertMemorySources } from '../restrictedPartnerLegacyMemory.js';
+import { existsSync } from 'node:fs';
+it('real per-subject memory CAS still saves new facts when approved old DB never existed; alias shares facts, other subject cannot read them', async () => {
+  const f = fixture(),
+    source = originalMemoryFixture();
+  try {
+    const g = { ...f.grant, memorySources: source.approve() };
+    const current = () => {
+      f.current();
+      assertMemorySources(g.memorySources, f.current);
+    };
+    const claim = {
+      runId: 'new-memory-run',
+      text: 'synthetic new question',
+      channel: f.channel,
+    } as Parameters<typeof restrictedConversation>[2];
+    const lane = await restrictedConversation(f.db, g, claim, f.route, current);
+    const memory = lane.tools.find((t) => t.name === 'partner_memory')!;
+    await memory.invoke(
+      { facts: ['NEW_SUBJECT_FACT'], expectedRevision: 0 },
+      { callId: 'save', runId: claim.runId },
+    );
+    expect(existsSync(source.database)).toBe(false);
+    const alias = await restrictedConversation(
+      f.db,
+      g,
+      { ...claim, channel: { ...f.channel, chatId: 'same-person-alias' } },
+      f.route,
+      current,
+    );
+    expect(
+      JSON.stringify(
+        await alias.tools
+          .find((t) => t.name === 'partner_memory')!
+          .invoke({}, { callId: 'read', runId: claim.runId }),
+      ),
+    ).toContain('NEW_SUBJECT_FACT');
+    const other = { ...g, principalId: sha(JSON.stringify(['domain', 'other'])) };
+    const foreign = await restrictedConversation(
+      f.db,
+      other,
+      { ...claim, channel: { ...f.channel, principalId: 'other' } },
+      f.route,
+      current,
+    );
+    expect(
+      JSON.stringify(
+        await foreign.tools
+          .find((t) => t.name === 'partner_memory')!
+          .invoke({}, { callId: 'read', runId: claim.runId }),
+      ),
+    ).not.toContain('NEW_SUBJECT_FACT');
+  } finally {
+    f.sql.close();
+    source.cleanup();
+  }
+});

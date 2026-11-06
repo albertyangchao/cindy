@@ -19392,6 +19392,12 @@
     "lineNumbers": "行号"
   },
   "restrictedPartner": {
+    "originalSourceRoot": "选择此主体原有的资料根目录",
+    "fixedMemoryDirectory": "选择原 PROFILE / MEMORY / INTERESTS 目录",
+    "originalAbsenceTitle": "核验原本无数据库的历史证据",
+    "originalAbsenceBody": "固定原始记录证明此主体原本没有此数据库。请确认已核验该历史记录，而不只是当前文件缺失。",
+    "approveOriginalAbsence": "我已核验原始缺库记录",
+    "evidenceRevision": "原始证据版本",
     "title": "插件访问权限",
     "message": "允许外部消息使用伙伴“{{partner}}”吗？",
     "detail": "仅使用所选伙伴身份和你明确选择的只读资料。不共享其它任务历史、主人记忆、凭据、网络或通用工具。此授权不会启用消息入口。",

@@ -15373,19 +15373,30 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
         detail:t('restrictedPartner.detail')+'\nScoped channel history, subject memory CAS, approved resource readers and available configured Core media routes only. No shell or unscoped integrations.\n'+JSON.stringify({media:input.mediaRoutes??{},model:input.modelRoute??null})+'\n'+'\n\n'+(getInstalledGhostName(input.pluginId)??input.pluginId)+' / '+input.principalId,buttons:[t('pluginCompanionAnswer.allow'),t('pluginCompanionAnswer.cancel')],defaultId:1,cancelId:1});
       if(result.response!==0)return {approved:false,paths:[]};
       if(input.requirements){
-        const coverage:Partial<Record<'workspace'|'notes'|'memory',string[]>>={};
+        const coverage:Partial<Record<'workspace'|'notes'|'memory'|'durable-files',string[]>>={};
+        let sourceRoots:{root:string;durableRoot:string;historicalAbsenceReviewed:boolean}|undefined;
+        if(input.requirements.sourceInventory){
+          const memory=await import('./restrictedPartnerLegacyMemory.js');input.assertCurrent();
+          const root=await dialog.showOpenDialog(win,{title:t('restrictedPartner.originalSourceRoot'),properties:['openDirectory']});input.assertCurrent();if(root.canceled||root.filePaths.length!==1)return {approved:false,paths:[]};
+          const durable=await dialog.showOpenDialog(win,{title:t('restrictedPartner.fixedMemoryDirectory'),properties:['openDirectory']});input.assertCurrent();if(durable.canceled||durable.filePaths.length!==1)return {approved:false,paths:[]};
+          const sourceRoot=await fsp.realpath(root.filePaths[0]);input.assertCurrent();const durableRoot=await fsp.realpath(durable.filePaths[0]);input.assertCurrent();
+          let reviewed=false;if(input.requirements.sourceInventory.database.state==='absent'){const proof=await dialog.showMessageBox(win,{type:'question',title:t('restrictedPartner.originalAbsenceTitle'),message:t('restrictedPartner.originalAbsenceBody'),detail:t('restrictedPartner.evidenceRevision')+': '+input.requirements.sourceInventory.evidenceRevision+' / '+input.requirements.sourceInventory.evidenceHash,buttons:[t('restrictedPartner.approveOriginalAbsence'),t('common.cancel')],defaultId:1,cancelId:1});input.assertCurrent();if(proof.response!==0)return {approved:false,paths:[]};reviewed=true;}
+          memory.approveMemorySources(sourceRoot,durableRoot,input.requirements.sourceInventory,reviewed,input.assertCurrent);
+          sourceRoots={root:sourceRoot,durableRoot,historicalAbsenceReviewed:reviewed};coverage.memory=[input.requirements.sourceInventory.database.state==='present'?memory.originalDatabasePath(sourceRoot):sourceRoot];coverage['durable-files']=[durableRoot];
+        }
         for(const purpose of input.requirements.purposes){
+          if(sourceRoots&&['memory','durable-files'].includes(purpose))continue;
           const selection=await dialog.showOpenDialog(win,{title:'Original subject '+purpose+' — approve only this subject’s existing source',properties:purpose==='memory'?['openFile']:['openDirectory','multiSelections']});
           input.assertCurrent();if(selection.canceled||!selection.filePaths.length)return {approved:false,paths:[]};coverage[purpose as keyof typeof coverage]=selection.filePaths;
         }
         input.assertCurrent();const memorySource=coverage.memory;
         if(!memorySource||memorySource.length!==1)return {approved:false,paths:[]};
         memorySource[0]=await fsp.realpath(memorySource[0]);input.assertCurrent();
-        const names=(await import('./restrictedPartnerLegacyMemory.js')).legacyMemoryNamespaces(memorySource[0],input.assertCurrent);input.assertCurrent();
+        const names=sourceRoots&&input.requirements.sourceInventory?.database.state==='absent'?[]:(await import('./restrictedPartnerLegacyMemory.js')).legacyMemoryNamespaces(memorySource[0],input.assertCurrent,input.requirements.excludedNamespaces);input.assertCurrent();
         let legacyNamespace:string|null=null;
         if(names.length){const picked=await dialog.showMessageBox(win,{type:'question',title:'Original persistent-memory namespace',message:'Select this exact subject’s existing namespace. This never imports old request intents or summaries.',buttons:[...names,'Cancel'],defaultId:names.length,cancelId:names.length});input.assertCurrent();if(picked.response>=names.length)return {approved:false,paths:[]};legacyNamespace=names[picked.response];}
         const review=await dialog.showMessageBox(win,{type:'question',title:'Confirm original capability sources',message:'These selected folders are the original approved workspace / notes / durable memory for this exact subject.',detail:JSON.stringify(input.requirements)+'\nThis approval binds only these resource purposes. Missing research/services remain blocked; approval never fabricates a provider or cancels old effects.',buttons:['Confirm original sources','Cancel'],defaultId:1,cancelId:1});
-        if(review.response!==0)return {approved:false,paths:[]};return {approved:true,paths:[],coverage,legacyNamespace};
+        if(review.response!==0)return {approved:false,paths:[]};return {approved:true,paths:[],coverage,legacyNamespace,...(sourceRoots?{sourceRoots}:{})};
       }
       if(!input.chooseResources)return {approved:true,paths:[]};
       const selected=await dialog.showOpenDialog(win,{title:t('restrictedPartner.resources'),properties:['openFile','openDirectory','multiSelections']});

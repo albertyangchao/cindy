@@ -1,4 +1,7 @@
 import Database from 'better-sqlite3';
+import { createHash } from 'node:crypto';
+import type { OriginalMemoryInventory } from './restrictedPartnerRequirements.js';
+import { validateOriginalInventory } from './restrictedPartnerRequirements.js';
 import path from 'node:path';
 import {
   lstatSync,
@@ -89,22 +92,28 @@ function opened<T>(file: string, current: () => void, fn: (db: Database.Database
     }
   }
 }
-export function legacyMemoryNamespaces(file: string, current: () => void): string[] {
+export function legacyMemoryNamespaces(
+  file: string,
+  current: () => void,
+  excluded: string[] = [],
+): string[] {
   return opened(file, current, (db) => {
     const rows = db
       .prepare('SELECT DISTINCT substr(namespace,1,129) AS namespace FROM sticky_notes LIMIT 65')
       .all() as Array<{ namespace: unknown }>;
     if (rows.length > 64) deny();
-    return rows.map((r) => {
-      if (
-        typeof r.namespace !== 'string' ||
-        !r.namespace.length ||
-        r.namespace.length > 128 ||
-        /[\x00-\x1f]/.test(r.namespace)
-      )
-        deny();
-      return r.namespace as string;
-    });
+    return rows
+      .map((r) => {
+        if (
+          typeof r.namespace !== 'string' ||
+          !r.namespace.length ||
+          r.namespace.length > 128 ||
+          /[\x00-\x1f]/.test(r.namespace)
+        )
+          deny();
+        return r.namespace as string;
+      })
+      .filter((n) => !excluded.includes(n));
   });
 }
 export function searchLegacyMemory(
@@ -112,6 +121,7 @@ export function searchLegacyMemory(
   namespace: string | null,
   query: string,
   current: () => void,
+  excluded: string[] = [],
 ) {
   if (
     (namespace !== null &&
@@ -123,9 +133,10 @@ export function searchLegacyMemory(
     deny();
   return opened(file, current, (db) => {
     if (namespace === null) {
-      if (db.prepare('SELECT 1 FROM sticky_notes LIMIT 1').get()) deny();
+      if (legacyMemoryNamespaces(file, current, excluded).length) deny();
       return { matches: [], partial: false, summaryExcluded: true };
     }
+    if (excluded.includes(namespace)) deny();
     // Bound allocations before returning a value. Namespace never comes from model/plugin arguments.
     const rows = db
       .prepare(
@@ -140,4 +151,193 @@ export function searchLegacyMemory(
       summaryExcluded: true,
     };
   });
+}
+
+/** Private native owner approval. No paths/absence booleans are accepted on the plugin wire. */
+export interface ApprovedMemorySources {
+  root: string;
+  durableRoot: string;
+  inventory: OriginalMemoryInventory;
+  snapshot: string;
+}
+const sourceHash = (v: string | Buffer) => createHash('sha256').update(v).digest('hex');
+function sourceStat(file: string, directory: boolean) {
+  const s = lstatSync(file);
+  if (
+    s.isSymbolicLink() ||
+    realpathSync(file) !== file ||
+    (directory ? !s.isDirectory() : !s.isFile()) ||
+    (typeof process.getuid === 'function' && s.uid !== process.getuid()) ||
+    (directory ? (s.mode & 0o500) !== 0o500 : (s.mode & 0o444) === 0) ||
+    (!directory && s.nlink !== 1)
+  )
+    deny();
+  return [s.dev, s.ino, s.size, s.mtimeMs, s.ctimeMs, s.mode, s.uid];
+}
+function optionalFile(file: string, limit: number): number[] | null {
+  try {
+    const s = sourceStat(file, false);
+    if (s[2] > limit) deny();
+    return s;
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw e;
+  }
+}
+export const originalDatabasePath = (root: string) =>
+  path.join(root, '.bridge', 'runtime', 'memory.db');
+function sourceBytes(file: string, limit: number, current: () => void): Buffer {
+  current();
+  const before = sourceStat(file, false);
+  if (before[2] > limit) deny();
+  let fd: number | undefined;
+  try {
+    fd = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const stat = fstatSync(fd);
+    if (stat.ino !== before[1] || stat.dev !== before[0]) deny();
+    const bytes = Buffer.alloc(Number(before[2]) + 1);
+    let n = 0;
+    while (n < bytes.length) {
+      current();
+      const count = readSync(fd, bytes, n, bytes.length - n, null);
+      if (!count) break;
+      n += count;
+    }
+    if (n !== before[2] || JSON.stringify(sourceStat(file, false)) !== JSON.stringify(before))
+      deny();
+    current();
+    return bytes.subarray(0, n);
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+function sourceSnapshot(
+  source: Pick<ApprovedMemorySources, 'root' | 'durableRoot' | 'inventory'>,
+  current: () => void,
+  verifyBytes: boolean,
+) {
+  current();
+  const { root, durableRoot, inventory: i } = source;
+  validateOriginalInventory(i);
+  if (
+    !path.isAbsolute(root) ||
+    !path.isAbsolute(durableRoot) ||
+    sourceHash(root) !== i.rootHash ||
+    sourceHash(durableRoot) !== i.durableRootHash
+  )
+    deny();
+  const records: unknown[] = [sourceStat(root, true), sourceStat(durableRoot, true)];
+  for (const f of i.files) {
+    const name = path.join(durableRoot, f.name),
+      s = optionalFile(name, 65536);
+    if (Boolean(s) !== f.exists) deny();
+    records.push([f.name, s]);
+    if (s && verifyBytes && sourceHash(sourceBytes(name, 65536, current)) !== f.sha256) deny();
+    current();
+  }
+  let missing = false;
+  for (const piece of ['.bridge', '.bridge/runtime']) {
+    const target = path.join(root, piece);
+    try {
+      if (missing) {
+        try {
+          lstatSync(target);
+          deny();
+        } catch (e) {
+          if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e;
+        }
+      } else records.push([piece, sourceStat(target, true)]);
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e;
+      missing = true;
+      records.push([piece, null]);
+    }
+  }
+  const db = originalDatabasePath(root),
+    stat = missing ? null : optionalFile(db, 32 * 1024 * 1024);
+  if ((i.database.state === 'present') !== Boolean(stat)) deny();
+  records.push(['memory.db', stat]);
+  if (stat) {
+    for (const suffix of ['-wal', '-shm', '-journal']) {
+      try {
+        lstatSync(db + suffix);
+        deny();
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e;
+      }
+    }
+    if (verifyBytes && sourceHash(sourceBytes(db, 32 * 1024 * 1024, current)) !== i.database.sha256)
+      deny();
+  }
+  current();
+  return sourceHash(JSON.stringify(records));
+}
+function approveMemorySourcesImpl(
+  root: string,
+  durableRoot: string,
+  inventory: OriginalMemoryInventory,
+  historicalAbsenceReviewed: boolean,
+  current: () => void,
+): ApprovedMemorySources {
+  if (inventory.database.state === 'absent' && !historicalAbsenceReviewed) deny();
+  const source = { root, durableRoot, inventory: structuredClone(inventory) };
+  const snapshot = sourceSnapshot(source, current, true);
+  current();
+  if (sourceSnapshot(source, current, false) !== snapshot) deny();
+  return { ...source, snapshot };
+}
+function assertMemorySourcesImpl(source: ApprovedMemorySources, current: () => void) {
+  if (
+    !source ||
+    Object.keys(source).sort().join(',') !== 'durableRoot,inventory,root,snapshot' ||
+    !/^[a-f0-9]{64}$/.test(source.snapshot) ||
+    sourceSnapshot(source, current, false) !== source.snapshot
+  )
+    deny();
+}
+function readOriginalDurableFilesImpl(source: ApprovedMemorySources, current: () => void) {
+  assertMemorySources(source, current);
+  const files = source.inventory.files.map((f) => ({
+    name: f.name,
+    exists: f.exists,
+    text: f.exists
+      ? Array.from(
+          sourceBytes(path.join(source.durableRoot, f.name), 65536, current).toString('utf8'),
+        )
+          .slice(0, 12000)
+          .join('')
+      : null,
+    partial: f.exists ? sourceStat(path.join(source.durableRoot, f.name), false)[2] > 12000 : false,
+  }));
+  assertMemorySources(source, current);
+  return {
+    files,
+    source: 'original-subject-long-term-data',
+    worklogExcluded: true,
+    summaryExcluded: true,
+    notExecutableIntent: true,
+  };
+}
+
+// Public errors are finite; never return fs paths or arbitrary exception messages.
+export function approveMemorySources(...args: Parameters<typeof approveMemorySourcesImpl>) {
+  try {
+    return approveMemorySourcesImpl(...args);
+  } catch {
+    return deny();
+  }
+}
+export function assertMemorySources(...args: Parameters<typeof assertMemorySourcesImpl>) {
+  try {
+    return assertMemorySourcesImpl(...args);
+  } catch {
+    return deny();
+  }
+}
+export function readOriginalDurableFiles(...args: Parameters<typeof readOriginalDurableFilesImpl>) {
+  try {
+    return readOriginalDurableFilesImpl(...args);
+  } catch {
+    return deny();
+  }
 }

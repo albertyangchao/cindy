@@ -336,3 +336,60 @@ it('reviewed actual resource/namespace/model/media grant facts can be ready; mod
     await rm(root, { recursive: true, force: true });
   }
 });
+
+import { originalMemoryFixture as originalSource, memoryHash } from './originalMemoryFixture.js';
+import { mkdirSync, writeFileSync } from 'node:fs';
+it('real binding approves proven original absence with durable facts; later source appearance blocks future model admission', async () => {
+  const source = originalSource();
+  const f = fixture(
+    true,
+    { vision: { providerId: 'vision', modelId: 'model' } },
+    {
+      modelConfiguration: async () => ({ providerId: 'fixture-provider', modelId: 'fixture' }),
+      prepare: async () => {
+        throw Error('metadata only');
+      },
+      confirm: async () => ({
+        approved: true,
+        paths: [],
+        coverage: { memory: [source.root], 'durable-files': [source.durableRoot] },
+        legacyNamespace: null,
+        sourceRoots: {
+          root: source.root,
+          durableRoot: source.durableRoot,
+          historicalAbsenceReviewed: true,
+        },
+      }),
+    },
+  );
+  try {
+    const requirement = source.requirements(principalId);
+    const grant = await f.call({ ...bind, requirements: requirement });
+    expect(grant.sourceInventoryFingerprint).toBe(memoryHash(JSON.stringify(source.inventory)));
+    let facts = await f.call({ operation: 'binding', principalId });
+    expect(facts.legacySourceState).toBe('absent');
+    expect(facts.missingRequirements).toEqual([]);
+    expect(facts.tools).toContain('partner_durable_memory');
+    const resumed = await f.call({ operation: 'resume', principalId, expectedRevision: 1 });
+    mkdirSync(path.dirname(source.database), { recursive: true });
+    writeFileSync(source.database, 'LATE SOURCE');
+    facts = await f.call({ operation: 'binding', principalId });
+    expect(facts.legacySourceState).toBe('unavailable');
+    expect(facts.missingRequirements).toContain('memory-source-changed');
+    await expect(
+      f.call({
+        operation: 'submit',
+        principalId,
+        partnerId: 'bot_real',
+        grantRevision: resumed.revision,
+        inputId: 'new',
+        text: 'synthetic',
+        channel: { memoryRead: true },
+      }),
+    ).rejects.toThrow('REQUIREMENTS_UNMET');
+    expect(f.start).not.toHaveBeenCalled();
+  } finally {
+    f.sqlite.close();
+    source.cleanup();
+  }
+});

@@ -19464,6 +19464,12 @@
     "lineNumbers": "Line numbers"
   },
   "restrictedPartner": {
+    "originalSourceRoot": "Select this subject’s original source root",
+    "fixedMemoryDirectory": "Select the original PROFILE / MEMORY / INTERESTS directory",
+    "originalAbsenceTitle": "Review original absence evidence",
+    "originalAbsenceBody": "The fixed original source record says this subject never had this database. Confirm that exact original record, not merely a current missing file.",
+    "approveOriginalAbsence": "I reviewed the original absence record",
+    "evidenceRevision": "Original evidence revision",
     "title": "Plugin access",
     "message": "Allow external input to {{partner}}?",
     "detail": "Only the selected partner persona and files you explicitly choose are available. Other task history, owner memory, credentials, network and general tools are not shared. This does not enable a messaging route.",

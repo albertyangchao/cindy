@@ -1,5 +1,6 @@
 import {
   validateRequirements,
+  validateOriginalInventory,
   type PartnerRequirements,
   type ResourceCoverage,
 } from './restrictedPartnerRequirements.js';
@@ -30,6 +31,7 @@ export interface RestrictedPartnerGrant {
   requirements?: PartnerRequirements;
   resourceCoverage?: ResourceCoverage;
   legacyMemory?: { resourceId: string; namespace: string | null };
+  memorySources?: import('./restrictedPartnerLegacyMemory.js').ApprovedMemorySources;
   media?: Partial<
     Record<
       'vision' | 'draw' | 'edit' | 'stt' | 'tts',
@@ -167,6 +169,7 @@ export function validGrant(
           'modelRoute',
           'resourceCoverage',
           'legacyMemory',
+          'memorySources',
         ].includes(k),
     ) ||
     g.version !== 1 ||
@@ -213,6 +216,18 @@ export function validGrant(
     )
   )
     fail('RESTRICTED_PARTNER_GRANT_INVALID');
+  if (g.memorySources) {
+    const source = g.memorySources;
+    validateOriginalInventory(source.inventory);
+    if (
+      Object.keys(source).sort().join(',') !== 'durableRoot,inventory,root,snapshot' ||
+      typeof source.root !== 'string' ||
+      typeof source.durableRoot !== 'string' ||
+      !/^[a-f0-9]{64}$/.test(source.snapshot) ||
+      JSON.stringify(source.inventory) !== JSON.stringify(g.requirements?.sourceInventory)
+    )
+      fail('RESTRICTED_PARTNER_GRANT_INVALID');
+  }
   if (
     g.legacyMemory &&
     (Object.keys(g.legacyMemory).sort().join(',') !== 'namespace,resourceId' ||
@@ -239,7 +254,9 @@ export function validGrant(
   }
   if (
     g.resourceCoverage &&
-    (Object.keys(g.resourceCoverage).some((k) => !['workspace', 'notes', 'memory'].includes(k)) ||
+    (Object.keys(g.resourceCoverage).some(
+      (k) => !['workspace', 'notes', 'memory', 'durable-files'].includes(k),
+    ) ||
       Object.values(g.resourceCoverage).some(
         (ids) =>
           !Array.isArray(ids) ||

@@ -160,3 +160,94 @@ it('actual bounded legacy SQLite namespace preserves original bytes, excludes ot
     await rm(root, { recursive: true, force: true });
   }
 });
+
+import { originalMemoryFixture, memoryHash } from './originalMemoryFixture.js';
+import {
+  approveMemorySources,
+  assertMemorySources,
+  readOriginalDurableFiles,
+} from '../restrictedPartnerLegacyMemory.js';
+import { chmodSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
+it('approved original absence retains fixed interests without fabricating a database or importing WORKLOG/default', async () => {
+  const f = originalMemoryFixture();
+  try {
+    expect(() => f.approve(false)).toThrow('DENIED');
+    const source = f.approve();
+    const g = {
+      resources: [
+        { id: memoryHash(f.root), path: f.root },
+        { id: memoryHash(f.durableRoot), path: f.durableRoot },
+      ],
+      resourceCoverage: {
+        memory: [memoryHash(f.root)],
+        'durable-files': [memoryHash(f.durableRoot)],
+      },
+      legacyMemory: { resourceId: memoryHash(f.root), namespace: null },
+      memorySources: source,
+      requirements: f.requirements('p'),
+    } as RestrictedPartnerGrant;
+    const resources = restrictedPartnerResources(g, () => {});
+    expect(resources.tools.some((t) => t.name === 'partner_resource_read')).toBe(false);
+    const read = resources.tools.find((t) => t.name === 'partner_durable_memory')!;
+    const result = await read.invoke({}, { callId: 'c', runId: 'r' });
+    expect(JSON.stringify(result)).toContain('rockets');
+    expect(JSON.stringify(result)).not.toContain('OLD INTENT');
+    expect(existsSync(f.database)).toBe(false);
+    await expect(read.invoke({ file: 'WORKLOG.md' }, { callId: 'c', runId: 'r' })).rejects.toThrow(
+      'DENIED',
+    );
+    const search = resources.tools.find((t) => t.name === 'partner_memory_search')!;
+    expect(
+      JSON.stringify(await search.invoke({ query: 'rockets' }, { callId: 'c', runId: 'r' })),
+    ).toContain('rockets');
+  } finally {
+    f.cleanup();
+  }
+});
+it('fixed original present source cannot be approved as absent; only selected nondefault namespace is returned', () => {
+  const f = originalMemoryFixture(true);
+  try {
+    const wrong = structuredClone(f.inventory);
+    wrong.database = { state: 'absent', sha256: null };
+    expect(() => approveMemorySources(f.root, f.durableRoot, wrong, true, () => {})).toThrow(
+      'DENIED',
+    );
+    const source = f.approve();
+    expect(legacyMemoryNamespaces(f.database, () => {}, ['default'])).toEqual(['mine']);
+    expect(
+      JSON.stringify(searchLegacyMemory(f.database, 'mine', 'rockets', () => {}, ['default'])),
+    ).not.toContain('UNATTRIBUTED');
+    expect(() =>
+      searchLegacyMemory(f.database, 'default', 'unmapped', () => {}, ['default']),
+    ).toThrow('DENIED');
+    expect(readOriginalDurableFiles(source, () => {}).files.filter((f) => f.exists)).toHaveLength(
+      1,
+    );
+  } finally {
+    f.cleanup();
+  }
+});
+it('wrong subject source, read denial, new source and changed fixed file all revoke the captured approval', () => {
+  const f = originalMemoryFixture(),
+    other = originalMemoryFixture();
+  try {
+    expect(() =>
+      approveMemorySources(other.root, other.durableRoot, f.inventory, true, () => {}),
+    ).toThrow('DENIED');
+    const source = f.approve();
+    chmodSync(path.join(f.durableRoot, 'INTERESTS.md'), 0);
+    expect(() => assertMemorySources(source, () => {})).toThrow();
+    chmodSync(path.join(f.durableRoot, 'INTERESTS.md'), 0o644);
+    expect(() => assertMemorySources(source, () => {})).toThrow();
+    const fresh = f.approve();
+    mkdirSync(path.dirname(f.database), { recursive: true });
+    writeFileSync(f.database, 'NOT A PREEXISTING DATABASE');
+    expect(() => assertMemorySources(fresh, () => {})).toThrow('DENIED');
+    const second = other.approve();
+    writeFileSync(path.join(other.durableRoot, 'INTERESTS.md'), 'DRIFT');
+    expect(() => readOriginalDurableFiles(second, () => {})).toThrow('DENIED');
+  } finally {
+    f.cleanup();
+    other.cleanup();
+  }
+});

@@ -1,4 +1,9 @@
-import { legacyMemoryNamespaces } from './restrictedPartnerLegacyMemory.js';
+import {
+  legacyMemoryNamespaces,
+  approveMemorySources,
+  assertMemorySources,
+  originalDatabasePath,
+} from './restrictedPartnerLegacyMemory.js';
 import {
   validateRequirements,
   grantResourceFingerprint,
@@ -58,8 +63,9 @@ export interface RestrictedPartnerHostDeps {
   }): Promise<{
     approved: boolean;
     paths: string[];
-    coverage?: Partial<Record<'workspace' | 'notes' | 'memory', string[]>>;
+    coverage?: Partial<Record<'workspace' | 'notes' | 'memory' | 'durable-files', string[]>>;
     legacyNamespace?: string | null;
+    sourceRoots?: { root: string; durableRoot: string; historicalAbsenceReviewed: boolean };
   }>;
 }
 const sha = (x: string) => createHash('sha256').update(x).digest('hex');
@@ -79,13 +85,17 @@ const safeGrant = (g: RestrictedPartnerGrant, ready = false, research = false) =
   resourceCount: g.resourceIds.length,
   personaSha256: g.personaSha256,
   resourceFingerprint: grantResourceFingerprint(g),
+  sourceInventoryFingerprint: g.memorySources ? requirementHash(g.memorySources.inventory) : null,
+  legacySourceState: (g.memorySources?.inventory.database.state ??
+    (g.legacyMemory ? 'present' : 'unreviewed')) as
+    'present' | 'absent' | 'unreviewed' | 'unavailable',
   requirementsFingerprint: g.requirements ? requirementHash(g.requirements) : null,
   requirementsRevision: g.requirements?.revision ?? null,
   modelRoute: g.modelRoute ?? null,
   coverage: Object.fromEntries(
-    ['workspace', 'notes', 'memory'].map((k) => [
+    ['workspace', 'notes', 'memory', ...(g.memorySources ? ['durable-files'] : [])].map((k) => [
       k,
-      g.resourceCoverage?.[k as 'workspace' | 'notes' | 'memory']?.length ?? 0,
+      g.resourceCoverage?.[k as 'workspace' | 'notes' | 'memory' | 'durable-files']?.length ?? 0,
     ]),
   ),
   mediaRoutes: g.media ?? {},
@@ -108,6 +118,7 @@ const safeGrant = (g: RestrictedPartnerGrant, ready = false, research = false) =
     ...(ready && research ? ['partner_research'] : []),
     ...(g.resourceCoverage?.notes?.length ? ['partner_notes_search'] : []),
     ...(g.legacyMemory ? ['partner_memory_search'] : []),
+    ...(g.memorySources ? ['partner_durable_memory'] : []),
     'partner_history',
     'partner_memory',
     ...(Object.keys(g.media ?? {}).length ? ['partner_media'] : []),
@@ -237,6 +248,26 @@ export function createRestrictedPartnerHost(deps: RestrictedPartnerHostDeps) {
             ...new Set(await Promise.all(paths!.map(async (p) => sha(await fs.realpath(p))))),
           ];
         current();
+        const inventory = (a.requirements as PartnerRequirements | undefined)?.sourceInventory;
+        let memorySources: RestrictedPartnerGrant['memorySources'];
+        if (inventory) {
+          const source = decision.sourceRoots;
+          if (!source) return fail('RESTRICTED_PARTNER_MEMORY_SOURCE_DENIED');
+          memorySources = approveMemorySources(
+            source.root,
+            source.durableRoot,
+            inventory,
+            source.historicalAbsenceReviewed,
+            current,
+          );
+          const expectedMemory =
+            inventory.database.state === 'absent' ? source.root : originalDatabasePath(source.root);
+          if (
+            JSON.stringify(coverage.memory) !== JSON.stringify([sha(expectedMemory)]) ||
+            JSON.stringify(coverage['durable-files']) !== JSON.stringify([sha(source.durableRoot)])
+          )
+            return fail('RESTRICTED_PARTNER_MEMORY_SOURCE_DENIED');
+        }
         const grant: RestrictedPartnerGrant = {
           version: 1,
           id: grantId,
@@ -251,6 +282,7 @@ export function createRestrictedPartnerHost(deps: RestrictedPartnerHostDeps) {
           resources,
           dispatchEpoch: 1,
           dispatchEnabled: false,
+          ...(memorySources ? { memorySources } : {}),
           ...(media ? { media: media.routes } : {}),
           ...(modelRoute ? { modelRoute } : {}),
           ...(a.requirements
@@ -286,6 +318,7 @@ export function createRestrictedPartnerHost(deps: RestrictedPartnerHostDeps) {
       return fail('PERMISSION_DENIED');
     const executionEpoch = epochs.get(grantId) ?? 0;
     const partnerCurrent = deps.partnerAuthority(grant.partnerId);
+    let sourceRequired = false;
     const assertGrant = (g: RestrictedPartnerGrant) => {
       current();
       partnerCurrent();
@@ -296,6 +329,7 @@ export function createRestrictedPartnerHost(deps: RestrictedPartnerHostDeps) {
         g.approvalRevision !== approval
       )
         fail('PERMISSION_DENIED');
+      if (sourceRequired && g.memorySources) assertMemorySources(g.memorySources, current);
     };
     const readiness = async () => {
       const ready = (await deps.executionReady?.()) === true;
@@ -332,13 +366,29 @@ export function createRestrictedPartnerHost(deps: RestrictedPartnerHostDeps) {
         assertGrant(grant);
       }
       if (!resourcesAvailable) facts.coverage = { workspace: 0, notes: 0, memory: 0 };
-      let legacyAvailable = Boolean(grant.legacyMemory);
-      if (grant.legacyMemory) {
+      let sourceAvailable = true;
+      if (grant.memorySources) {
+        try {
+          assertMemorySources(grant.memorySources, () => assertGrant(grant));
+        } catch {
+          sourceAvailable = false;
+        }
+      }
+      let legacyAvailable = Boolean(grant.legacyMemory) && sourceAvailable;
+      if (
+        grant.legacyMemory &&
+        sourceAvailable &&
+        grant.memorySources?.inventory.database.state !== 'absent'
+      ) {
         try {
           const resource = grant.resources.find((r) => r.id === grant.legacyMemory!.resourceId);
           if (!resource) legacyAvailable = false;
           else {
-            const ns = legacyMemoryNamespaces(resource.path, () => assertGrant(grant));
+            const ns = legacyMemoryNamespaces(
+              resource.path,
+              () => assertGrant(grant),
+              grant.requirements?.excludedNamespaces,
+            );
             if (
               grant.legacyMemory.namespace === null
                 ? ns.length > 0
@@ -351,12 +401,18 @@ export function createRestrictedPartnerHost(deps: RestrictedPartnerHostDeps) {
         }
         assertGrant(grant);
       }
+      if (!sourceAvailable) facts.legacySourceState = 'unavailable';
+      if (!sourceAvailable) facts.tools = facts.tools.filter((t) => t !== 'partner_durable_memory');
       if (!legacyAvailable) facts.tools = facts.tools.filter((t) => t !== 'partner_memory_search');
       return {
         ...facts,
         missingRequirements: grant.requirements
           ? [
               ...(!modelAvailable ? ['model-route'] : []),
+              ...(!sourceAvailable ? ['memory-source-changed'] : []),
+              ...(grant.requirements.sourceInventory && !grant.memorySources
+                ? ['original-memory-source']
+                : []),
               ...grant.requirements.media.filter((k) => facts.media[k] !== true),
               ...requirementGaps(grant.requirements, {
                 tools: facts.tools,
@@ -544,6 +600,8 @@ export function createRestrictedPartnerHost(deps: RestrictedPartnerHostDeps) {
     return new Promise((resolve, reject) => {
       let reserved = false;
       let reservedRun: string | undefined;
+      sourceRequired = true;
+      assertGrant(grant);
       const service = createRestrictedPartnerExecution({
         assertCurrent: assertGrant,
         readGrant: () => store.readGrant(pluginId, grantId),
