@@ -3,6 +3,9 @@
  * The independent ConsumerGuards leaf owns the untrusted proof parser; do not import it until reviewed.
  */
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import { ChildProcess } from 'node:child_process';
+import type { Readable, Writable } from 'node:stream';
+import { parseNativeFrame } from './restrictedPublicationProtocol.js';
 import type { createRestrictedPartnerStore } from './restrictedPartnerStore.js';
 
 export type CoverageState =
@@ -41,6 +44,7 @@ export interface CoverageRegistration {
   rootIdentity: string;
   /** Canonical Caller pin digest: paths/origin/files/import closure/interpreter. Main registration only. */
   rootDefinitionDigest: string;
+  deviceScopeRef: string;
   inventoryDigest: string;
   registrationSetDigest: string;
   /** Exact closed instance set, not just seven role names. Captured by the managed controller. */
@@ -52,6 +56,7 @@ export interface CoverageRegistration {
 }
 export interface ControlledCoverageReport {
   releaseGeneration: string;
+  releaseSequence: number;
   lifecycleSequence: number;
   fenceRef: string;
   enrollmentReceiptId: string;
@@ -62,6 +67,8 @@ export interface ControlledCoverageReport {
     entryId: (typeof adjacentCoverageEntries)[number];
     namespace: 'native-publication';
     fenceReceiptId: string;
+    definitionDigest: string;
+    fenceRevision: number;
   }>;
 }
 /** Only a real Main-managed controller may implement this seam. Nothing is registered today.
@@ -101,7 +108,11 @@ export function isConsumerGuardCoverageAuthority(
 }
 const sha = (x: unknown) => createHash('sha256').update(JSON.stringify(x)).digest('hex');
 const hash = (s: unknown): s is string => typeof s === 'string' && /^[a-f0-9]{64}$/.test(s);
-const text = (s: unknown): s is string => typeof s === 'string' && s.length > 0 && s.length <= 256;
+const text = (s: unknown): s is string =>
+  typeof s === 'string' &&
+  s.length > 0 &&
+  Buffer.byteLength(s, 'utf8') <= 512 &&
+  !/[\u0000-\u001f\u007f-\u009f]/.test(s);
 const integer = (n: unknown): n is number => Number.isSafeInteger(n) && (n as number) >= 0;
 function fail(code: string): never {
   throw Error('PUBLICATION_COVERAGE_' + code);
@@ -145,6 +156,7 @@ export class ConsumerGuardCoverageAuthority {
   private readonly coordinator: Coordinator;
   private readonly challenges = new Map<string, { root: string; at: number; revision: number }>();
   private lastTime = 0;
+  private readonly managedJobs = new Set<{ revoke(): void }>();
   constructor(
     private readonly store: Store,
     private readonly pluginId: string,
@@ -332,6 +344,7 @@ export class ConsumerGuardCoverageAuthority {
     this.coordinator.closed = true;
     const transitionRevision = this.coordinator.revision;
     this.challenges.clear();
+    for (const job of this.managedJobs) job.revoke();
     return this.exclusive(async () => {
       const row = await this.read(this.stateKey),
         old = this.state(row);
@@ -345,7 +358,7 @@ export class ConsumerGuardCoverageAuthority {
         coverageRevision: old.coverageRevision + 1,
         usedGenerations: [...old.usedGenerations, generation],
         releaseGeneration: generation,
-        report: null,
+        report: old.report,
       };
       await this.save(this.stateKey, row, next);
       let q = await this.read(this.stateKey);
@@ -362,7 +375,7 @@ export class ConsumerGuardCoverageAuthority {
         this.current();
         const report = await this.driver!.switchRelease(generation, old.lifecycleSequence);
         this.current();
-        this.checkControlledReport(report, generation, old.lifecycleSequence);
+        this.checkControlledReport(report, generation, old.lifecycleSequence, old.releaseSequence);
         // Root identity includes the release generation, even for rollback of identical files.
         if (old.usedRootIdentities.includes(this.driver!.registration.rootIdentity))
           fail('ROOT_GENERATION_REUSED');
@@ -370,7 +383,7 @@ export class ConsumerGuardCoverageAuthority {
           ...next,
           state: 'READY',
           report: structuredClone(report),
-          releaseSequence: old.releaseSequence + 1,
+          releaseSequence: report.releaseSequence,
           lifecycleSequence: report.lifecycleSequence,
           registrationDigest: sha(this.driver!.registration),
           rootIdentity: this.driver!.registration.rootIdentity,
@@ -392,11 +405,17 @@ export class ConsumerGuardCoverageAuthority {
       }
     });
   }
-  private checkControlledReport(r: ControlledCoverageReport, generation: string, sequence: number) {
+  private checkControlledReport(
+    r: ControlledCoverageReport,
+    generation: string,
+    sequence: number,
+    releaseSequence: number,
+  ) {
     const registration = this.driver!.registration;
     if (
       !hash(registration.rootIdentity) ||
       !hash(registration.rootDefinitionDigest) ||
+      !hash(registration.deviceScopeRef) ||
       !hash(registration.inventoryDigest) ||
       !hash(registration.registrationSetDigest) ||
       !Array.isArray(registration.instances) ||
@@ -404,6 +423,8 @@ export class ConsumerGuardCoverageAuthority {
       registration.instances.length > 64 ||
       !r ||
       r.releaseGeneration !== generation ||
+      r.releaseSequence !== releaseSequence + 1 ||
+      !integer(r.releaseSequence) ||
       r.lifecycleSequence !== sequence + 1 ||
       !integer(r.lifecycleSequence) ||
       !text(r.fenceRef) ||
@@ -456,7 +477,12 @@ export class ConsumerGuardCoverageAuthority {
       adjacentCoverageEntries.some((id) => {
         const x = r.exclusions.filter((e) => e.entryId === id);
         return (
-          x.length !== 1 || x[0].namespace !== 'native-publication' || !text(x[0].fenceReceiptId)
+          x.length !== 1 ||
+          x[0].namespace !== 'native-publication' ||
+          !text(x[0].fenceReceiptId) ||
+          !hash(x[0].definitionDigest) ||
+          !integer(x[0].fenceRevision) ||
+          x[0].fenceRevision < 1
         );
       })
     )
@@ -468,6 +494,7 @@ export class ConsumerGuardCoverageAuthority {
     this.coordinator.revision++;
     this.coordinator.closed = true;
     this.challenges.clear();
+    for (const job of this.managedJobs) job.revoke();
     if (!['QUIESCING', 'REVOKED', 'UNKNOWN'].includes(state)) fail('LIFECYCLE_STATE_INVALID');
     return this.exclusive(async () => {
       const row = await this.read(this.stateKey),
@@ -519,6 +546,22 @@ export class ConsumerGuardCoverageAuthority {
       fail('CHALLENGE_INVALID');
     const row = await this.read(this.stateKey),
       s = this.state(row);
+    // Observed authoritative facts may not be silently restored into READY on a second read.
+    // Keep the last successful report/sequences in SQL; only a controlled new generation can recover.
+    if (
+      this.driver &&
+      s.state === 'READY' &&
+      s.boot === this.boot &&
+      (s.issuerId !== this.driver.issuerId ||
+        s.registrationDigest !== sha(this.driver.registration))
+    ) {
+      try {
+        await this.invalidate('UNKNOWN');
+      } catch {
+        /* local lease is already irrevocably closed */
+      }
+      fail('FACTS_CHANGED');
+    }
     if (
       this.coordinator.closed ||
       !this.driver ||
@@ -532,7 +575,12 @@ export class ConsumerGuardCoverageAuthority {
       owned.revision !== this.coordinator.revision
     )
       fail('NOT_READY');
-    this.checkControlledReport(s.report, s.releaseGeneration!, s.lifecycleSequence - 1);
+    this.checkControlledReport(
+      s.report,
+      s.releaseGeneration!,
+      s.lifecycleSequence - 1,
+      s.releaseSequence - 1,
+    );
     if (this.clock() >= owned.at + 30000) fail('CHALLENGE_EXPIRED');
     return Object.freeze({
       schema: 'publication-consumer-guard-evidence-contract/v1',
@@ -549,11 +597,143 @@ export class ConsumerGuardCoverageAuthority {
       expiresAt: Math.min(issuedAt + 30000, owned.at + 30000),
       challenge,
       closedEnrollment: true,
-      members: structuredClone(s.report.members),
-      oldGenerationAdmissions: structuredClone(s.report.oldGenerationAdmissions),
+      // Exact 964fe89 source ABI projection. Extra provenance remains in Main's own SQL report.
+      members: s.report.members.map(({ dispositionReceiptId: _disposition, ...member }) => member),
+      oldGenerationAdmissions: s.report.oldGenerationAdmissions.unresolved,
       unknownNativeEffects: s.report.unknownNativeEffects,
       fenceRef: s.report.fenceRef,
     });
+  }
+  /** Creates a durable owner-bound job BEFORE the fixed Caller launches a process.
+   * The actual child handle/channel is held by Main; JSON, FD numbers and exit0 cannot mint it.
+   * Queue IO is delegated back to Main, so a fake pipe cannot authorize a Python queue write.
+   */
+  async prepareManagedJob(
+    root: string,
+    binding: ManagedPublicationJobBinding,
+    nativeCurrent: () => void,
+    perform: ManagedPublicationJobIO,
+  ): Promise<ManagedPublicationJob> {
+    if (
+      !['canonical-producer', 'generic-direct'].includes(binding.entryId) ||
+      !text(binding.actionId) ||
+      !integer(binding.actionRevision) ||
+      binding.actionRevision < 1 ||
+      !hash(binding.bindingSha256) ||
+      !hash(binding.scopeSha256) ||
+      !hash(binding.releaseId)
+    )
+      fail('JOB_BINDING_INVALID');
+    const proof = await this.readCurrent(root, this.freshChallenge(root));
+    const device = this.driver!.registration.deviceScopeRef;
+    if (!hash(device)) fail('DEVICE_UNSUPPORTED');
+    const members = proof.members.filter(
+      (m) =>
+        m.entryId === binding.entryId &&
+        m.launchAuthorityId === this.issuer &&
+        m.state === 'GUARDED',
+    );
+    if (members.length !== 1) fail('JOB_INSTANCE_UNSUPPORTED');
+    const epoch = this.coordinator.revision,
+      definition = sha(this.driver!.registration);
+    const current = () => {
+      nativeCurrent();
+      this.current();
+      if (
+        this.coordinator.closed ||
+        this.coordinator.revision !== epoch ||
+        this.clock() >= proof.expiresAt ||
+        definition !== sha(this.driver!.registration)
+      )
+        fail('JOB_FENCED');
+      this.fenceCurrent(proof.fenceRef);
+    };
+    const key = sha([
+      'publication-managed-job/v1',
+      binding.actionId,
+      binding.actionRevision,
+      binding.entryId,
+    ]);
+    const initialNonce = randomBytes(32).toString('hex');
+    const metadata: JobMetadata = {
+      schema: 'publication-managed-job/v1',
+      jobId: randomUUID(),
+      accountScopeRef: this.accountScopeRef,
+      deviceScopeRef: device,
+      rootIdentity: root,
+      releaseGeneration: proof.releaseGeneration!,
+      instanceId: members[0].instanceId,
+      entryId: binding.entryId,
+      bindingSha256: binding.bindingSha256,
+      scopeSha256: binding.scopeSha256,
+      actionId: binding.actionId,
+      actionRevision: binding.actionRevision,
+      releaseId: binding.releaseId,
+      coverageRevision: proof.coverageRevision,
+      expiresAt: proof.expiresAt,
+    };
+    await this.exclusive(async () => {
+      current();
+      if (await this.read(key)) fail('JOB_ALREADY_CLAIMED');
+      await this.save(key, undefined, {
+        ...metadata,
+        state: 'UNKNOWN',
+        nonceSha256: sha(initialNonce),
+        createdAt: this.clock(),
+      });
+      current();
+    });
+    const update = async (suffix: string, value: unknown, once = false) =>
+      this.exclusive(async () => {
+        current();
+        const target = suffix ? sha([key, suffix]) : key,
+          old = await this.read(target);
+        if (once && old) fail('JOB_OPERATION_HELD');
+        await this.save(target, old, value);
+        current();
+      });
+    if (
+      binding.entryId === 'generic-direct' &&
+      proof.members.filter(
+        (m) =>
+          m.entryId === 'native-main-dispatch' &&
+          m.launchAuthorityId === this.issuer &&
+          m.state === 'GUARDED',
+      ).length !== 1
+    )
+      fail('JOB_INSTANCE_UNSUPPORTED');
+    const roleInstances = Object.fromEntries(
+      proof.members
+        .filter((m) => m.launchAuthorityId === this.issuer && m.state === 'GUARDED')
+        .map((m) => [m.entryId, m.instanceId]),
+    );
+    const job = new ManagedPublicationJob(
+      metadata,
+      initialNonce,
+      roleInstances,
+      current,
+      perform,
+      update,
+      async () => ({
+        proof: await this.readCurrent(root, this.freshChallenge(root)),
+        registeredInstances: this.driver!.registration.instances.map((x) => x.instanceId),
+        namespaceExclusions: this.state(await this.read(this.stateKey)).report!.exclusions.map(
+          (e) => ({
+            entryId: e.entryId,
+            receiptId: e.fenceReceiptId,
+            definitionDigest: e.definitionDigest,
+            fenceRevision: e.fenceRevision,
+          }),
+        ),
+      }),
+      () => {
+        this.managedJobs.delete(job);
+        void this.invalidate('UNKNOWN').catch(() => {});
+      },
+      () => this.managedJobs.delete(job),
+    );
+    this.managedJobs.add(job);
+    return job;
   }
   /** Durable once-only claim precedes queue write / each fixed transport dispatch. No resend on UNKNOWN.
    * Read-only reconciliation is intentionally outside this effect API and cannot issue a new claim.
@@ -635,6 +815,322 @@ export class ConsumerGuardCoverageAuthority {
           /* preserve the original IO/permission error */
         }
       }
+      throw error;
+    }
+  }
+}
+
+export interface ManagedPublicationJobBinding {
+  entryId: 'canonical-producer' | 'generic-direct';
+  actionId: string;
+  actionRevision: number;
+  bindingSha256: string;
+  scopeSha256: string;
+  releaseId: string;
+}
+/** Implemented only by the fixed Caller: no arbitrary command, path, URL, issuer or SQL input. */
+export type ManagedPublicationJobIO = (
+  operation: 'queue-write' | 'queue-archive' | 'confirm-claim' | 'confirm-session',
+  payload: Record<string, unknown>,
+  current: () => void,
+) => Promise<unknown>;
+type JobMetadata = ManagedPublicationJobBinding & {
+  schema: 'publication-managed-job/v1';
+  jobId: string;
+  accountScopeRef: string;
+  deviceScopeRef: string;
+  rootIdentity: string;
+  releaseGeneration: string;
+  instanceId: string;
+  coverageRevision: number;
+  expiresAt: number;
+};
+/** Main-held transport endpoint. An anonymous pipe is transport, not the issuer.
+ * Only this exact Main-spawned ChildProcess reaches the stored job and its current native/coverage fence.
+ * Python must delegate native queue writes to this endpoint; accepting a fake peer must cause no queue IO.
+ */
+export class ManagedPublicationJob {
+  private child?: ChildProcess;
+  private controlWriter?: Writable;
+  private controlReader?: Readable;
+  private nonce: string;
+  private sequence = 0;
+  private loaded = false;
+  private closed = false;
+  private wire = Buffer.alloc(0);
+  private chain: Promise<void> = Promise.resolve();
+  private readonly claims = new Map<
+    string,
+    {
+      operationId: string;
+      requestedEntryId: string;
+      requestedInstanceId: string;
+      state: 'UNKNOWN' | 'COMPLETE';
+    }
+  >();
+  constructor(
+    readonly metadata: Readonly<JobMetadata>,
+    initialNonce: string,
+    private readonly roleInstances: Record<string, string>,
+    private readonly current: () => void,
+    private readonly perform: ManagedPublicationJobIO,
+    private readonly update: (key: string, value: unknown, once?: boolean) => Promise<void>,
+    private readonly observe: () => Promise<unknown>,
+    private readonly failed: () => void,
+    private readonly completed: () => void,
+  ) {
+    this.nonce = initialNonce;
+  }
+  attach(child: ChildProcess) {
+    this.current();
+    if (this.child || !(child instanceof ChildProcess)) fail('JOB_CHANNEL_INVALID');
+    const streams = child.stdio as unknown as Array<Readable | Writable | null | undefined>;
+    const writer = streams[5] as Writable | undefined,
+      reader = streams[6] as Readable | undefined;
+    if (!writer || !reader || typeof writer.write !== 'function' || typeof reader.on !== 'function')
+      fail('JOB_CHANNEL_INVALID');
+    this.controlWriter = writer;
+    this.controlReader = reader;
+    this.child = child;
+    this.controlWriter!.on('error', () => this.revoke());
+    this.controlReader!.on('error', () => this.revoke());
+    this.controlReader!.on('end', () => {
+      if (
+        !this.closed &&
+        (!this.loaded ||
+          !this.claims.size ||
+          [...this.claims.values()].some((c) => c.state === 'UNKNOWN'))
+      )
+        this.revoke();
+    });
+    this.controlReader!.on('data', (chunk: Buffer) => {
+      if (this.closed) return;
+      this.wire = Buffer.concat([this.wire, chunk]);
+      if (this.wire.length > 65536) {
+        this.revoke();
+        return;
+      }
+      const at = this.wire.indexOf(10);
+      if (at < 0) return;
+      if (at !== this.wire.length - 1) {
+        this.revoke();
+        return;
+      }
+      const raw = this.wire.subarray(0, at);
+      this.wire = Buffer.alloc(0);
+      this.chain = this.chain
+        .then(() => this.request(raw))
+        .catch(() => {
+          this.revoke();
+        });
+    });
+    // FD5: Main->child; FD6: child->Main. No secret, command, path or authority supplied by child.
+    this.controlWriter!.write(JSON.stringify({ ...this.metadata, nonce: this.nonce }) + '\n');
+  }
+  private async request(raw: Buffer) {
+    this.current();
+    if (this.closed || !this.child) fail('JOB_CLOSED');
+    const m = parseNativeFrame(new TextDecoder('utf-8', { fatal: true }).decode(raw));
+    if (
+      !m ||
+      Object.keys(m).sort().join(',') !== 'jobId,nonce,operation,payload,schema,sequence' ||
+      m.schema !== this.metadata.schema ||
+      m.jobId !== this.metadata.jobId ||
+      m.nonce !== this.nonce ||
+      m.sequence !== this.sequence + 1 ||
+      !integer(m.sequence) ||
+      m.sequence > 256 ||
+      !m.payload ||
+      typeof m.payload !== 'object' ||
+      Array.isArray(m.payload)
+    )
+      fail('JOB_FRAME_INVALID');
+    this.sequence++;
+    this.nonce = randomBytes(32).toString('hex');
+    await this.update('', {
+      ...this.metadata,
+      state: 'UNKNOWN',
+      sequence: this.sequence,
+      nonceSha256: sha(this.nonce),
+    });
+    const keys = Object.keys(m.payload).sort().join(',');
+    let result: unknown;
+    if (m.operation === 'loaded' && !this.loaded && keys === 'bindingSha256,entryId') {
+      if (
+        m.payload.bindingSha256 !== this.metadata.bindingSha256 ||
+        m.payload.entryId !== this.metadata.entryId
+      )
+        fail('JOB_SCOPE_INVALID');
+      await this.update(
+        'loaded',
+        {
+          ...this.metadata,
+          schema: 'publication-managed-loaded/v1',
+          state: 'LOADED',
+          sequence: this.sequence,
+        },
+        true,
+      );
+      this.loaded = true;
+      result = { state: 'LOADED' };
+    } else if (!this.loaded) fail('JOB_NOT_LOADED');
+    else if (m.operation === 'observe' && keys === '') result = await this.observe();
+    else if (m.operation === 'claim' && keys === 'entryId,operationId') {
+      const op = m.payload.operationId,
+        entry = m.payload.entryId;
+      const queue =
+        this.metadata.entryId === 'canonical-producer' &&
+        entry === 'canonical-producer' &&
+        /^queue:[a-f0-9]{64}$/.test(op);
+      const remote =
+        this.metadata.entryId === 'generic-direct' &&
+        entry === 'native-main-dispatch' &&
+        ['remote-staging-prepare', 'remote-staging-upload', 'remote-transaction'].some(
+          (x) => op === this.metadata.releaseId + ':' + x,
+        );
+      if (
+        !text(op) ||
+        (!queue && !remote) ||
+        [...this.claims.values()].some((c) => c.operationId === op)
+      )
+        fail('JOB_OPERATION_DENIED');
+      const claimId = randomUUID();
+      const claim = {
+        operationId: op,
+        requestedEntryId: entry,
+        requestedInstanceId: this.roleInstances[entry],
+        state: 'UNKNOWN' as const,
+      };
+      if (!text(claim.requestedInstanceId)) fail('JOB_INSTANCE_UNSUPPORTED');
+      await this.update(
+        'claim:' + sha(op),
+        { ...this.metadata, schema: 'publication-managed-claim/v1', claimId, ...claim },
+        true,
+      );
+      this.claims.set(claimId, claim);
+      if (!this.roleInstances[entry]) fail('JOB_INSTANCE_UNSUPPORTED');
+      result = {
+        instance_id: this.roleInstances[entry],
+        entry_id: entry,
+        generation: this.metadata.releaseGeneration,
+        root_identity: this.metadata.rootIdentity,
+        claim_id: claimId,
+      };
+    } else if (m.operation === 'assert_current' && keys === 'claimId') {
+      if (!this.claims.has(m.payload.claimId)) fail('JOB_CLAIM_INVALID');
+      result = { state: 'CURRENT' };
+    } else if (
+      ['queue-write', 'queue-archive'].includes(m.operation) &&
+      keys === 'candidate,claimId'
+    ) {
+      const claim = this.claims.get(m.payload.claimId);
+      if (
+        !claim ||
+        claim.state !== 'UNKNOWN' ||
+        this.metadata.entryId !== 'canonical-producer' ||
+        !claim.operationId.startsWith('queue:')
+      )
+        fail('JOB_CLAIM_INVALID');
+      const candidate = m.payload.candidate;
+      if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate))
+        fail('JOB_CANDIDATE_INVALID');
+      if (
+        m.operation === 'queue-write' &&
+        candidate.manifest?.artifact_sha256 !== claim.operationId.slice(6)
+      )
+        fail('JOB_SCOPE_INVALID');
+      const target =
+        m.operation === 'queue-write'
+          ? candidate.manifest?.artifact_sha256
+          : candidate.predecessorSha256;
+      if (!hash(target)) fail('JOB_CANDIDATE_INVALID');
+      const slot = 'io:' + m.operation + ':' + target;
+      await this.update(
+        slot,
+        {
+          ...this.metadata,
+          schema: 'publication-managed-io/v1',
+          state: 'UNKNOWN',
+          operation: m.operation,
+          candidateSha256: sha(candidate),
+        },
+        true,
+      );
+      result = await this.perform(m.operation as 'queue-write' | 'queue-archive', candidate, () => {
+        this.current();
+        if (this.closed) fail('JOB_CLOSED');
+      });
+      this.current();
+      await this.update(slot, {
+        ...this.metadata,
+        schema: 'publication-managed-io/v1',
+        state: 'COMPLETE',
+        operation: m.operation,
+        receipt: result,
+      });
+    } else if (m.operation === 'finish' && keys === 'claimId,outcome') {
+      const claim = this.claims.get(m.payload.claimId);
+      if (!claim || claim.state !== 'UNKNOWN' || m.payload.outcome !== 'COMPLETE')
+        fail('JOB_FINISH_UNKNOWN');
+      // Child COMPLETE is only a candidate: the actual Caller must have its OWN queue/dispatch receipt.
+      result = await this.perform('confirm-claim', { operationId: claim.operationId }, () =>
+        this.current(),
+      );
+      await this.update('claim:' + sha(claim.operationId), {
+        ...this.metadata,
+        schema: 'publication-managed-claim/v1',
+        claimId: m.payload.claimId,
+        operationId: claim.operationId,
+        requestedEntryId: claim.requestedEntryId,
+        requestedInstanceId: claim.requestedInstanceId,
+        state: 'COMPLETE',
+        receipt: result,
+      });
+      claim.state = 'COMPLETE';
+    } else fail('JOB_OPERATION_DENIED');
+    this.current();
+    if (this.closed) fail('JOB_CLOSED');
+    const reply = {
+      schema: this.metadata.schema,
+      jobId: this.metadata.jobId,
+      sequence: this.sequence,
+      nextNonce: this.nonce,
+      ok: true,
+      result,
+    };
+    const wire = JSON.stringify(reply) + '\n';
+    if (Buffer.byteLength(wire) > 65536) fail('JOB_FRAME_LIMIT');
+    this.controlWriter!.write(wire);
+  }
+  revoke() {
+    if (this.closed) return;
+    this.closed = true;
+    this.controlWriter?.destroy();
+    this.controlReader?.destroy();
+    this.child?.kill(); // local kill is NOT remote cancellation or a completed business receipt
+    this.failed();
+  }
+  async finishProcess(success: boolean) {
+    await this.chain;
+    try {
+      this.current();
+      if (
+        !success ||
+        this.closed ||
+        !this.loaded ||
+        this.wire.length ||
+        !this.claims.size ||
+        [...this.claims.values()].some((c) => c.state !== 'COMPLETE')
+      )
+        fail('JOB_FINISH_UNKNOWN');
+      const receipt = await this.perform('confirm-session', {}, () => this.current());
+      await this.update('', { ...this.metadata, state: 'COMPLETE', receipt });
+      this.closed = true;
+      this.controlWriter?.destroy();
+      this.controlReader?.destroy();
+      this.completed();
+    } catch (error) {
+      this.revoke();
       throw error;
     }
   }

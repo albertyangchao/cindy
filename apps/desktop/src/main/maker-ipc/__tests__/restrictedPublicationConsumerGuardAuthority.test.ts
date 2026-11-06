@@ -33,7 +33,12 @@ import {
   type ControlledCoverageDriver,
   type CoverageRegistration,
 } from '../restrictedPublicationConsumerGuardAuthority.js';
-const pureProcess = vi.hoisted(() => ({ reply: undefined as undefined | ((r: any) => any) }));
+const pureProcess = vi.hoisted(() => ({
+  reply: undefined as undefined | ((r: any) => any),
+  candidate: undefined as any,
+  managedMode: 'normal' as string,
+  archiveCandidate: undefined as any,
+}));
 // Fixed pure-child boundary only; no runtime/provider/network endpoint is contacted.
 vi.mock('node:child_process', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:child_process')>();
@@ -41,21 +46,87 @@ vi.mock('node:child_process', async (importOriginal) => {
     ...actual,
     spawn: (...args: any[]) => {
       if (!pureProcess.reply) return (actual.spawn as any)(...args);
-      const child = new EventEmitter() as any;
+      const child = new actual.ChildProcess() as any;
       child.stdin = new PassThrough();
       child.stdout = new PassThrough();
       child.stderr = new PassThrough();
-      child.kill = () => true;
+      child.stdio = [
+        child.stdin,
+        child.stdout,
+        child.stderr,
+        undefined,
+        undefined,
+        new PassThrough(),
+        new PassThrough(),
+      ];
+      child.kill = () => {
+        queueMicrotask(() => child.emit('close', 1));
+        return true;
+      };
       let input = '';
       child.stdin.on('data', (b: Buffer) => {
         input += b.toString('utf8');
       });
+      let meta: any, nextReply: ((v: any) => void) | undefined;
+      child.stdio[5].on('data', (b: Buffer) => {
+        const m = JSON.parse(b.toString('utf8'));
+        if (!meta) meta = m;
+        else nextReply?.(m);
+      });
+      const request = (operation: string, payload: any) =>
+        new Promise<any>((resolve, reject) => {
+          if (!meta) return reject(Error('NO_MAIN_JOB'));
+          const m = {
+            schema: meta.schema,
+            jobId: meta.jobId,
+            sequence: (meta.sequence ?? 0) + 1,
+            nonce: pureProcess.managedMode === 'wrong-nonce' ? '0'.repeat(64) : meta.nonce,
+            operation,
+            payload,
+          };
+          nextReply = (r) => {
+            meta.sequence = r.sequence;
+            meta.nonce = r.nextNonce;
+            resolve(r.result);
+          };
+          child.stdio[6].emit('data', Buffer.from(JSON.stringify(m) + '\n'));
+        });
       child.stdin.on('finish', () =>
-        queueMicrotask(() => {
+        queueMicrotask(async () => {
           try {
+            const inputRequest = JSON.parse(input);
+            if (meta) {
+              await request('loaded', { bindingSha256: meta.bindingSha256, entryId: meta.entryId });
+              await request('observe', {});
+              const candidate = structuredClone(pureProcess.candidate);
+              const claim = await request('claim', {
+                entryId: 'canonical-producer',
+                operationId: 'queue:' + candidate.manifest.artifact_sha256,
+              });
+              await request('assert_current', { claimId: claim.claim_id });
+              if (pureProcess.managedMode === 'wrong-scope')
+                candidate.manifest.artifact_relative =
+                  'core/imessage/imessage-' + '0'.repeat(32) + '.html';
+              if (pureProcess.managedMode === 'duplicate-claim')
+                await request('claim', {
+                  entryId: 'canonical-producer',
+                  operationId: 'queue:' + candidate.manifest.artifact_sha256,
+                });
+              if (pureProcess.managedMode === 'disconnect') {
+                child.emit('close', 1);
+                return;
+              }
+              await request('queue-write', { claimId: claim.claim_id, candidate });
+              if (pureProcess.archiveCandidate)
+                await request('queue-archive', {
+                  claimId: claim.claim_id,
+                  candidate: pureProcess.archiveCandidate,
+                });
+              await request('finish', { claimId: claim.claim_id, outcome: 'COMPLETE' });
+            }
             child.stdout.emit(
               'data',
-              Buffer.from(JSON.stringify(pureProcess.reply!(JSON.parse(input)))),
+              Buffer.from(JSON.stringify(pureProcess.reply!(inputRequest))),
             );
             child.emit('close', 0);
           } catch {
@@ -71,6 +142,9 @@ const sha = (s: string) => createHash('sha256').update(s).digest('hex');
 const dbs: Database.Database[] = [];
 afterEach(() => {
   pureProcess.reply = undefined;
+  pureProcess.candidate = undefined;
+  pureProcess.managedMode = 'normal';
+  pureProcess.archiveCandidate = undefined;
   for (const db of dbs.splice(0)) db.close();
 });
 function deferred() {
@@ -117,6 +191,7 @@ function fixture(change?: (r: ControlledCoverageReport) => void) {
   const registration: CoverageRegistration = {
     rootIdentity: sha('synthetic-root'),
     rootDefinitionDigest: sha('synthetic-definition'),
+    deviceScopeRef: sha('synthetic-device'),
     inventoryDigest: sha('registered-full-inventory'),
     registrationSetDigest: sha('registered-instance-set'),
     instances: coverageEntries.map((entryId, i) => ({
@@ -141,9 +216,10 @@ function fixture(change?: (r: ControlledCoverageReport) => void) {
       switches++;
       if (switches > 1) registration.rootIdentity = sha('synthetic-root-' + generation);
       await switchHook?.();
-      fence = 'synthetic-fence-' + generation;
+      fence = 'synthetic-fence-' + sha(generation);
       const r: ControlledCoverageReport = {
         releaseGeneration: generation,
+        releaseSequence: switches,
         lifecycleSequence: sequence + 1,
         fenceRef: fence,
         enrollmentReceiptId: 'synthetic-closed-registration',
@@ -151,7 +227,7 @@ function fixture(change?: (r: ControlledCoverageReport) => void) {
         unknownNativeEffects: 0,
         members: registration.instances.map((m) => ({
           ...m,
-          launchAuthorityId: 'synthetic-launch',
+          launchAuthorityId: 'synthetic-managed-controller',
           admissionReceiptId: 'synthetic-admission-' + m.instanceId,
           releaseGeneration: generation,
           guardSourceIdentity: sha('guard-source'),
@@ -164,6 +240,8 @@ function fixture(change?: (r: ControlledCoverageReport) => void) {
           entryId,
           namespace: 'native-publication',
           fenceReceiptId: 'synthetic-exclusion-' + entryId,
+          definitionDigest: sha('namespace-' + entryId),
+          fenceRevision: 1,
         })),
       };
       change?.(r);
@@ -258,7 +336,20 @@ it('controlled lifecycle stores exact complete coverage and one-use root challen
   expect(proof.members).toHaveLength(7);
   expect(proof.closedEnrollment).toBe(true);
   expect(proof.expiresAt - proof.issuedAt).toBeLessThanOrEqual(30000);
-  expect(proof.oldGenerationAdmissions.unresolved).toBe(0);
+  expect(proof.oldGenerationAdmissions).toBe(0);
+  expect(Object.keys(proof.members[0]).sort()).toEqual(
+    [
+      'instanceId',
+      'entryId',
+      'launchAuthorityId',
+      'admissionReceiptId',
+      'releaseGeneration',
+      'guardSourceIdentity',
+      'entryDefinitionDigest',
+      'state',
+      'effectFenceRevision',
+    ].sort(),
+  );
   await expect(f.authority.readCurrent(f.root, n)).rejects.toThrow('CHALLENGE_INVALID');
   await expect(
     f.authority.readCurrent(sha('another-root'), f.authority.freshChallenge(f.root)),
@@ -320,6 +411,12 @@ for (const [name, change] of [
     'event sequence gap',
     (r: ControlledCoverageReport) => {
       r.lifecycleSequence++;
+    },
+  ],
+  [
+    'release sequence gap',
+    (r: ControlledCoverageReport) => {
+      r.releaseSequence++;
     },
   ],
   [
@@ -494,7 +591,9 @@ async function callerFixture(f: ReturnType<typeof fixture>, beforeIO?: () => Pro
   const root = path.join(dir, 'root'),
     artifacts = path.join(dir, 'artifacts'),
     dispatch = path.join(dir, 'dispatch');
-  await Promise.all([root, artifacts, dispatch].map((p) => mkdir(p, { mode: 0o700 })));
+  await Promise.all(
+    [root, artifacts, dispatch, path.join(dir, 'queue')].map((p) => mkdir(p, { mode: 0o700 })),
+  );
   const files: Record<string, string> = {};
   for (const rel of [
     'scripts/publish_generic_html_direct.py',
@@ -545,9 +644,49 @@ async function callerFixture(f: ReturnType<typeof fixture>, beforeIO?: () => Pro
     mode: 0o700,
   });
   await writeFile(path.join(artifacts, a.artifactRelative), 'synthetic html', { mode: 0o600 });
+  const metadata = {
+    provenance: publicMarker(wireBinding(a)),
+    publisher_binding_sha256: a.publisherBindingSha256,
+  };
+  const metaRaw = JSON.stringify(metadata);
+  await writeFile(path.join(artifacts, a.artifactRelative.slice(0, -5) + '.json'), metaRaw, {
+    mode: 0o600,
+  });
+  pureProcess.candidate = {
+    expectedBeforeSha256: null,
+    manifest: {
+      schema_version: 1,
+      state: 'queued',
+      queued_at: new Date().toISOString(),
+      artifact: path.join(artifacts, a.artifactRelative),
+      artifact_relative: a.artifactRelative,
+      artifact_sha256: a.artifactSha256,
+      public_url: null,
+      candidate_public_url: 'https://synthetic.invalid/reports/' + a.artifactRelative,
+      source: 'bluebubbles-connect',
+      publisher_metadata: path.posix.basename(a.artifactRelative.slice(0, -5) + '.json'),
+      publisher_metadata_sha256_at_queue: sha(metaRaw),
+      publisher_binding_sha256: a.publisherBindingSha256,
+      template_family: 'home-kb',
+      template_variant: 'plain',
+      template_producer: {},
+      ui_contract: {},
+      dispatcher: null,
+      dispatcher_status: 'staged-not-deployed',
+    },
+  };
   let sent = 0,
     stages = 0;
   pureProcess.reply = (r) => {
+    if (r.operation === 'managed-contract')
+      return pureProcess.managedMode === 'old-root'
+        ? { schema: 'old-root' }
+        : {
+            schema: 'publication-managed-job/v1',
+            nativeQueueIO: 'main-only',
+            controlReadFd: 5,
+            controlWriteFd: 6,
+          };
     if (r.operation === 'contract')
       return { schema: nativeWireSchema, generation: 'string', dispatcher: nativeDispatcher };
     if (r.operation === 'stage') {
@@ -619,6 +758,17 @@ async function callerFixture(f: ReturnType<typeof fixture>, beforeIO?: () => Pro
     pin,
     sent: () => sent,
     stages: () => stages,
+    dir,
+    queued: async () => {
+      try {
+        return JSON.parse(
+          await readFile(path.join(dir, 'queue', a.artifactSha256 + '.json'), 'utf8'),
+        );
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+        throw error;
+      }
+    },
     cleanup: () => rm(dir, { recursive: true, force: true }),
   };
 }
@@ -650,8 +800,11 @@ it('actual Caller stages once and composes real coverage admission on every fixe
       await c.runtime.dispatch(c.a, effect);
     }
     expect(c.stages()).toBe(1);
+    expect((await c.queued()).artifact_sha256).toBe(c.a.artifactSha256);
     expect(c.sent()).toBe(3);
     expect(f.admissions()).toHaveLength(4);
+    await f.authority.switchGeneration('generation-2');
+    expect(await f.authority.status()).toBe('READY');
     f.preserved();
   } finally {
     await c.cleanup();
@@ -756,4 +909,161 @@ it('an exact 30-second challenge is expired and incomplete persisted READY canno
     .run(JSON.stringify(damaged));
   await expect(f.read()).rejects.toThrow('RECEIPT_UNKNOWN');
   f.preserved();
+});
+
+it('pinned Core source ABI preserves exact opaque 512-byte generation and rejects controls/over-budget values before a switch', async () => {
+  const f = fixture();
+  for (const value of ['x'.repeat(513), 'bad\u0000generation', 'bad\u0085generation'])
+    await expect(f.authority.switchGeneration(value)).rejects.toThrow('GENERATION_INVALID');
+  expect(f.switches()).toBe(0);
+  const generation = 'x'.repeat(512);
+  await f.authority.switchGeneration(generation);
+  const proof = await f.read();
+  expect(proof.releaseGeneration).toBe(generation);
+  expect(typeof proof.oldGenerationAdmissions).toBe('number');
+  f.preserved();
+});
+
+for (const mode of [
+  'wrong-nonce',
+  'wrong-scope',
+  'duplicate-claim',
+  'disconnect',
+  'old-root',
+] as const)
+  it(
+    'managed fixed-child ' + mode + ' cannot write a native queue or relaunch an unknown job',
+    async () => {
+      const f = fixture();
+      const c = await callerFixture(f);
+      await f.authority.switchGeneration('generation-1');
+      pureProcess.managedMode = mode;
+      try {
+        await expect(
+          c.runtime.stage(c.a, 'synthetic result', {
+            stageBind: async () => c.a,
+            beforeEffect: async () => {},
+            settle: async () => c.a,
+          }),
+        ).rejects.toThrow();
+        expect(await c.queued()).toBeUndefined();
+        expect(c.sent()).toBe(0);
+        const jobs = f.sqlite
+          .prepare(
+            "SELECT payload FROM plugin_task_requests WHERE json_extract(payload,'$.schema')='publication-managed-job/v1'",
+          )
+          .all() as Array<{ payload: string }>;
+        if (mode === 'old-root') expect(jobs).toHaveLength(0);
+        else expect(jobs.some((r) => JSON.parse(r.payload).state === 'UNKNOWN')).toBe(true);
+        await expect(
+          c.runtime.stage(c.a, 'synthetic result', {
+            stageBind: async () => c.a,
+            beforeEffect: async () => {},
+            settle: async () => c.a,
+          }),
+        ).rejects.toThrow();
+        expect(await c.queued()).toBeUndefined();
+        f.preserved();
+      } finally {
+        await c.cleanup();
+      }
+    },
+  );
+it('observed same-generation facts cannot relatch on a second read; original verified report/counters survive rejection', async () => {
+  const f = fixture();
+  await f.authority.switchGeneration('generation-1');
+  const first = await f.read();
+  const definition = f.registration.instances[0].entryDefinitionDigest;
+  (f.registration.instances[0] as any).entryDefinitionDigest = sha('unauthorized-drift');
+  await expect(f.read()).rejects.toThrow('FACTS_CHANGED');
+  (f.registration.instances[0] as any).entryDefinitionDigest = definition;
+  await expect(f.read()).rejects.toThrow('NOT_READY');
+  expect(await f.authority.status()).toBe('UNKNOWN');
+  const rows = f.sqlite
+    .prepare(
+      "SELECT payload FROM plugin_task_requests WHERE json_extract(payload,'$.schema')='publication-coverage-state/v1'",
+    )
+    .all() as Array<{ payload: string }>;
+  expect(
+    rows
+      .map((r) => JSON.parse(r.payload))
+      .filter((r) => r.state === 'UNKNOWN')
+      .every(
+        (r) =>
+          r.report.releaseGeneration === 'generation-1' &&
+          r.releaseSequence === first.releaseSequence &&
+          r.lifecycleSequence === first.lifecycleSequence,
+      ),
+  ).toBe(true);
+  await f.authority.switchGeneration('generation-2');
+  expect(await f.authority.status()).toBe('READY');
+  f.preserved();
+});
+it('repeated rejected sequence changes retain the last verified baseline and never become READY', async () => {
+  const f = fixture((r) => {
+    if (r.releaseGeneration !== 'generation-1') r.releaseSequence++;
+  });
+  await f.authority.switchGeneration('generation-1');
+  for (const gen of ['generation-2', 'generation-3'])
+    await expect(f.authority.switchGeneration(gen)).rejects.toThrow('COVERAGE_UNKNOWN');
+  expect(await f.authority.status()).toBe('UNKNOWN');
+  await expect(f.read()).rejects.toThrow('NOT_READY');
+  const rows = f.sqlite
+    .prepare(
+      "SELECT payload FROM plugin_task_requests WHERE json_extract(payload,'$.schema')='publication-coverage-state/v1'",
+    )
+    .all() as Array<{ payload: string }>;
+  expect(
+    rows
+      .map((r) => JSON.parse(r.payload))
+      .filter((r) => r.state === 'UNKNOWN')
+      .every(
+        (r) =>
+          r.report.releaseGeneration === 'generation-1' &&
+          r.releaseSequence === 1 &&
+          r.lifecycleSequence === 1,
+      ),
+  ).toBe(true);
+  f.preserved();
+});
+
+it('actual Main queue archival preserves predecessor failure evidence and durable successor before the canonical move', async () => {
+  const f = fixture();
+  const c = await callerFixture(f);
+  await f.authority.switchGeneration('generation-1');
+  const oldSha = 'd'.repeat(64),
+    m = pureProcess.candidate.manifest;
+  m.consecutive_failures = 2;
+  m.failing_since = '2020-01-01T00:00:00Z';
+  const old = {
+    ...m,
+    artifact_sha256: oldSha,
+    queued_at: '2020-01-01T00:00:00Z',
+    last_failure: { failed_at: '2020-01-01T00:00:00Z', stage: 'synthetic' },
+  };
+  const raw = JSON.stringify(old);
+  await writeFile(path.join(c.dir, 'queue', oldSha + '.json'), raw, { mode: 0o600 });
+  pureProcess.archiveCandidate = { predecessorSha256: oldSha, expectedBeforeSha256: sha(raw) };
+  try {
+    await c.runtime.stage(c.a, 'synthetic result', {
+      stageBind: async () => c.a,
+      beforeEffect: async () => {},
+      settle: async () => c.a,
+    });
+    const name =
+      path.posix.basename(c.a.artifactRelative, '.html') + '.' + oldSha + '.20200101T000000Z.json';
+    const archived = JSON.parse(
+      await readFile(path.join(c.dir, 'queue/archive/generic-html', name), 'utf8'),
+    );
+    expect(archived.state).toBe('superseded');
+    expect(archived.consecutive_failures).toBe(2);
+    expect(archived.last_failure).toEqual(old.last_failure);
+    expect((await c.queued()).consecutive_failures).toBe(2);
+    await expect(readFile(path.join(c.dir, 'queue', oldSha + '.json'))).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+    f.preserved();
+  } finally {
+    await c.cleanup();
+  }
 });

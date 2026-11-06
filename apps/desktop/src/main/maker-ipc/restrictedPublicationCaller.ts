@@ -1,13 +1,24 @@
 /** Main-owned canonical transport. Root child packets are candidates, never authority. */
 import { spawn } from 'node:child_process';
-import { open, lstat, realpath, mkdir, writeFile, readFile, readdir } from 'node:fs/promises';
+import {
+  open,
+  lstat,
+  realpath,
+  mkdir,
+  writeFile,
+  readFile,
+  readdir,
+  rename,
+  unlink,
+} from 'node:fs/promises';
 import { constants } from 'node:fs';
 import path from 'node:path';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { publicationPython } from './restrictedPublicationPython.js';
 import {
   isConsumerGuardCoverageAuthority,
   type ConsumerGuardCoverageAuthority,
+  type ManagedPublicationJob,
 } from './restrictedPublicationConsumerGuardAuthority.js';
 import {
   canonical,
@@ -103,19 +114,26 @@ function boundedProcess(
   current: () => void,
   deadline = 10000,
   limit = 65536,
+  managedJob?: ManagedPublicationJob,
 ): Promise<Result> {
   current();
   return new Promise((resolve, reject) => {
     let ended = false;
     const chunks: Buffer[] = [];
     let size = 0;
-    const child = spawn(executable, args, { ...options, stdio: ['pipe', 'pipe', 'pipe'] });
+    const child = spawn(executable, args, {
+      ...options,
+      stdio: managedJob
+        ? ['pipe', 'pipe', 'pipe', 'ignore', 'ignore', 'pipe', 'pipe']
+        : ['pipe', 'pipe', 'pipe'],
+    });
     const finish = (error?: unknown) => {
       if (ended) return;
       ended = true;
       clearTimeout(timer);
       child.stdin?.destroy();
       if (error) {
+        managedJob?.revoke();
         child.kill();
         reject(Error('NATIVE_MAIN_OPERATION_UNKNOWN'));
       } else {
@@ -128,6 +146,12 @@ function boundedProcess(
       }
     };
     const timer = setTimeout(() => finish(Error('TIMEOUT')), deadline);
+    try {
+      managedJob?.attach(child);
+    } catch (error) {
+      finish(error);
+      return;
+    }
     child.stdin?.on('error', () => {});
     child.stderr?.on('data', () => {});
     child.stdout?.on('data', (chunk: Buffer) => {
@@ -136,7 +160,14 @@ function boundedProcess(
       else chunks.push(chunk);
     });
     child.on('error', finish);
-    child.on('close', (code) => finish(code === 0 ? undefined : Error('EXIT')));
+    child.on('close', (code) => {
+      if (!managedJob) finish(code === 0 ? undefined : Error('EXIT'));
+      else
+        void managedJob.finishProcess(code === 0).then(
+          () => finish(),
+          (error) => finish(error),
+        );
+    });
     child.stdin?.end(input === undefined ? undefined : JSON.stringify(input));
   });
 }
@@ -288,6 +319,7 @@ export function controlledPublicationRuntime(
     extra: Record<string, unknown> = {},
     readonly = false,
     coverageCurrent?: () => void,
+    managedJob?: ManagedPublicationJob,
   ) => {
     const current = () => {
       (readonly ? guards.readCurrent : guards.effectCurrent)();
@@ -303,10 +335,16 @@ export function controlledPublicationRuntime(
         ...(a ? { binding: wireBinding(a), artifactRoot: pin.artifactRoot } : {}),
         ...extra,
       },
-      { cwd: pin.root, env },
+      {
+        cwd: pin.root,
+        env: managedJob
+          ? { ...env, BRIDGE_CONSUMER_CONTROL_READ_FD: '5', BRIDGE_CONSUMER_CONTROL_WRITE_FD: '6' }
+          : env,
+      },
       current,
       10000,
       65536,
+      managedJob,
     );
     current();
     return JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(result.stdout));
@@ -317,6 +355,36 @@ export function controlledPublicationRuntime(
     await coverage.readCurrent(coverageRoot, coverage.freshChallenge(coverageRoot));
     coverageBindingCurrent();
     guards.readCurrent();
+    // A legacy root can write before it ever reads a control FD. Refuse it BEFORE launching a stage job.
+    // This is a pinned source ABI prerequisite, never runtime coverage evidence or a READY issuer.
+    const managed = await boundedProcess(
+      pin.python.path,
+      [
+        '-I',
+        '-c',
+        'import sys,json;sys.path.insert(0,sys.argv[1]);from bridge_core.publication_consumer_controller import main_job_contract;print(json.dumps(main_job_contract()))',
+        pin.root,
+      ],
+      { operation: 'managed-contract' },
+      { cwd: pin.root, env },
+      guards.readCurrent,
+      10000,
+      65536,
+    );
+    guards.readCurrent();
+    const managedContract = parseNativeFrame(
+      new TextDecoder('utf-8', { fatal: true }).decode(managed.stdout),
+    );
+    if (
+      canonical(managedContract) !==
+      canonical({
+        schema: 'publication-managed-job/v1',
+        nativeQueueIO: 'main-only',
+        controlReadFd: 5,
+        controlWriteFd: 6,
+      })
+    )
+      denied();
     const c = await pure('contract', undefined, {}, true);
     if (
       c.schema !== nativeWireSchema ||
@@ -402,6 +470,305 @@ export function controlledPublicationRuntime(
   const directories = new Map<string, string>(),
     completed = new Map<string, PublicationEffect[]>(),
     observed = new Map<string, NativePublicationReceipt>();
+  const managedJobFor = async (
+    a: NativePublicationRecord,
+    entryId: 'canonical-producer' | 'generic-direct',
+    nativeCurrent: () => void,
+  ) => {
+    const queueReceipts = new Map<string, unknown>();
+    const baseCurrent = () => {
+      nativeCurrent();
+      coverageBindingCurrent();
+    };
+    let activeJobCurrent: (() => void) | undefined;
+    const current = () => {
+      baseCurrent();
+      activeJobCurrent?.();
+    };
+    const safeQueue = async () => {
+      current();
+      if ((await realpath(pin.queueRoot)) !== pin.queueRoot) denied();
+      const stat = await lstat(pin.queueRoot);
+      current();
+      if (
+        !stat.isDirectory() ||
+        stat.isSymbolicLink() ||
+        stat.mode & 0o022 ||
+        (process.getuid && stat.uid !== process.getuid())
+      )
+        denied();
+    };
+    const optional = async (root: string, name: string) => {
+      try {
+        const bytes = await readFixed(root, name, 65536);
+        current();
+        return bytes;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+        throw error;
+      }
+    };
+    const atomic = async (root: string, name: string, value: unknown) => {
+      current();
+      const tmp = '.main-' + randomUUID() + '.tmp',
+        bytes = Buffer.from(canonical(value) + '\n');
+      const file = await open(
+        path.join(root, tmp),
+        constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+        0o600,
+      );
+      try {
+        current();
+        await file.writeFile(bytes);
+        current();
+        await file.sync();
+        current();
+      } finally {
+        await file.close();
+      }
+      try {
+        current();
+        await rename(path.join(root, tmp), path.join(root, name));
+        current();
+      } finally {
+        await unlink(path.join(root, tmp)).catch(() => {});
+      }
+      if (sha(await readFixed(root, name, 65536)) !== sha(bytes)) denied();
+      current();
+      return sha(bytes);
+    };
+    const scopeManifest = (m: any, artifactSha: string) => {
+      const required = [
+        'schema_version',
+        'state',
+        'queued_at',
+        'artifact',
+        'artifact_relative',
+        'artifact_sha256',
+        'public_url',
+        'candidate_public_url',
+        'source',
+        'publisher_metadata',
+        'publisher_metadata_sha256_at_queue',
+        'publisher_binding_sha256',
+        'template_producer',
+        'template_family',
+        'template_variant',
+        'ui_contract',
+        'dispatcher',
+        'dispatcher_status',
+      ];
+      const diagnostic = ['last_failure', 'failure_count', 'consecutive_failures', 'failing_since'];
+      if (
+        !m ||
+        required.some((k) => !Object.hasOwn(m, k)) ||
+        Object.keys(m).some((k) => !required.includes(k) && !diagnostic.includes(k))
+      )
+        denied();
+      for (const k of ['failure_count', 'consecutive_failures'])
+        if (Object.hasOwn(m, k) && (!Number.isSafeInteger(m[k]) || m[k] < 0)) denied();
+
+      if (
+        !m ||
+        m.schema_version !== 1 ||
+        m.state !== 'queued' ||
+        m.source !== 'bluebubbles-connect' ||
+        m.artifact_relative !== a.artifactRelative ||
+        m.artifact_sha256 !== artifactSha ||
+        m.artifact !== path.join(pin.artifactRoot, a.artifactRelative) ||
+        m.public_url !== null ||
+        m.candidate_public_url !== pin.publicOrigin + '/reports/' + a.artifactRelative ||
+        !/^[a-f0-9]{64}$/.test(m.publisher_binding_sha256) ||
+        typeof m.queued_at !== 'string' ||
+        !/(?:Z|[+-]\d\d:\d\d)$/.test(m.queued_at) ||
+        !Number.isFinite(Date.parse(m.queued_at))
+      )
+        denied();
+    };
+    return coverage.prepareManagedJob(
+      coverageRoot,
+      {
+        entryId,
+        actionId: a.nativeActionId,
+        actionRevision: a.actionRevision,
+        bindingSha256: digest(wireBinding(a)),
+        scopeSha256: digest([
+          a.domainId,
+          a.principalId,
+          a.connectionId,
+          a.generation,
+          a.chatId,
+          a.eventId,
+          a.epoch,
+          a.grantId,
+          a.grantRevision,
+        ]),
+        releaseId: releaseId(wireBinding(a)),
+      },
+      baseCurrent,
+      async (operation, candidate, jobCurrent) => {
+        activeJobCurrent = jobCurrent;
+        const guard = current;
+        guard();
+        if (operation === 'confirm-claim') {
+          const op = typeof candidate.operationId === 'string' ? candidate.operationId : denied();
+          const receipt =
+            queueReceipts.get(op) ??
+            (completed
+              .get(a.nativeActionId)
+              ?.some((e) => op === releaseId(wireBinding(a)) + ':' + e)
+              ? { operationId: op, mainDispatched: true }
+              : undefined);
+          if (!receipt) denied();
+          return receipt;
+        }
+        if (operation === 'confirm-session') {
+          if (entryId === 'canonical-producer' && queueReceipts.size)
+            return { mainQueueReceipts: [...queueReceipts.values()] };
+          const own = observed.get(a.nativeActionId);
+          if (entryId === 'generic-direct' && own) return { mainReceiptSha256: own.receiptSha256 };
+          denied();
+        }
+        if (entryId !== 'canonical-producer') denied();
+        await safeQueue();
+        guard();
+        if (operation === 'queue-write') {
+          if (Object.keys(candidate).sort().join(',') !== 'expectedBeforeSha256,manifest') denied();
+          const m = candidate.manifest as any;
+          scopeManifest(m, m?.artifact_sha256);
+          const html = await readFixed(pin.artifactRoot, a.artifactRelative, 8 * 1024 * 1024);
+          guard();
+          if (sha(html) !== m.artifact_sha256) denied();
+          const metaRel = a.artifactRelative.slice(0, -5) + '.json',
+            metaRaw = await readFixed(pin.artifactRoot, metaRel, 65536);
+          guard();
+          const metadata = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(metaRaw));
+          if (
+            canonical(metadata.provenance) !== canonical(publicMarker(wireBinding(a))) ||
+            m.publisher_metadata !== path.posix.basename(metaRel) ||
+            sha(metaRaw) !== m.publisher_metadata_sha256_at_queue ||
+            metadata.publisher_binding_sha256 !== m.publisher_binding_sha256
+          )
+            denied();
+          const name = m.artifact_sha256 + '.json',
+            old = await optional(pin.queueRoot, name);
+          guard();
+          if ((old ? sha(old) : null) !== candidate.expectedBeforeSha256) denied();
+          if (old) {
+            const before = JSON.parse(old.toString('utf8'));
+            scopeManifest(before, m.artifact_sha256);
+            for (const [k, v] of Object.entries(before)) {
+              if (k === 'consecutive_failures') {
+                if (!Number.isSafeInteger(m[k]) || m[k] < (v as number)) denied();
+              } else if (k === 'failing_since') {
+                if (!m[k] || Date.parse(m[k]) > Date.parse(v as string)) denied();
+              } else if (canonical(m[k]) !== canonical(v)) denied();
+            }
+          }
+          guard();
+          const manifestSha256 = await atomic(pin.queueRoot, name, m);
+          guard();
+          const receipt = {
+            jobOperation: 'queue-write',
+            artifactSha256: m.artifact_sha256,
+            manifestSha256,
+            bindingSha256: digest(wireBinding(a)),
+          };
+          queueReceipts.set('queue:' + m.artifact_sha256, receipt);
+          return receipt;
+        }
+        if (operation === 'queue-archive') {
+          if (
+            Object.keys(candidate).sort().join(',') !== 'expectedBeforeSha256,predecessorSha256' ||
+            !/^[a-f0-9]{64}$/.test(candidate.predecessorSha256 as string) ||
+            !queueReceipts.size
+          )
+            denied();
+          const prior = candidate.predecessorSha256 as string,
+            name = prior + '.json',
+            raw = await optional(pin.queueRoot, name);
+          guard();
+          if (!raw || sha(raw) !== candidate.expectedBeforeSha256) denied();
+          const before = JSON.parse(raw!.toString('utf8'));
+          scopeManifest(before, prior);
+          const replacement = [...queueReceipts.values()].find(
+            (r: any) => r.jobOperation === 'queue-write',
+          ) as any;
+          if (!replacement || replacement.artifactSha256 === prior) denied();
+          const successorRaw = await readFixed(
+            pin.queueRoot,
+            replacement.artifactSha256 + '.json',
+            65536,
+          );
+          guard();
+          if (sha(successorRaw) !== replacement.manifestSha256) denied();
+          const successor = JSON.parse(successorRaw.toString('utf8'));
+          scopeManifest(successor, replacement.artifactSha256);
+          const failures = Math.max(before.failure_count ?? 0, before.consecutive_failures ?? 0);
+          if (
+            failures &&
+            (!Number.isSafeInteger(successor.consecutive_failures) ||
+              successor.consecutive_failures < failures)
+          )
+            denied();
+          const since = before.failing_since ?? before.last_failure?.failed_at;
+          if (
+            since &&
+            (!successor.failing_since ||
+              !Number.isFinite(Date.parse(since)) ||
+              Date.parse(successor.failing_since) > Date.parse(since))
+          )
+            denied();
+          const archived = {
+            ...before,
+            state: 'superseded',
+            superseded_at: new Date().toISOString(),
+            superseded_by_artifact_sha256: replacement.artifactSha256,
+          };
+          for (const rel of ['archive', 'archive/generic-html']) {
+            try {
+              await mkdir(path.join(pin.queueRoot, rel), { mode: 0o700 });
+            } catch (error) {
+              if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+            }
+            const info = await lstat(path.join(pin.queueRoot, rel));
+            guard();
+            if (info.isSymbolicLink() || !info.isDirectory() || info.mode & 0o022) denied();
+          }
+          const stamp =
+            new Date(before.queued_at)
+              .toISOString()
+              .slice(0, 19)
+              .replaceAll('-', '')
+              .replaceAll(':', '') + 'Z';
+          const archiveName =
+            path.posix.basename(a.artifactRelative, '.html') + '.' + prior + '.' + stamp + '.json';
+          if (await optional(pin.queueRoot, 'archive/generic-html/' + archiveName)) denied();
+          guard();
+          const manifestSha256 = await atomic(pin.queueRoot, name, archived);
+          guard();
+          await rename(
+            path.join(pin.queueRoot, name),
+            path.join(pin.queueRoot, 'archive/generic-html', archiveName),
+          );
+          guard();
+          if (
+            sha(await readFixed(pin.queueRoot, 'archive/generic-html/' + archiveName, 65536)) !==
+            manifestSha256
+          )
+            denied();
+          guard();
+          return {
+            jobOperation: 'queue-archive',
+            predecessorSha256: prior,
+            manifestSha256,
+            bindingSha256: digest(wireBinding(a)),
+          };
+        }
+        denied();
+      },
+    );
+  };
   const observe = async (a: NativePublicationRecord) => {
     const current = guards.readCurrent;
     current();
@@ -474,6 +841,7 @@ export function controlledPublicationRuntime(
     if (!readonly) await verify();
     const current = readonly ? guards.readCurrent : guards.effectCurrent;
     current();
+    const managedJob = readonly ? undefined : await managedJobFor(a, 'generic-direct', current);
     const slug = path.posix.basename(a.artifactRelative, '.html');
     if (!/^imessage-[a-f0-9]{32}$/.test(slug) || !a.artifactSha256) denied();
     return new Promise<NativePublicationReceipt>((resolve, reject) => {
@@ -501,7 +869,19 @@ export function controlledPublicationRuntime(
           '--native-control-write-fd',
           '4',
         ],
-        { cwd: pin.root, env, stdio: ['ignore', 'pipe', 'pipe', 'pipe', 'pipe'] },
+        {
+          cwd: pin.root,
+          env: managedJob
+            ? {
+                ...env,
+                BRIDGE_CONSUMER_CONTROL_READ_FD: '5',
+                BRIDGE_CONSUMER_CONTROL_WRITE_FD: '6',
+              }
+            : env,
+          stdio: managedJob
+            ? ['ignore', 'pipe', 'pipe', 'pipe', 'pipe', 'pipe', 'pipe']
+            : ['ignore', 'pipe', 'pipe', 'pipe', 'pipe'],
+        },
       );
       let timer: ReturnType<typeof setTimeout>;
       const arm = () => {
@@ -515,6 +895,7 @@ export function controlledPublicationRuntime(
         child.stdio[3]?.destroy();
         child.stdio[4]?.destroy();
         if (error) {
+          managedJob?.revoke();
           child.kill();
           reject(Error('NATIVE_ROOT_SESSION_UNKNOWN'));
           return;
@@ -547,6 +928,12 @@ export function controlledPublicationRuntime(
         }
       };
       arm();
+      try {
+        managedJob?.attach(child);
+      } catch (error) {
+        finish(error);
+        return;
+      }
       child.stderr?.on('data', () => {});
       child.stdout?.on('data', (b: Buffer) => {
         output = Buffer.concat([output, b]);
@@ -676,9 +1063,18 @@ export function controlledPublicationRuntime(
       });
       child.on('error', () => finish(Error('START')));
       child.on('close', (code) => {
-        void chain.then(() => {
-          if (code !== 0 || wire.length || awaiting) finish(Error('EXIT'));
-          else finish();
+        void chain.then(async () => {
+          if (code !== 0 || wire.length || awaiting) {
+            managedJob?.revoke();
+            finish(Error('EXIT'));
+          } else {
+            try {
+              await managedJob?.finishProcess(true);
+              finish();
+            } catch (error) {
+              finish(error);
+            }
+          }
         });
       });
     });
@@ -712,7 +1108,8 @@ export function controlledPublicationRuntime(
             fence.assertCurrent();
           };
           current();
-          await pure('stage', a, { text }, false, current);
+          const job = await managedJobFor(a, 'canonical-producer', current);
+          await pure('stage', a, { text }, false, current, job);
           current();
           await control.stageBind();
           current();
