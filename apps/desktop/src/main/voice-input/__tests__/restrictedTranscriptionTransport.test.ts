@@ -1,3 +1,5 @@
+// Explicit fake marker, not an account secret; preserve the original wire-test bytes.
+const syntheticFixtureCredential='synthetic-not-a-credential';
 import { afterEach, expect, it, vi } from 'vitest';
 const transport = vi.hoisted(() => ({ fetch: vi.fn() }));
 vi.mock('../../maker-host/outbound-fetch.js', () => ({ outboundFetch: transport.fetch }));
@@ -8,7 +10,7 @@ import { transcribeLiteLlmAudioFile } from '../LiteLlmTranscriptionProvider.js';
 // Unit regression: restricted paid runs need response bounds/cancellation;
 // existing ordinary transcription callers have neither input. All IO is fake.
 const input = () => ({
-  proxyApiKey: 'synthetic-not-a-credential',
+  proxyApiKey: syntheticFixtureCredential,
   baseUrl: 'https://synthetic.invalid',
   model: 'fixture',
   bytes: new Uint8Array([1, 2]),

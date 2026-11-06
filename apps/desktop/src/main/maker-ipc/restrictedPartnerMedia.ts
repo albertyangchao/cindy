@@ -1,3 +1,12 @@
+import {
+  analyzeRestrictedVideo,
+  validatePreparedVideo,
+  type PreparedVideo,
+} from '../cindy-brain/restrictedVideoInput.js';
+import {
+  createRestrictedMediaUrlLoader,
+  type MediaUrlPorts,
+} from '../cindy-brain/restrictedMediaUrl.js';
 import { grantResourceFingerprint } from './restrictedPartnerRequirements.js';
 import { createHash } from 'node:crypto';
 import { and, eq } from 'drizzle-orm';
@@ -83,6 +92,9 @@ export async function restrictedPartnerMedia(
   current: () => void,
   inputs: RestrictedInputAsset[],
   laneSessionId?: string,
+  urlAuthorization?: Pick<MediaUrlPorts, 'authorize' | 'assertCurrent'> & {
+    approve?(permit: MediaPermit, url: string, role: 'input' | 'output'): Promise<void>;
+  },
 ) {
   const config = await restrictedMediaConfiguration(g.partnerId, current);
   current();
@@ -276,7 +288,64 @@ export async function restrictedPartnerMedia(
   };
   const handles = new WeakMap<object, MediaPermit>();
   const receipts = new Map<string, MediaReceipt>();
+  // Main-only explicit approval port; absence keeps URL routes closed.
+  const urlStageKey = (p: MediaPermit, source: string) =>
+    'restricted:url:' + sha(JSON.stringify([claim.runId, p.binding.effectSlot, source, 'output']));
+  const resultUrlLoader = urlAuthorization
+    ? createRestrictedMediaUrlLoader({
+        ...urlAuthorization,
+        claim: async (p, source, role) => {
+          p.assertCurrent();
+          if (role !== 'output') fail();
+          return insert(urlStageKey(p, source), {
+            state: 'UNKNOWN',
+            binding: p.binding,
+            sourceSha256: source,
+            role,
+          });
+        },
+        complete: async (p, source, hash) => {
+          p.assertCurrent();
+          const old = await readRow(urlStageKey(p, source));
+          p.assertCurrent();
+          if (!old) fail();
+          const record = JSON.parse(old!.payload);
+          if (
+            record.state !== 'UNKNOWN' ||
+            record.sourceSha256 !== source ||
+            !sameBinding(record.binding, p.binding)
+          )
+            fail();
+          const payload = JSON.stringify({ ...record, state: 'COMPLETE', outputSha256: hash });
+          const updated = await db.drizzle
+            .update(pluginTaskRequests)
+            .set({ payload, fingerprint: sha(payload), revision: 2 })
+            .where(
+              and(
+                eq(pluginTaskRequests.id, old!.id),
+                eq(pluginTaskRequests.payload, old!.payload),
+                eq(pluginTaskRequests.revision, 1),
+              ),
+            )
+            .returning({ id: pluginTaskRequests.id });
+          p.assertCurrent();
+          if (updated.length !== 1) fail();
+        },
+        unknown: async () => {
+          unknown = true;
+        },
+      })
+    : undefined;
   const adapter = new RestrictedMediaAdapter({
+    ...(resultUrlLoader
+      ? {
+          urlImage: async (p: MediaPermit, url: string) => {
+            await urlAuthorization?.approve?.(p, url, 'output');
+            p.assertCurrent();
+            return resultUrlLoader(p, url, 'output');
+          },
+        }
+      : {}),
     images: config.images,
     authorize: (h, kind) => {
       if (!h || typeof h !== 'object') fail();
@@ -398,10 +467,33 @@ export async function restrictedPartnerMedia(
     normalizedSha256: string;
     partial: boolean;
   }> = [];
+  const videos = new Map<string, PreparedVideo>();
   if (inputs.length > 4) fail();
   let total = 0;
   for (const item of inputs) {
     current();
+    if (item.type === 'video') {
+      if (!routes.vision || !claim.inputId) fail();
+      const prepared = item.video,
+        expected = {
+          ...makeBinding('vision', 'prepare-video:' + item.sourceSha256),
+          runId: 'input:' + claim.inputId,
+        };
+      const frames = validatePreparedVideo(prepared, expected);
+      if (
+        item.sourceSha256 !== prepared.sourceSha256 ||
+        item.id !== 'video:' + sha(JSON.stringify(prepared)) ||
+        prepared.sourceId !== 'asset:' + prepared.sourceSha256
+      )
+        fail();
+      total += frames.reduce((n, f) => n + f.bytes.length, 0);
+      if (total > 8 * 1024 * 1024) fail();
+      const video = structuredClone(prepared);
+      video.binding = makeBinding('vision', 'video:' + item.sourceSha256);
+      if (videos.has(video.sourceId)) fail();
+      videos.set(video.sourceId, video);
+      continue;
+    }
     if (
       !item ||
       Object.keys(item).some(
@@ -552,9 +644,151 @@ export async function restrictedPartnerMedia(
       }
     },
   };
+  const videoTool: RestrictedPartnerTool = {
+    name: 'partner_video',
+    description:
+      'Analyze an authenticated original video source, up to three sampled frames from the first bounded window. This is partial visual sampling with decoder PTS, not full movie/audio comprehension. No URLs or packets.',
+    inputSchema: {
+      type: 'object',
+      properties: { sourceId: { type: 'string' }, text: { type: 'string', maxLength: 8000 } },
+      required: ['sourceId', 'text'],
+      additionalProperties: false,
+    },
+    invoke: async (raw) => {
+      current();
+      const a = (typeof raw === 'string' ? JSON.parse(raw) : raw) as {
+        sourceId: string;
+        text: string;
+      };
+      if (
+        !a ||
+        Object.keys(a).some((k) => !['sourceId', 'text'].includes(k)) ||
+        typeof a.text !== 'string' ||
+        !a.text.trim() ||
+        Buffer.byteLength(a.text) > 8000
+      )
+        fail();
+      const video = videos.get(a.sourceId);
+      if (!video) fail();
+      if (effectCount + 1 + video!.frames.length > 8) fail();
+      const authority = { binding: video!.binding, signal: signal.signal, assertCurrent: current };
+      const key =
+        'restricted:video:' + sha(JSON.stringify([claim.runId, video!.binding.effectSlot, a.text]));
+      const priorVideo = await readRow(key);
+      current();
+      if (priorVideo) {
+        const saved = JSON.parse(priorVideo.payload);
+        if (saved.state === 'COMPLETE' && sameBinding(saved.binding, video!.binding))
+          return {
+            success: true,
+            contentItems: [{ type: 'inputText', text: JSON.stringify(saved.result) }],
+          };
+        unknown = true;
+        throw Error('RESTRICTED_MEDIA_UNKNOWN');
+      }
+      const result = await analyzeRestrictedVideo(
+        adapter,
+        {
+          authorizeSource: (p, v) => {
+            current();
+            if (
+              JSON.stringify(v.binding) !== JSON.stringify(video!.binding) ||
+              v.sourceSha256 !== video!.sourceSha256 ||
+              v.sourceId !== video!.sourceId ||
+              v.frames.some((f, i) => f.sha256 !== video!.frames[i]?.sha256)
+            )
+              fail();
+          },
+          claim: async (p, sourceSha256, windowDigest) => {
+            current();
+            effectCount++;
+            const ok = await insert(key, {
+              state: 'UNKNOWN',
+              binding: p.binding,
+              sourceSha256,
+              windowDigest,
+            });
+            if (!ok) unknown = true;
+            return ok;
+          },
+          stage: async (p, b, f, bytes) =>
+            ingest(
+              { binding: b, kind: 'vision', signal: p.signal, assertCurrent: current },
+              bytes,
+              'image/png',
+            ),
+          authorizeFrame: (p, b, asset) => {
+            current();
+            if (!sameBinding(b, asset.binding)) fail();
+            const handle = {};
+            handles.set(handle, {
+              binding: b,
+              kind: 'vision',
+              signal: p.signal,
+              assertCurrent: current,
+            });
+            return handle;
+          },
+          execute: async (handle, command) => {
+            const p = handles.get(handle as object);
+            if (!p) fail();
+            try {
+              return await withCindyMediaBillingSession(laneSessionId, () =>
+                withCindyMediaCallGuard(current, scopedFetch(p!), () =>
+                  adapter.execute(handle, command),
+                ),
+              );
+            } finally {
+              handles.delete(handle as object);
+            }
+          },
+          complete: async (p, result) => {
+            current();
+            const old = await readRow(key);
+            if (!old || JSON.parse(old.payload).state !== 'UNKNOWN') fail();
+            const payload = JSON.stringify({ state: 'COMPLETE', binding: p.binding, result });
+            const changed = await db.drizzle
+              .update(pluginTaskRequests)
+              .set({ payload, revision: 2, fingerprint: sha(payload) })
+              .where(
+                and(
+                  eq(pluginTaskRequests.id, old!.id),
+                  eq(pluginTaskRequests.payload, old!.payload),
+                  eq(pluginTaskRequests.revision, 1),
+                ),
+              )
+              .returning({ id: pluginTaskRequests.id });
+            current();
+            if (changed.length !== 1) fail();
+          },
+          unknown: async () => {
+            unknown = true;
+          },
+        },
+        authority,
+        video!,
+        a.text,
+      );
+      current();
+      return { success: true, contentItems: [{ type: 'inputText', text: JSON.stringify(result) }] };
+    },
+  };
   return {
-    context: JSON.stringify({ authorizedRequestMedia: context, approvedMediaRoutes: routes }),
-    tools: Object.keys(routes).length ? [tool] : [],
+    context: JSON.stringify({
+      authorizedRequestMedia: context,
+      approvedMediaRoutes: routes,
+      authorizedVideoSources: [...videos.values()].map((v) => ({
+        sourceId: v.sourceId,
+        sourceSha256: v.sourceSha256,
+        startSeconds: v.startSeconds,
+        windowSeconds: v.windowSeconds,
+        timeBasis: v.timeBasis,
+        partial: true,
+        sampling: v.sampling,
+        framePTS: v.frames.map((f) => f.timestampSeconds),
+      })),
+    }),
+    tools: [...(Object.keys(routes).length ? [tool] : []), ...(videos.size ? [videoTool] : [])],
     outputs() {
       current();
       if (unknown) throw Error('RESTRICTED_MEDIA_UNKNOWN');

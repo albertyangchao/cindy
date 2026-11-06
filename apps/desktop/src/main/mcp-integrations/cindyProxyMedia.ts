@@ -28,6 +28,16 @@ export function withCindyMediaCallGuard<T>(
   current();
   return restrictedCall.run({ current, fetch: fetcher }, run);
 }
+/** Forward opt-in scope to an existing Core image channel; ordinary calls keep their original fetch. */
+export function dispatchCindyMediaCallFetch(
+  fallback: typeof fetch,
+  input: Parameters<typeof fetch>[0],
+  init?: RequestInit,
+) {
+  const scope = restrictedCall.getStore();
+  scope?.current();
+  return (scope?.fetch ?? fallback)(input, init);
+}
 const assertRestrictedCall = () => restrictedCall.getStore()?.current();
 const currentFetch = (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
   assertRestrictedCall();

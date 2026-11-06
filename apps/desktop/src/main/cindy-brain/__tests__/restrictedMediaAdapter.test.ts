@@ -1,7 +1,13 @@
+// Explicit fake marker, not an account secret; preserve the original wire-test bytes.
+const syntheticFixtureCredential='synthetic-not-a-credential';
+import { createRestrictedMediaUrlLoader } from '../restrictedMediaUrl.js';
 import { afterEach, expect, it, vi } from 'vitest';
 import { createHash } from 'node:crypto';
-const network = vi.hoisted(() => ({ fetch: vi.fn() }));
-vi.mock('../../maker-host/outbound-fetch.js', () => ({ outboundFetch: network.fetch }));
+const network = vi.hoisted(() => ({ fetch: vi.fn(), guarded: vi.fn() }));
+vi.mock('../../maker-host/outbound-fetch.js', () => ({
+  outboundFetch: network.fetch,
+  guardedOutboundFetch: network.guarded,
+}));
 vi.mock('../../model-access/gatewayKeyRejection.js', () => ({
   reportCindyGatewayKeyRejected: vi.fn(),
 }));
@@ -108,7 +114,7 @@ function setup(kind: MediaKind = 'draw') {
     })),
     editPath: vi.fn(async () => `/managed/assets/${hash(png).slice(0, 2)}/${hash(png)}/blob.png`),
     transcription: () => ({
-      proxyApiKey: 'synthetic-not-a-credential',
+      proxyApiKey: syntheticFixtureCredential,
       baseUrl: 'https://synthetic.invalid',
     }),
     speech: () => ({
@@ -501,4 +507,39 @@ it('STT deadline aborts pending body, ignores late completion and never dispatch
   expect(s.ports.complete).not.toHaveBeenCalled();
   expect(await s.adapter.execute(s.handle, s.request)).toEqual({ state: 'HELD' });
   expect(network.fetch).toHaveBeenCalledOnce();
+});
+it('URL-only generated image uses approved loader then actual managed output receipt', async () => {
+  const s = setup();
+  s.image.mockResolvedValue({ data: [{ url: 'https://images.example.test/result' }] } as any);
+  network.guarded.mockResolvedValue({
+    response: new Response(png, { headers: { 'content-type': 'image/png' } }),
+    release: async () => {},
+  });
+  const loader = createRestrictedMediaUrlLoader({
+    authorize: (p, url, role) => ({
+      binding: p.binding,
+      role,
+      sourceSha256: createHash('sha256').update(url).digest('hex'),
+      hosts: ['images.example.test'],
+      revision: 1,
+    }),
+    assertCurrent: () => {},
+    claim: async () => true,
+    complete: async () => {},
+    unknown: async () => {},
+  });
+  const urlImage = vi.fn((p: any, url: string) => loader(p, url, 'output'));
+  (s.ports as any).urlImage = urlImage;
+  expect(await s.adapter.execute(s.handle, s.request)).toMatchObject({
+    asset: { sha256: hash(png), mimeType: 'image/png' },
+  });
+  expect(urlImage).toHaveBeenCalledOnce();
+  expect(network.guarded).toHaveBeenCalledOnce();
+  expect(s.ports.ingest).toHaveBeenCalledOnce();
+});
+it('URL-only result without current granted loader is UNKNOWN, never arbitrary fetch', async () => {
+  const s = setup();
+  s.image.mockResolvedValue({ data: [{ url: 'https://images.example.test/result' }] } as any);
+  await expect(s.adapter.execute(s.handle, s.request)).rejects.toThrow('UNKNOWN');
+  expect(s.ports.ingest).not.toHaveBeenCalled();
 });

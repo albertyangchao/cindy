@@ -736,6 +736,7 @@ import {
   getCindyProxyMediaService,
   getCindyVideoProviderRegistry,
   withCindyMediaBillingSession,
+  dispatchCindyMediaCallFetch,
 } from '../mcp-integrations/cindyProxyMedia.js';
 import { getCindyProxySearchService } from '../mcp-integrations/cindyProxySearch.js';
 import { normalizeImageParameters } from '../cindy-media/imageParameters.js';
@@ -749,7 +750,7 @@ import {
   pruneDynamicImageChannels,
   registerByokImageChannels,
 } from './byokImageChannel.js';
-import { createCustomImageChannel, registerCustomImageChannels } from './customImageChannel.js';
+import { createCustomImageChannel, registerCustomImageChannels, isCustomImageProvider } from './customImageChannel.js';
 import { readByokCredential, readByokInferenceBase } from '../model-access/byokCredentials.js';
 import type { AgentKind } from '@cindy/model-providers';
 import { resolveCustomMediaConnection, isCustomVideoProvider } from './customMediaConnection.js';
@@ -5032,7 +5033,7 @@ function getVideoProviderRegistry() {
         getCredentialGeneration: () => getGrokOAuthCredentialGeneration(),
         getOwnerScopeKey: () => activeOwnerScopeKey(),
         isOwnerBoundaryPending: () => isAppSessionBoundaryPending(),
-        fetchImplementation: ((url, init) => outboundFetch(url as string, init)) as typeof fetch,
+        fetchImplementation: ((url, init) => dispatchCindyMediaCallFetch(((u,o)=>outboundFetch(u as string,o)) as typeof fetch,url,init)) as typeof fetch,
         beforeDispatch: (model) => assertMediaModelStillEnabled('video', model),
         onAuthRejected: (failure) => invalidateXaiBridgeAuth(failure),
       }),
@@ -5726,7 +5727,7 @@ function getImageChannelRegistry(): ImageChannelRegistry {
         getCredentialGeneration: () => 0,
         getOwnerScopeKey: () => activeOwnerScopeKey(),
         isOwnerBoundaryPending: () => isGhostBoundaryPending(),
-        fetchImplementation: ((url, init) => outboundFetch(url as string, init)) as typeof fetch,
+        fetchImplementation: ((url, init) => dispatchCindyMediaCallFetch(((u,o)=>outboundFetch(u as string,o)) as typeof fetch,url,init)) as typeof fetch,
         beforeDispatch: (model) => assertMediaModelStillEnabled('image', model, 'xai-api'),
       }),
     );
@@ -5738,7 +5739,7 @@ function getImageChannelRegistry(): ImageChannelRegistry {
         getCredentialGeneration: () => getGrokOAuthCredentialGeneration(),
         getOwnerScopeKey: () => activeOwnerScopeKey(),
         isOwnerBoundaryPending: () => isGhostBoundaryPending(),
-        fetchImplementation: ((url, init) => outboundFetch(url as string, init)) as typeof fetch,
+        fetchImplementation: ((url, init) => dispatchCindyMediaCallFetch(((u,o)=>outboundFetch(u as string,o)) as typeof fetch,url,init)) as typeof fetch,
         beforeDispatch: (model) => assertMediaModelStillEnabled('image', model),
         onAuthRejected: (failure) => invalidateXaiBridgeAuth(failure),
       }),
@@ -5752,7 +5753,7 @@ function getImageChannelRegistry(): ImageChannelRegistry {
         getApiKey: () => getProviderSecretStore().get('gemini'),
         // googleapis 境外端点经 outboundFetch 吃系统代理:main 的裸 fetch 不读系统
         // 代理设置,代理软件非 TUN 模式下会直连失败(xd 网关域名境内直连,不注)。
-        fetchImplementation: ((url, init) => outboundFetch(url as string, init)) as typeof fetch,
+        fetchImplementation: ((url, init) => dispatchCindyMediaCallFetch(((u,o)=>outboundFetch(u as string,o)) as typeof fetch,url,init)) as typeof fetch,
         beforeDispatch: (model) => assertMediaModelStillEnabled('image', model),
       }),
     );
@@ -5765,7 +5766,7 @@ function getImageChannelRegistry(): ImageChannelRegistry {
       // 境外端点吃系统代理(outboundFetch):main 的裸 fetch 不读系统代理设置,
       // 代理软件非 TUN 模式下会直连失败(2026-07 review;xd 网关通道不注 ——
       // 网关域名境内直连,与现状一致)。
-      fetchImplementation: ((url, init) => outboundFetch(url as string, init)) as typeof fetch,
+      fetchImplementation: ((url, init) => dispatchCindyMediaCallFetch(((u,o)=>outboundFetch(u as string,o)) as typeof fetch,url,init)) as typeof fetch,
       proxy: {
         baseUrl: 'https://api.openai.com',
         generatePath: '/v1/images/generations',
@@ -5785,7 +5786,7 @@ function getImageChannelRegistry(): ImageChannelRegistry {
       onAuthFailure: async (failure) => {
         await getCodexImageAuthBinding().onAuthFailure(failure);
       },
-      fetchImplementation: ((url, init) => outboundFetch(url as string, init)) as typeof fetch,
+      fetchImplementation: ((url, init) => dispatchCindyMediaCallFetch(((u,o)=>outboundFetch(u as string,o)) as typeof fetch,url,init)) as typeof fetch,
       beforeDispatch: (model) => assertMediaModelStillEnabled('image', model, 'openai'),
     });
     registry.register('openai', {
@@ -5844,7 +5845,7 @@ function getImageChannelRegistry(): ImageChannelRegistry {
         onAuthFailure: async (failure) => {
           await getCodexImageAuthBinding().onAuthFailure(failure, providerId);
         },
-        fetchImplementation: ((url, init) => outboundFetch(url as string, init)) as typeof fetch,
+        fetchImplementation: ((url, init) => dispatchCindyMediaCallFetch(((u,o)=>outboundFetch(u as string,o)) as typeof fetch,url,init)) as typeof fetch,
         beforeDispatch: (model) => assertMediaModelStillEnabled('image', model, providerId),
       }),
     );
@@ -5872,7 +5873,7 @@ function getImageChannelRegistry(): ImageChannelRegistry {
             (model) => model.modalities?.input.includes('image') === true,
           );
         },
-        fetchImplementation: ((url, init) => outboundFetch(url as string, init)) as typeof fetch,
+        fetchImplementation: ((url, init) => dispatchCindyMediaCallFetch(((u,o)=>outboundFetch(u as string,o)) as typeof fetch,url,init)) as typeof fetch,
         beforeDispatch: (model) => assertMediaModelStillEnabled('image', model, providerId),
         logger: log,
       });
@@ -5887,7 +5888,7 @@ function getImageChannelRegistry(): ImageChannelRegistry {
       readApiKey: agent => readCustomProviderKey(providerId, agent),
       getOwnerScopeKey: activeOwnerScopeKey,
       isOwnerBoundaryPending: isGhostBoundaryPending,
-      fetchImplementation: ((url, init) => outboundFetch(url as string, init)) as typeof fetch,
+      fetchImplementation: ((url, init) => dispatchCindyMediaCallFetch(((u,o)=>outboundFetch(u as string,o)) as typeof fetch,url,init)) as typeof fetch,
       beforeDispatch: model => assertMediaModelStillEnabled('image', model, providerId),
       logger: log,
     }),
@@ -11910,11 +11911,28 @@ export function refreshInstalledPluginApps(): void {
 
 /** Main-only restricted media adapter reuses the existing executable Core registry. No IPC/exported secrets. */
 export function restrictedPartnerImageConfiguration() {
-  const routes: Partial<Record<'draw'|'edit',{providerId:string;modelId:string}>>={};
-  for(const [kind,capability] of [['draw','image.generate'],['edit','image.edit']] as const){
-    const config=getMediaPreferenceConfig(capability);
-    const chosen=config.models.find(m=>m.id===config.defaults?.standard);
-    if(chosen && chosen.providerId==='xd'){try{const channel=resolveImageChannelForModel(chosen.modelId,kind==='edit'?'edit':'generate',chosen.providerId);if(channel.legacyCompatible===false)continue;routes[kind]={providerId:chosen.providerId,modelId:chosen.modelId};}catch{/* Configured source is not currently executable; never advertise it. */}}
+  const routes: Partial<Record<'draw' | 'edit', { providerId: string; modelId: string }>> = {};
+  for (const [kind, capability] of [
+    ['draw', 'image.generate'],
+    ['edit', 'image.edit'],
+  ] as const) {
+    const config = getMediaPreferenceConfig(capability);
+    const chosen = config.models.find((m) => m.id === config.defaults?.standard);
+    const provider = chosen && getActiveCatalog().providers.find((p) => p.id === chosen.providerId);
+    if (chosen && (chosen.providerId === 'xd' || (provider && isCustomImageProvider(provider)))) {
+      try {
+        const channel = resolveImageChannelForModel(
+          chosen.modelId,
+          kind === 'edit' ? 'edit' : 'generate',
+          chosen.providerId,
+        );
+        if (channel.legacyCompatible === false && !(provider && isCustomImageProvider(provider)))
+          continue;
+        routes[kind] = { providerId: chosen.providerId, modelId: chosen.modelId };
+      } catch {
+        /* Configured source is not currently executable; never advertise it. */
+      }
+    }
   }
-  return {images:getImageChannelRegistry(),routes};
+  return { images: getImageChannelRegistry(), routes };
 }

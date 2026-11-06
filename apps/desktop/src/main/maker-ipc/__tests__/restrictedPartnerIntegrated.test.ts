@@ -21,6 +21,18 @@ const mocks = vi.hoisted(() => ({
   vision: undefined as any,
   routes: {} as Record<string, unknown>,
   ingest: vi.fn(),
+  network: vi.fn(),
+}));
+vi.mock('../../maker-host/outbound-fetch.js', () => ({
+  outboundFetch: () => {
+    throw Error('UNSCOPED_TEST_NETWORK_DENIED');
+  },
+  guardedOutboundFetch: async (url: any, init: any, current: any) => {
+    current();
+    const response = await mocks.network(url, init);
+    current();
+    return { response, release: async () => {} };
+  },
 }));
 vi.mock('../../cindy-brain/index.js', () => ({
   restrictedPartnerImageConfiguration: () => ({ images: mocks.images, routes: mocks.routes }),
@@ -500,8 +512,8 @@ it('real per-subject memory CAS still saves new facts when approved old DB never
       assertMemorySources(g.memorySources, f.current);
     };
     const claim = {
-      runId: 'new-memory-run',
-      text: 'synthetic new question',
+      version:1 as const,runId:'new-memory-run',inputId:'new-memory-input',pluginId:g.pluginId,principalId:g.principalId,partnerId:g.partnerId,grantId:g.id,grantRevision:g.revision,inputSha256:sha('synthetic new question'),state:'UNKNOWN' as const,
+      text:'synthetic new question',
       channel: f.channel,
     } as Parameters<typeof restrictedConversation>[2];
     const lane = await restrictedConversation(f.db, g, claim, f.route, current);
@@ -543,5 +555,229 @@ it('real per-subject memory CAS still saves new facts when approved old DB never
   } finally {
     f.sql.close();
     source.cleanup();
+  }
+});
+
+it('actual Main video input stage/SQL/Core tool claims one bounded window, keeps PTS and rejects packet drift/revocation', async () => {
+  const f = fixture();
+  f.grant.media = { vision: { providerId: 'fake', modelId: 'vision' } };
+  mocks.routes = {};
+  mocks.images = new ImageChannelRegistry();
+  mocks.vision = {
+    route: f.grant.media.vision,
+    assertCurrent: f.current,
+    deps: {
+      getProviderById: () => null,
+      resolveBackendRoute: () => ({
+        upstream: 'https://fixture.invalid/v1',
+        requestPath: '/chat/completions',
+        model: 'vision',
+        authorization: null,
+        headers: {},
+        wireProtocol: 'openai-chat',
+      }),
+    },
+  };
+  mocks.network.mockReset();
+  mocks.network.mockImplementation(async () =>
+    Response.json({ choices: [{ message: { content: 'One bounded frame' } }] }),
+  );
+  mocks.ingest.mockImplementation(async (p: any) => {
+    p.assertStillValid();
+    return { ext: '.png' };
+  });
+  const { grantResourceFingerprint } = await import('../restrictedPartnerRequirements.js');
+  const claim: any = {
+    version: 1,
+    runId: 'video-run',
+    inputId: 'video-input',
+    pluginId: 'plugin',
+    principalId: f.grant.principalId,
+    partnerId: 'bot',
+    grantId: 'grant',
+    grantRevision: 1,
+    inputSha256: sha('question'),
+    state: 'UNKNOWN',
+    channel: f.channel,
+  };
+  const sourceSha256 = sha('original video');
+  const binding = {
+    ...f.channel,
+    principalId: f.grant.principalId,
+    partnerId: 'bot',
+    runId: 'input:' + claim.inputId,
+    resourceFingerprint: grantResourceFingerprint(f.grant),
+    providerId: 'fake',
+    modelId: 'vision',
+    effectSlot: 'prepare-video:' + sourceSha256,
+  };
+  delete (binding as any).memoryRead;
+  const video: any = {
+    binding,
+    sourceId: 'asset:' + sourceSha256,
+    sourceSha256,
+    durationSeconds: 2,
+    startSeconds: 0,
+    windowSeconds: 2,
+    timeBasis: 'decoder-presentation-timestamp',
+    partial: true,
+    sampling: 'at-most-three-seeks-one-second-apart',
+    frames: [0, 1].map((index) => ({
+      index,
+      timestampSeconds: index + 0.05,
+      requestedSeconds: index,
+      base64: png.toString('base64'),
+      sha256: sha(png),
+      mimeType: 'image/png',
+    })),
+  };
+  const input: any = {
+    type: 'video',
+    id: 'video:' + sha(JSON.stringify(video)),
+    sourceSha256,
+    video,
+  };
+  try {
+    await expect(
+      restrictedPartnerMedia(f.db, f.grant, claim, f.current, [
+        { ...input, video: { ...video, binding: { ...binding, chatId: 'other' } } },
+      ]),
+    ).rejects.toThrow('DENIED');
+    expect(mocks.network).not.toHaveBeenCalled();
+    const media = await restrictedPartnerMedia(f.db, f.grant, claim, f.current, [input]);
+    const tool = media.tools.find((t) => t.name === 'partner_video')!;
+    await expect(
+      tool.invoke(
+        { sourceId: 'forged', text: 'describe' },
+        { runId: claim.runId, callId: 'wrong' },
+      ),
+    ).rejects.toThrow('DENIED');
+    const result: any = await tool.invoke(
+      { sourceId: video.sourceId, text: 'describe' },
+      { runId: claim.runId, callId: 'ok' },
+    );
+    expect(result.success).toBe(true);
+    expect(JSON.stringify(result)).toContain('0.05');
+    expect(mocks.network).toHaveBeenCalledTimes(2);
+    await tool.invoke(
+      { sourceId: video.sourceId, text: 'describe' },
+      { runId: claim.runId, callId: 'duplicate' },
+    );
+    expect(mocks.network).toHaveBeenCalledTimes(2);
+    expect(media.outputs()).toEqual([]);
+    f.revoke();
+    await expect(
+      tool.invoke(
+        { sourceId: video.sourceId, text: 'different' },
+        { runId: claim.runId, callId: 'revoke' },
+      ),
+    ).rejects.toThrow('REVOKED');
+    expect(mocks.network).toHaveBeenCalledTimes(2);
+    expect(
+      f.sql
+        .prepare(
+          "SELECT count(*) n FROM plugin_task_requests WHERE target_id LIKE 'restricted:video:%'",
+        )
+        .get(),
+    ).toEqual({ n: 1 });
+  } finally {
+    f.sql.close();
+  }
+});
+it('actual Main URL-result stage requires exact approval before one bounded download and keeps UNKNOWN after revoked approval', async () => {
+  const f = fixture();
+  mocks.vision = undefined;
+  const registry = new ImageChannelRegistry();
+  let paid = 0,
+    approved = false;
+  registry.register('fake', {
+    ready: () => true,
+    generateImage: async () => {
+      paid++;
+      return { data: [{ url: 'https://cdn.example.invalid/generated.png' }] };
+    },
+    editImage: async () => {
+      throw Error('unused');
+    },
+  });
+  mocks.images = registry;
+  mocks.routes = { draw: f.grant.media!.draw };
+  mocks.network.mockReset();
+  mocks.network.mockImplementation(
+    async () => new Response(png, { headers: { 'content-type': 'image/png' } }),
+  );
+  mocks.ingest.mockImplementation(async (p: any) => {
+    p.assertStillValid();
+    return { ext: '.png' };
+  });
+  const claim: any = {
+    version: 1,
+    runId: 'url-run',
+    inputId: 'url-input',
+    pluginId: 'plugin',
+    principalId: f.grant.principalId,
+    partnerId: 'bot',
+    grantId: 'grant',
+    grantRevision: 1,
+    inputSha256: sha('question'),
+    state: 'UNKNOWN',
+    channel: f.channel,
+  };
+  const approval = {
+    approve: async () => {
+      approved = true;
+    },
+    authorize: (p: any, url: string, role: any) => {
+      f.current();
+      if (!approved) throw Error('DENIED');
+      return {
+        binding: p.binding,
+        role,
+        sourceSha256: sha(url),
+        hosts: ['cdn.example.invalid'],
+        revision: 1,
+      };
+    },
+    assertCurrent: () => f.current(),
+  };
+  try {
+    const media = await restrictedPartnerMedia(
+      f.db,
+      f.grant,
+      claim,
+      f.current,
+      [],
+      undefined,
+      approval,
+    );
+    await media.tools[0]!.invoke(
+      { kind: 'draw', text: 'synthetic' },
+      { runId: claim.runId, callId: 'draw' },
+    );
+    expect(paid).toBe(1);
+    expect(approved).toBe(true);
+    expect(mocks.network).toHaveBeenCalledOnce();
+    expect(media.outputs()).toHaveLength(1);
+    const held = await restrictedPartnerMedia(
+      f.db,
+      f.grant,
+      { ...claim, runId: 'late-url' },
+      f.current,
+      [],
+      undefined,
+      {
+        ...approval,
+        approve: async () => {
+          f.revoke();
+        },
+      },
+    );
+    await expect(
+      held.tools[0]!.invoke({ kind: 'draw', text: 'late' }, { runId: 'late-url', callId: 'late' }),
+    ).rejects.toThrow();
+    expect(paid).toBe(2);
+    expect(mocks.network).toHaveBeenCalledOnce();
+  } finally {
+    f.sql.close();
   }
 });

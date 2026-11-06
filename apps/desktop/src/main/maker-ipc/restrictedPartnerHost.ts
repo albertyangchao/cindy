@@ -575,6 +575,49 @@ export function createRestrictedPartnerHost(deps: RestrictedPartnerHostDeps) {
       let bytes = 0;
       for (const rawAsset of a.assets) {
         const x = rawAsset as Record<string, unknown>;
+        if (x.type === 'video') {
+          if (
+            Object.keys(x).some((k) => !['type', 'id', 'sourceSha256', 'video'].includes(k)) ||
+            !grant.media?.vision ||
+            !a.channel
+          )
+            return fail('INVALID_PARAMS');
+          const v = x.video as import('../cindy-brain/restrictedVideoInput.js').PreparedVideo;
+          const c = a.channel as import('./restrictedPartnerExecution.js').RestrictedChannelInput;
+          const route = grant.media.vision;
+          const expected = {
+            domainId: c.domainId,
+            connectionId: c.connectionId,
+            generation: c.generation,
+            chatId: c.chatId,
+            eventId: c.eventId,
+            revision: c.revision,
+            epoch: grant.dispatchEpoch,
+            principalId: grant.principalId,
+            partnerId: grant.partnerId,
+            runId: 'input:' + a.inputId,
+            resourceFingerprint: grantResourceFingerprint(grant),
+            providerId: route.providerId,
+            modelId: route.modelId,
+            effectSlot: 'prepare-video:' + x.sourceSha256,
+          };
+          try {
+            const frames = (
+              await import('../cindy-brain/restrictedVideoInput.js')
+            ).validatePreparedVideo(v, expected);
+            if (
+              x.id !== 'video:' + sha(JSON.stringify(v)) ||
+              x.sourceSha256 !== v.sourceSha256 ||
+              v.sourceId !== 'asset:' + v.sourceSha256
+            )
+              return fail('INVALID_PARAMS');
+            bytes += frames.reduce((n, f) => n + f.base64.length, 0);
+          } catch {
+            return fail('INVALID_PARAMS');
+          }
+          continue;
+        }
+
         if (
           Object.keys(x).some(
             (k) => !['id', 'sha256', 'mimeType', 'base64', 'sourceSha256', 'partial'].includes(k),

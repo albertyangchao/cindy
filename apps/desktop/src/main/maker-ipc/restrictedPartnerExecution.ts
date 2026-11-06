@@ -50,7 +50,8 @@ export interface RestrictedChannelInput {
   epoch: number;
   memoryRead?: boolean;
 }
-export interface RestrictedInputAsset {
+export interface RestrictedByteInputAsset {
+  type?: never;
   id: string;
   sha256: string;
   mimeType: string;
@@ -58,6 +59,14 @@ export interface RestrictedInputAsset {
   sourceSha256: string;
   partial: boolean;
 }
+export type RestrictedInputAsset =
+  | RestrictedByteInputAsset
+  | {
+      type: 'video';
+      id: string;
+      sourceSha256: string;
+      video: import('../cindy-brain/restrictedVideoInput.js').PreparedVideo;
+    };
 export interface RestrictedOutputAsset {
   kind: 'draw' | 'edit' | 'tts';
   id: string;

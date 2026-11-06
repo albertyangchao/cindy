@@ -15306,21 +15306,194 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       const after=getCachedBinaryStatus('codex');return version==='0.166.0'&&after.binaryReady&&after.binaryPath===status.binaryPath;
     },
     mediaConfiguration: async (id,current) => {current();const media=await import('./restrictedPartnerMedia.js');current();return media.restrictedMediaConfiguration(id,current);},
-    prepare: async (grant,claim,route,current,assets) => {
-      const snapshot=getCurrentDbClientSnapshot(); if(!snapshot)throw Error('HOST_NOT_READY');
-      const guard=()=>{current();if(getCurrentDbClientSnapshot()!==snapshot)throw Error('PERMISSION_DENIED');};
-      const ownerScope=captureDataOwnerBroadcastScope();
-      const conversation=await (await import('./restrictedPartnerConversation.js')).restrictedConversation(snapshot.client,grant,claim,route,guard,{
-        created: id=>{guard();if(!isDataOwnerBroadcastScopeCurrent(ownerScope))throw Error('PERMISSION_DENIED');emitSessionCreated(id);},
-        message: async(id,row)=>{const {messageToCamel}=await import('../localDb/mapper.js');guard();const {broadcastMessageRow}=await import('../localDb/ipc/messages.js');guard();if(!isDataOwnerBroadcastScopeCurrent(ownerScope))throw Error('PERMISSION_DENIED');broadcastMessageRow(id,messageToCamel(row),ownerScope);},
-      });guard();
-      const media=await (await import('./restrictedPartnerMedia.js')).restrictedPartnerMedia(snapshot.client,grant,claim,guard,assets,conversation.laneSessionId);guard();
-      const research=(await import('./restrictedPartnerResearch.js')).restrictedPartnerResearch(snapshot.client,grant,claim,guard,{
-        route:async()=>route,start:opts=>maker.startRestrictedPartnerInput(opts),
-        project:async g=>{guard();const [profile]=await snapshot.client.drizzle.select({persona:botProfileVersions.identitySource}).from(botProfiles).innerJoin(botProfileVersions,and(eq(botProfileVersions.botId,botProfiles.id),eq(botProfileVersions.version,botProfiles.currentVersion))).where(eq(botProfiles.id,g.partnerId)).limit(1);guard();if(!profile)throw Error('TARGET_UNAVAILABLE');const resources=(await import('./restrictedPartnerResources.js')).restrictedPartnerResources(g,guard);guard();return {persona:profile.persona,subjectContext:resources.context,readPaths:[],tools:[...resources.tools,...conversation.tools.filter(t=>t.name==='partner_history')]};},
-      });guard();
-      restrictedCompletions.set(claim.runId,conversation.append);
-      return {context:conversation.context+'\n'+media.context,tools:[...conversation.tools,...media.tools,research.tool],laneSessionId:conversation.laneSessionId,outputs:()=>{research.assertResolved();return media.outputs();}};
+    prepare: async (grant, claim, route, current, assets) => {
+      const snapshot = getCurrentDbClientSnapshot();
+      if (!snapshot) throw Error('HOST_NOT_READY');
+      const guard = () => {
+        current();
+        if (getCurrentDbClientSnapshot() !== snapshot) throw Error('PERMISSION_DENIED');
+      };
+      const ownerScope = captureDataOwnerBroadcastScope();
+      const conversation = await (
+        await import('./restrictedPartnerConversation.js')
+      ).restrictedConversation(snapshot.client, grant, claim, route, guard, {
+        created: (id) => {
+          guard();
+          if (!isDataOwnerBroadcastScopeCurrent(ownerScope)) throw Error('PERMISSION_DENIED');
+          emitSessionCreated(id);
+        },
+        message: async (id, row) => {
+          const { messageToCamel } = await import('../localDb/mapper.js');
+          guard();
+          const { broadcastMessageRow } = await import('../localDb/ipc/messages.js');
+          guard();
+          if (!isDataOwnerBroadcastScopeCurrent(ownerScope)) throw Error('PERMISSION_DENIED');
+          broadcastMessageRow(id, messageToCamel(row), ownerScope);
+        },
+      });
+      guard();
+      const approvedUrls = new Map<
+        string,
+        import('../cindy-brain/restrictedMediaUrl.js').MediaUrlGrant
+      >();
+      const urlKey = (
+        p: import('../cindy-brain/restrictedMediaAdapter.js').MediaPermit,
+        url: string,
+      ) =>
+        pluginTaskConfigHash('sha256')
+          .update(JSON.stringify([p.binding, url]))
+          .digest('hex');
+      const urlAuthority = {
+        approve: async (
+          p: import('../cindy-brain/restrictedMediaAdapter.js').MediaPermit,
+          raw: string,
+          role: 'input' | 'output',
+        ) => {
+          guard();
+          p.assertCurrent();
+          if (role !== 'output' || raw.length > 8192) throw Error('RESTRICTED_MEDIA_URL_DENIED');
+          const u = new URL(raw);
+          if (
+            u.protocol !== 'https:' ||
+            u.username ||
+            u.password ||
+            u.hash ||
+            !u.hostname.includes('.') ||
+            /[\[\]:]/.test(u.hostname) ||
+            /^\d+(\.\d+){3}$/.test(u.hostname) ||
+            u.hostname.endsWith('.') ||
+            (u.port && u.port !== '443')
+          )
+            throw Error('RESTRICTED_MEDIA_URL_DENIED');
+          const key = urlKey(p, raw);
+          if (approvedUrls.has(key)) return;
+          const win = getDeepLinkMainWindow();
+          if (!win || win.isDestroyed() || !isTrustedAppRendererWindow(win))
+            throw Error('RESTRICTED_MEDIA_URL_DENIED');
+          const sourceSha256 = pluginTaskConfigHash('sha256').update(raw).digest('hex');
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          try {
+            const answer = await Promise.race([
+              dialog.showMessageBox(win, {
+                type: 'warning',
+                title: 'Restricted image download',
+                message: 'Download this generated image from the exact provider host?',
+                detail:
+                  'Host: ' +
+                  u.hostname +
+                  '\nURL digest: ' +
+                  sourceSha256 +
+                  '\nThis approves one bounded download only. Generation may already have incurred cost. No retry on unknown.',
+                buttons: ['Cancel', 'Approve download'],
+                defaultId: 0,
+                cancelId: 0,
+              }),
+              new Promise<never>((_, reject) => {
+                timer = setTimeout(() => reject(Error('RESTRICTED_MEDIA_URL_DENIED')), 30000);
+              }),
+            ]);
+            guard();
+            p.assertCurrent();
+            if (answer.response !== 1) throw Error('RESTRICTED_MEDIA_URL_DENIED');
+            approvedUrls.set(key, {
+              binding: { ...p.binding },
+              role,
+              sourceSha256,
+              hosts: [u.hostname],
+              revision: grant.revision,
+            });
+          } finally {
+            if (timer) clearTimeout(timer);
+          }
+        },
+        authorize: (
+          p: import('../cindy-brain/restrictedMediaAdapter.js').MediaPermit,
+          url: string,
+          role: 'input' | 'output',
+        ) => {
+          guard();
+          p.assertCurrent();
+          const a = approvedUrls.get(urlKey(p, url));
+          if (!a || a.role !== role) throw Error('RESTRICTED_MEDIA_URL_DENIED');
+          return a;
+        },
+        assertCurrent: (
+          p: import('../cindy-brain/restrictedMediaAdapter.js').MediaPermit,
+          a: import('../cindy-brain/restrictedMediaUrl.js').MediaUrlGrant,
+        ) => {
+          guard();
+          p.assertCurrent();
+          if (
+            ![...approvedUrls.values()].some(
+              (v) => v === a || JSON.stringify(v) === JSON.stringify(a),
+            )
+          )
+            throw Error('RESTRICTED_MEDIA_URL_DENIED');
+        },
+      };
+      const media = await (
+        await import('./restrictedPartnerMedia.js')
+      ).restrictedPartnerMedia(
+        snapshot.client,
+        grant,
+        claim,
+        guard,
+        assets,
+        conversation.laneSessionId,
+        urlAuthority,
+      );
+      guard();
+      const research = (await import('./restrictedPartnerResearch.js')).restrictedPartnerResearch(
+        snapshot.client,
+        grant,
+        claim,
+        guard,
+        {
+          route: async () => route,
+          start: (opts) => maker.startRestrictedPartnerInput(opts),
+          project: async (g) => {
+            guard();
+            const [profile] = await snapshot.client.drizzle
+              .select({ persona: botProfileVersions.identitySource })
+              .from(botProfiles)
+              .innerJoin(
+                botProfileVersions,
+                and(
+                  eq(botProfileVersions.botId, botProfiles.id),
+                  eq(botProfileVersions.version, botProfiles.currentVersion),
+                ),
+              )
+              .where(eq(botProfiles.id, g.partnerId))
+              .limit(1);
+            guard();
+            if (!profile) throw Error('TARGET_UNAVAILABLE');
+            const resources = (
+              await import('./restrictedPartnerResources.js')
+            ).restrictedPartnerResources(g, guard);
+            guard();
+            return {
+              persona: profile.persona,
+              subjectContext: resources.context,
+              readPaths: [],
+              tools: [
+                ...resources.tools,
+                ...conversation.tools.filter((t) => t.name === 'partner_history'),
+              ],
+            };
+          },
+        },
+      );
+      guard();
+      restrictedCompletions.set(claim.runId, conversation.append);
+      return {
+        context: conversation.context + '\n' + media.context,
+        tools: [...conversation.tools, ...media.tools, research.tool],
+        laneSessionId: conversation.laneSessionId,
+        outputs: () => {
+          research.assertResolved();
+          return media.outputs();
+        },
+      };
     },
     afterComplete: async(claim,text,current)=>{const append=restrictedCompletions.get(claim.runId);if(!append)throw Error('RESTRICTED_PARTNER_HISTORY_DENIED');try{await append(claim,text,current);}finally{restrictedCompletions.delete(claim.runId);}},
     snapshot: () => {

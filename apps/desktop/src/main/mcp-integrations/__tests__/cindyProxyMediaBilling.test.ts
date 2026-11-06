@@ -36,6 +36,7 @@ import {
   getCindyVideoProviderRegistry,
   withCindyMediaBillingSession,
   withCindyMediaCallGuard,
+  dispatchCindyMediaCallFetch,
 } from '../cindyProxyMedia.js';
 
 describe('legacy Gateway media billing wiring', () => {
@@ -178,4 +179,29 @@ describe('legacy Gateway media billing wiring', () => {
     expect(mocks.recordBilling).not.toHaveBeenCalled();
     expect(mocks.finishBilling).toHaveBeenCalledOnce();
   });
+});
+
+it('custom Core media fetch uses current restricted guard/transport and ordinary fallback only outside authority', async () => {
+  const ordinary = vi.fn(async () => Response.json({ ok: true })),
+    scoped = vi.fn(async () => Response.json({ ok: true }));
+  let active = true;
+  const current = () => {
+    if (!active) throw Error('DENIED');
+  };
+  await dispatchCindyMediaCallFetch(ordinary, 'https://example.invalid');
+  expect(ordinary).toHaveBeenCalledOnce();
+  await withCindyMediaCallGuard(current, scoped, () =>
+    dispatchCindyMediaCallFetch(ordinary, 'https://example.invalid'),
+  );
+  expect(scoped).toHaveBeenCalledOnce();
+  active = false;
+  await expect(
+    Promise.resolve().then(() =>
+      withCindyMediaCallGuard(current, scoped, () =>
+        dispatchCindyMediaCallFetch(ordinary, 'https://example.invalid'),
+      ),
+    ),
+  ).rejects.toThrow('DENIED');
+  expect(scoped).toHaveBeenCalledOnce();
+  expect(ordinary).toHaveBeenCalledOnce();
 });
