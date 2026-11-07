@@ -190,7 +190,7 @@ it('native effect count reads actual action namespace, preserves old input and r
       state,
       principalId: 'synthetic-principal',
       partnerId: 'synthetic-partner',
-      runId: 'synthetic-run',
+      runId: 'synthetic-run:'+action,
       sourceOutputMessageId: 'synthetic-output',
       completedOutputSha256: 'a'.repeat(64),
       effects:
@@ -241,8 +241,12 @@ it('native effect count reads actual action namespace, preserves old input and r
   expect(await f.store.unknownNativePublicationEffects('plugin')).toBe(0);
   insert('UNKNOWN');
   expect(await f.store.unknownNativePublicationEffects('plugin')).toBe(1);
+  insert('DISPATCHING_UNKNOWN','plugin','32345678-1234-1234-1234-123456789abc');
+  expect(await f.store.unknownNativePublicationEffects('plugin')).toBe(2);
+  insert('APPLIED_VERIFIED','plugin','42345678-1234-1234-1234-123456789abc');
+  expect(await f.store.unknownNativePublicationEffects('plugin')).toBe(2);
   insert('DISPATCHING_UNKNOWN', 'foreign', '22345678-1234-1234-1234-123456789abc');
-  expect(await f.store.unknownNativePublicationEffects('plugin')).toBe(1);
+  expect(await f.store.unknownNativePublicationEffects('plugin')).toBe(2);
   expect(
     f.db.prepare('SELECT payload FROM plugin_task_requests WHERE id=?').get('old-input'),
   ).toEqual({ payload: '{"state":"UNKNOWN"}' });
