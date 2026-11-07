@@ -1,8 +1,11 @@
-import { getCurrentDbClientSnapshot } from '../localDb/client/current.js';
+import { getCurrentDbClientSnapshot, type CurrentDbClientSnapshot } from '../localDb/client/current.js';
 import {
   isManagedCoverageDriver,
-  type ManagedCoverageDriver,
+  ManagedCoverageDriver,
+  type FixedCoverageProfile,
+  type MainPublicationSourcePlan,
 } from './restrictedPublicationCoverageDriver.js';
+import { createRestrictedPartnerStore } from './restrictedPartnerStore.js';
 import {
   ManagedPublicationController,
   type PublisherReleaseSource,
@@ -26,7 +29,8 @@ import { createHash, randomUUID } from 'node:crypto';
 import { publicationPython, publicationManagedEntryPython } from './restrictedPublicationPython.js';
 import {
   isConsumerGuardCoverageAuthority,
-  type ConsumerGuardCoverageAuthority,
+  ConsumerGuardCoverageAuthority,
+  createControlledCoverageController,
   type ManagedPublicationJob,
 } from './restrictedPublicationConsumerGuardAuthority.js';
 import {
@@ -81,6 +85,74 @@ const managedRoots = new WeakMap<
   object,
   { pin: RegisteredPublicationRoot; driver: ManagedCoverageDriver; epoch: object }
 >();
+const currentAssemblies = new WeakMap<object, { pending: number }>();
+/** Concrete account/Store/controller/Driver/Authority assembly. Only an original
+ * Main deployment owner may call this with an independently approved fixed profile.
+ * No IPC registration path exists; an all-owned test realm is not a production profile.
+ * Foreign profiles still require the original resident/namespace owners' facts.
+ */
+export function createControlledPublicationAssembly(
+  snapshot: CurrentDbClientSnapshot,
+  pluginId: string,
+  profile: FixedCoverageProfile,
+  sourcePlan?: MainPublicationSourcePlan,
+) {
+  if (!snapshot || getCurrentDbClientSnapshot() !== snapshot || currentAssemblies.get(snapshot)?.pending) denied();
+  const assembly = { pending: 0 };
+  const assertOwner = () => {
+    if (getCurrentDbClientSnapshot() !== snapshot || currentAssemblies.get(snapshot) !== assembly) denied();
+  };
+  const accountScopeRef = digest(['publication-main-account/v1', snapshot.userId]);
+  const store = createRestrictedPartnerStore(snapshot.client, assertOwner);
+  const controller = new ManagedPublicationController(
+    store, pluginId, accountScopeRef, profile.registration.deviceScopeRef, assertOwner,
+  );
+  const driver = new ManagedCoverageDriver(store, pluginId, accountScopeRef, controller, profile, assertOwner, Date.now, sourcePlan);
+  const authority = new ConsumerGuardCoverageAuthority(store, pluginId, accountScopeRef, assertOwner,
+    createControlledCoverageController(driver));
+  currentAssemblies.set(snapshot, assembly);
+  let closed = false;
+  let revoking: Promise<void> | undefined;
+  const removeOwnRoot = () => {
+    if (managedRoots.get(snapshot)?.driver === driver) managedRoots.delete(snapshot);
+  };
+  return Object.freeze({
+    accountScopeRef, store, controller, driver, authority,
+    async activate(generation: string) {
+      assertOwner();
+      if (closed || assembly.pending) denied();
+      assembly.pending++;
+      try {
+        await authority.switchGeneration(generation);
+        await driver.refresh();
+        assertOwner();
+        if (closed) denied();
+        bindControlledPublicationRoot(snapshot, snapshot, authority, driver);
+        const pin = resolveControlledPublicationRoot(snapshot, snapshot, assertOwner);
+        if (!pin) denied();
+        return pin!;
+      } catch (error) {
+        closed = true;
+        removeOwnRoot();
+        // Authority invalidates synchronously before its durable revoke/drain.
+        if (currentAssemblies.get(snapshot) === assembly)
+          await authority.invalidate('UNKNOWN').catch(() => {});
+        else await driver.quiesce().catch(() => {});
+        throw error;
+      } finally { assembly.pending--; }
+    },
+    revoke() {
+      closed = true;
+      removeOwnRoot();
+      if (revoking) return revoking;
+      assembly.pending++;
+      // A superseded assembly cannot invalidate the new shared authority/root.
+      revoking = (currentAssemblies.get(snapshot) === assembly ?
+        authority.invalidate('REVOKED') : driver.quiesce()).finally(() => { assembly.pending--; });
+      return revoking;
+    },
+  });
+}
 export function bindControlledPublicationRoot(
   accountSnapshot: object,
   ownerEpoch: object,

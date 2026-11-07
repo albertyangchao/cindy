@@ -31,6 +31,7 @@ type Store = Pick<
   | 'readConsumerGuardReceipt'
   | 'compareAndSwapConsumerGuardReceipt'
   | 'unresolvedConsumerGuardAdmissions'
+  | 'unknownNativePublicationEffects'
   | 'consumerGuardReceiptIdentity'
 >;
 export interface PublisherReleaseSource {
@@ -53,6 +54,11 @@ type Lifecycle = {
   boot: string;
   state: 'QUIESCING' | 'INSTALLED' | 'ACTIVE' | 'REVOKED' | 'UNKNOWN';
   sequence: number;
+  /** Independent source event counters, never inferred from RPC/SQL revisions. */
+  releaseSequence: number;
+  lifecycleSequence: number;
+  operationId: string | null;
+  sourcePhase: ManagedLifecyclePhase | null;
   usedGenerations: string[];
   release: Release | null;
 };
@@ -60,7 +66,12 @@ const locks = new WeakMap<object, Promise<unknown>>();
 const launches = new WeakSet<object>();
 const lifecycleReceipts = new WeakMap<
   object,
-  { owner: ManagedPublicationController; epoch: number; value: ManagedEnrollmentObservation }
+  {
+    owner: ManagedPublicationController;
+    epoch: number;
+    state: Lifecycle['state'];
+    value: ManagedEnrollmentObservation;
+  }
 >();
 export interface ManagedEnrollmentObservation {
   accountScopeRef: string;
@@ -84,12 +95,69 @@ export function readManagedEnrollmentReceipt(
     deny('ENROLLMENT_RECEIPT');
   return structuredClone(x.value);
 }
+export type ManagedLifecyclePhase = 'INSTALLED' | 'ENTRY_SWITCHED' | 'LOADED' | 'REVOKED' | 'DRAINED';
+export interface ManagedSourceBinding {
+  accountId: string;
+  deviceId: string;
+  bootId: string;
+  ownerEpoch: number;
+  generation: string;
+}
+export interface ManagedLifecycleObservation {
+  schema: 'publication-main-lifecycle-source/v1';
+  scope: 'OWNED_CONTROLLER_ONLY';
+  operationId: string;
+  binding: ManagedSourceBinding;
+  phase: ManagedLifecyclePhase;
+  releaseSequence: number;
+  lifecycleSequence: number;
+  root: string;
+  sourceDigest: string;
+  files: Record<string, string>;
+  enrollment: ManagedEnrollmentObservation | null;
+  ownedJobs: number;
+  unresolvedAdmissions: number;
+  unknownNativeEffects: number;
+}
+type LifecycleReceipt = {
+  owner: ManagedPublicationController;
+  epoch: number;
+  stateDigest: string;
+  key: string;
+  row: { revision: number; payload: string };
+  value: ManagedLifecycleObservation;
+};
+const managedLifecycleReceipts = new WeakMap<object, LifecycleReceipt>();
+/** Summaries are transport data; only the original Main-private handle can name a source fact. */
+export function readManagedLifecycleReceipt(
+  handle: object,
+  owner: ManagedPublicationController,
+): Readonly<ManagedLifecycleObservation> {
+  const receipt = managedLifecycleReceipts.get(handle);
+  if (
+    !receipt ||
+    receipt.owner !== owner ||
+    !owner.lifecycleReceiptCurrent(receipt.epoch, receipt.value)
+  )
+    deny('LIFECYCLE_RECEIPT');
+  return structuredClone(receipt.value);
+}
 export class ManagedPublicationController {
   private readonly boot = randomUUID();
   private readonly key = sha('publication-managed-lifecycle/v1');
   private closed = true;
   private ledgerFloor = 0;
   private sequenceFloor = 0;
+  private releaseSequenceFloor = 0;
+  private lifecycleSequenceFloor = 0;
+  private completedLifecycle?: {
+    epoch: number;
+    phase: ManagedLifecyclePhase;
+    stateDigest: string;
+    enrollment?: object;
+    receipt?: object;
+  };
+  private readonly sourceInvalidations = new Set<() => void>();
   private epoch = 0;
   private release?: Release;
   private readonly jobs = new Map<
@@ -114,13 +182,48 @@ export class ManagedPublicationController {
     );
     return next;
   }
-  private async write(state: Lifecycle) {
+  private assertEpoch(epoch: number) {
     this.ownerCurrent();
+    if (epoch !== this.epoch) deny('REVOKED');
+  }
+  private invalidate() {
+    this.closed = true;
+    ++this.epoch;
+    this.completedLifecycle = undefined;
+    for (const listener of [...this.sourceInvalidations]) {
+      try {
+        listener();
+      } catch {
+        // A closed source remains closed even if a consumer's cleanup fails.
+      }
+    }
+    return this.epoch;
+  }
+  /** Main brokers subscribe so their held source lease closes before transition I/O. */
+  onSourceInvalidated(listener: () => void): () => void {
+    this.sourceInvalidations.add(listener);
+    return () => this.sourceInvalidations.delete(listener);
+  }
+  private completeLifecycle(
+    phase: ManagedLifecyclePhase,
+    state: Lifecycle,
+    epoch: number,
+    enrollment?: object,
+  ) {
+    this.assertEpoch(epoch);
+    this.completedLifecycle = { epoch, phase, stateDigest: sha(state), enrollment };
+  }
+  private async write(state: Lifecycle, epoch: number) {
+    this.assertEpoch(epoch);
+    if (![state.sequence, state.releaseSequence, state.lifecycleSequence].every(
+      (value) => Number.isSafeInteger(value) && value >= 0,
+    )) deny('SEQUENCE');
     const old = await this.store.readConsumerGuardReceipt(
       this.plugin,
       this.accountScopeRef,
       this.key,
     );
+    this.assertEpoch(epoch);
     if (old) {
       let existing: Lifecycle;
       try {
@@ -143,10 +246,12 @@ export class ManagedPublicationController {
       old,
       JSON.stringify(state),
     );
-    this.ownerCurrent();
+    this.assertEpoch(epoch);
     if (!ok) deny('CAS');
     this.ledgerFloor = Math.max(this.ledgerFloor, (old?.revision ?? 0) + 1);
     this.sequenceFloor = Math.max(this.sequenceFloor, state.sequence);
+    this.releaseSequenceFloor = Math.max(this.releaseSequenceFloor, state.releaseSequence);
+    this.lifecycleSequenceFloor = Math.max(this.lifecycleSequenceFloor, state.lifecycleSequence);
     const auditKey = sha(['publication-managed-event/v1', this.boot, (old?.revision ?? 0) + 1]);
     if (
       !(await this.store.compareAndSwapConsumerGuardReceipt(
@@ -162,15 +267,20 @@ export class ManagedPublicationController {
       ))
     )
       deny('CAS');
+    this.assertEpoch(epoch);
   }
-  private async state(): Promise<Lifecycle> {
+  private async state(epoch: number = this.epoch): Promise<Lifecycle> {
     const row = await this.store.readConsumerGuardReceipt(
       this.plugin,
       this.accountScopeRef,
       this.key,
     );
-    this.ownerCurrent();
-    if (!row)
+    this.assertEpoch(epoch);
+    if (!row) {
+      if (this.ledgerFloor || this.sequenceFloor || this.releaseSequenceFloor || this.lifecycleSequenceFloor) {
+        this.invalidate();
+        deny('LEDGER_ROLLBACK');
+      }
       return {
         schema: 'publication-managed-lifecycle/v1',
         accountScopeRef: this.accountScopeRef,
@@ -178,14 +288,26 @@ export class ManagedPublicationController {
         boot: this.boot,
         state: 'QUIESCING',
         sequence: 0,
+        releaseSequence: 0,
+        lifecycleSequence: 0,
+        operationId: null,
+        sourcePhase: null,
         usedGenerations: [],
         release: null,
       };
+    }
     let s: Lifecycle;
     try {
       s = JSON.parse(row.payload);
     } catch {
       deny('LEDGER');
+    }
+    // Old v1 rows remain readable. They carry no new source authority: a completed
+    // operation in this controller is additionally required before issuing a handle.
+    if ([s.releaseSequence, s.lifecycleSequence, s.operationId, s.sourcePhase].every(
+      (value) => value === undefined,
+    )) {
+      s = { ...s, releaseSequence: 0, lifecycleSequence: 0, operationId: null, sourcePhase: null };
     }
     if (
       s.schema !== 'publication-managed-lifecycle/v1' ||
@@ -195,17 +317,29 @@ export class ManagedPublicationController {
       !['QUIESCING', 'INSTALLED', 'ACTIVE', 'REVOKED', 'UNKNOWN'].includes(s.state) ||
       !Number.isSafeInteger(s.sequence) ||
       s.sequence < 0 ||
+      !Number.isSafeInteger(s.releaseSequence) ||
+      s.releaseSequence < 0 ||
+      !Number.isSafeInteger(s.lifecycleSequence) ||
+      s.lifecycleSequence < 0 ||
+      (s.operationId !== null && !opaque(s.operationId)) ||
+      (s.sourcePhase !== null && !['INSTALLED', 'ENTRY_SWITCHED', 'LOADED', 'REVOKED', 'DRAINED'].includes(s.sourcePhase)) ||
       !Array.isArray(s.usedGenerations) ||
       s.usedGenerations.some((x) => !opaque(x))
     )
       deny('LEDGER');
-    if (row.revision < this.ledgerFloor || s.sequence < this.sequenceFloor) {
-      this.closed = true;
-      ++this.epoch;
+    if (
+      row.revision < this.ledgerFloor ||
+      s.sequence < this.sequenceFloor ||
+      s.releaseSequence < this.releaseSequenceFloor ||
+      s.lifecycleSequence < this.lifecycleSequenceFloor
+    ) {
+      this.invalidate();
       deny('LEDGER_ROLLBACK');
     }
     this.ledgerFloor = Math.max(this.ledgerFloor, row.revision);
     this.sequenceFloor = Math.max(this.sequenceFloor, s.sequence);
+    this.releaseSequenceFloor = Math.max(this.releaseSequenceFloor, s.releaseSequence);
+    this.lifecycleSequenceFloor = Math.max(this.lifecycleSequenceFloor, s.lifecycleSequence);
     // Restart never inherits an ACTIVE process set or a previously verified release lease.
     if (s.boot !== this.boot && s.state === 'ACTIVE') return { ...s, state: 'UNKNOWN' };
     return s;
@@ -265,22 +399,29 @@ export class ManagedPublicationController {
   }
   /** Revoke in-memory admissions synchronously, before waiting for any ledger/system IO. */
   async revoke(): Promise<void> {
-    this.closed = true;
-    this.epoch++;
+    const epoch = this.invalidate();
+    for (const x of this.jobs.values()) x.job.revoke();
     await this.exclusive(async () => {
+      this.assertEpoch(epoch);
       const s = await this.state();
-      await this.write({ ...s, boot: this.boot, state: 'QUIESCING', sequence: s.sequence + 1 });
-      for (const x of this.jobs.values()) x.job.revoke();
-      await this.write({ ...s, boot: this.boot, state: 'REVOKED', sequence: s.sequence + 2 });
+      this.assertEpoch(epoch);
+      await this.write({ ...s, boot: this.boot, state: 'QUIESCING', sequence: s.sequence + 1 }, epoch);
+      const revoked: Lifecycle = {
+        ...s, boot: this.boot, state: 'REVOKED', sequence: s.sequence + 2,
+        sourcePhase: 'REVOKED', lifecycleSequence: s.lifecycleSequence + 1,
+      };
+      await this.write(revoked, epoch);
+      this.completeLifecycle('REVOKED', revoked, epoch);
     });
   }
   async drain(timeoutMs = 10000): Promise<void> {
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > 30000) deny('TIMEOUT');
-    this.closed = true;
-    ++this.epoch;
+    const epoch = this.invalidate();
     await this.exclusive(async () => {
+      this.assertEpoch(epoch);
       const s = await this.state();
-      await this.write({ ...s, state: 'QUIESCING', sequence: s.sequence + 1 });
+      this.assertEpoch(epoch);
+      await this.write({ ...s, state: 'QUIESCING', sequence: s.sequence + 1 }, epoch);
     });
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
@@ -290,21 +431,35 @@ export class ManagedPublicationController {
           timer = setTimeout(() => reject(Error('PUBLICATION_MANAGED_DRAIN_UNKNOWN')), timeoutMs);
         }),
       ]);
-      if (
-        (await this.store.unresolvedConsumerGuardAdmissions(this.plugin, this.accountScopeRef)) !==
-        0
-      )
-        deny('DRAIN_UNKNOWN');
+      this.assertEpoch(epoch);
+      const unresolved = await this.store.unresolvedConsumerGuardAdmissions(this.plugin, this.accountScopeRef);
+      this.assertEpoch(epoch);
+      const nativeUnknown = await this.store.unknownNativePublicationEffects(this.plugin);
+      this.assertEpoch(epoch);
+      if (this.jobs.size || unresolved !== 0 || nativeUnknown !== 0) deny('DRAIN_UNKNOWN');
       await this.exclusive(async () => {
+        this.assertEpoch(epoch);
         const s = await this.state();
-        await this.write({ ...s, state: 'REVOKED', sequence: s.sequence + 1 });
+        this.assertEpoch(epoch);
+        const drained: Lifecycle = {
+          ...s, state: 'REVOKED', sequence: s.sequence + 1,
+          sourcePhase: 'DRAINED', lifecycleSequence: s.lifecycleSequence + 1,
+        };
+        await this.write(drained, epoch);
+        this.completeLifecycle('DRAINED', drained, epoch);
       });
     } catch (error) {
-      this.closed = true;
-      await this.exclusive(async () => {
-        const s = await this.state();
-        await this.write({ ...s, state: 'UNKNOWN', sequence: s.sequence + 1 });
-      });
+      // A late old drain must never close or overwrite a newer installed generation.
+      if (epoch === this.epoch) {
+        this.closed = true;
+        this.completedLifecycle = undefined;
+        await this.exclusive(async () => {
+          this.assertEpoch(epoch);
+          const s = await this.state();
+          this.assertEpoch(epoch);
+          await this.write({ ...s, state: 'UNKNOWN', sequence: s.sequence + 1 }, epoch);
+        });
+      }
       throw error;
     } finally {
       if (timer) clearTimeout(timer);
@@ -313,13 +468,19 @@ export class ManagedPublicationController {
   /** Copy a pinned import closure to an immutable generation directory; never mutate old release.
    * A failure keeps the partial directory and UNKNOWN receipt, not an apparently complete install.
    */
-  async install(source: PublisherReleaseSource, generation: string): Promise<Release> {
+  async install(
+    source: PublisherReleaseSource,
+    generation: string,
+    operationId: string = generation,
+  ): Promise<Release> {
     source = structuredClone(source);
-    this.closed = true;
-    const epoch = ++this.epoch;
+    const epoch = this.invalidate();
     return this.exclusive(async () => {
+      this.assertEpoch(epoch);
       const s = await this.state();
+      this.assertEpoch(epoch);
       if (
+        !opaque(operationId) ||
         !opaque(generation) ||
         s.usedGenerations.includes(generation) ||
         s.usedGenerations.length >= 1024
@@ -331,7 +492,7 @@ export class ManagedPublicationController {
         state: 'QUIESCING',
         sequence: s.sequence + 1,
         usedGenerations: [...s.usedGenerations, generation],
-      });
+      }, epoch);
       try {
         if (
           this.jobs.size ||
@@ -385,20 +546,36 @@ export class ManagedPublicationController {
           await this.bytes(target, relative, expected);
         }
         const release = { generation, root: target, sourceDigest: sha(files), files };
-        if (this.epoch !== epoch) deny('REVOKED');
-        await this.write({ ...(await this.state()), boot: this.boot, state: 'INSTALLED', release });
+        this.assertEpoch(epoch);
+        const current = await this.state();
+        this.assertEpoch(epoch);
+        const installed: Lifecycle = {
+          ...current, boot: this.boot, state: 'INSTALLED', release, operationId,
+          sequence: current.sequence + 1,
+          releaseSequence: current.releaseSequence + 1,
+          lifecycleSequence: current.lifecycleSequence + 1,
+          sourcePhase: 'INSTALLED',
+        };
+        await this.write(installed, epoch);
         this.release = release;
+        this.completeLifecycle('INSTALLED', installed, epoch);
         return structuredClone(release);
       } catch (error) {
-        await this.write({ ...(await this.state()), state: 'UNKNOWN' });
+        if (epoch === this.epoch) {
+          this.completedLifecycle = undefined;
+          const current = await this.state();
+          this.assertEpoch(epoch);
+          await this.write({ ...current, state: 'UNKNOWN', sequence: current.sequence + 1 }, epoch);
+        }
         throw error;
       }
     });
   }
   /** Activate ONLY this owned installed entry tree. This is not global coverage or a READY issuer. */
   async switchEntry(generation: string): Promise<void> {
-    const epoch = this.epoch;
+    const epoch = this.invalidate();
     await this.exclusive(async () => {
+      this.assertEpoch(epoch);
       const s = await this.state();
       this.ownerCurrent();
       if (epoch !== this.epoch) deny('REVOKED');
@@ -413,10 +590,15 @@ export class ManagedPublicationController {
       for (const [relative, expected] of Object.entries(s.release.files))
         await this.bytes(s.release.root, relative, expected);
       if (epoch !== this.epoch) deny('REVOKED');
-      await this.write({ ...s, state: 'ACTIVE', sequence: s.sequence + 1 });
-      if (epoch !== this.epoch) deny('REVOKED');
+      const switched: Lifecycle = {
+        ...s, state: 'ACTIVE', sequence: s.sequence + 1,
+        sourcePhase: 'ENTRY_SWITCHED', lifecycleSequence: s.lifecycleSequence + 1,
+      };
+      await this.write(switched, epoch);
+      this.assertEpoch(epoch);
       this.release = s.release;
       this.closed = false;
+      this.completeLifecycle('ENTRY_SWITCHED', switched, epoch);
     });
   }
   /** Only an Authority-created durable job can request this fixed generic entry.
@@ -532,20 +714,22 @@ export class ManagedPublicationController {
         child.once('error', reject);
         child.once('close', () => resolve());
       }).finally(() => {
-        this.jobs.delete(job.metadata.jobId);
+        if (this.jobs.get(job.metadata.jobId)?.child === child) this.jobs.delete(job.metadata.jobId);
       });
       // Keep rejected launch completion observed; drain() and account receipts preserve UNKNOWN.
       void settled.catch(() => {
-        this.closed = true;
+        if (epoch === this.epoch) this.invalidate();
       });
       this.jobs.set(job.metadata.jobId, { child, job, settled });
       return child;
     };
   }
   async verifyCurrent(root: string): Promise<void> {
+    const epoch = this.epoch;
     try {
       this.assertCurrent(root);
       const s = await this.state();
+      this.assertEpoch(epoch);
       this.assertCurrent(root);
       if (
         s.boot !== this.boot ||
@@ -556,8 +740,7 @@ export class ManagedPublicationController {
         deny('LEDGER_DRIFT');
     } catch (error) {
       // Restoring an old payload cannot relatch an already rejected live owner.
-      this.closed = true;
-      ++this.epoch;
+      if (epoch === this.epoch) this.invalidate();
       throw error;
     }
   }
@@ -579,8 +762,9 @@ export class ManagedPublicationController {
       ].includes(entryId)
     )
       deny('PROBE_ENTRY');
-    const s = await this.state(),
-      epoch = this.epoch;
+    const epoch = this.epoch;
+    const s = await this.state();
+    this.assertEpoch(epoch);
     if (!s.release || s.boot !== this.boot || !['INSTALLED', 'ACTIVE'].includes(s.state))
       deny('PROBE_STATE');
     const release = s.release;
@@ -695,7 +879,22 @@ export class ManagedPublicationController {
     this.ownerCurrent();
     if (this.epoch !== epoch) deny('REVOKED');
     const handle = Object.freeze(Object.create(null));
-    lifecycleReceipts.set(handle, { owner: this, epoch, value: structuredClone(observation) });
+    lifecycleReceipts.set(handle, { owner: this, epoch, state: s.state, value: structuredClone(observation) });
+    if (entryId === 'canonical-producer' && s.state === 'ACTIVE') {
+      await this.exclusive(async () => {
+        this.assertEpoch(epoch);
+        const current = await this.state();
+        this.assertEpoch(epoch);
+        this.assertCurrent(release.root);
+        if (current.state !== 'ACTIVE' || sha(current.release) !== sha(release)) deny('LEDGER_DRIFT');
+        const loaded: Lifecycle = {
+          ...current, sequence: current.sequence + 1,
+          sourcePhase: 'LOADED', lifecycleSequence: current.lifecycleSequence + 1,
+        };
+        await this.write(loaded, epoch);
+        this.completeLifecycle('LOADED', loaded, epoch, handle);
+      });
+    }
     return handle;
   }
   /** Actual closed launcher negative control for this installed owned realm only.
@@ -752,8 +951,130 @@ export class ManagedPublicationController {
     this.assertCurrent(value.root);
     if (before.epoch !== this.epoch) deny('REVOKED');
     const handle = Object.freeze(Object.create(null));
-    lifecycleReceipts.set(handle, { owner: this, epoch: this.epoch, value });
+    lifecycleReceipts.set(handle, { owner: this, epoch: this.epoch, state: 'ACTIVE', value });
     return handle;
+  }
+  /** The synchronous owner identity used by the Main source broker. */
+  currentSourceBinding(): ManagedSourceBinding {
+    this.ownerCurrent();
+    if (this.closed || !this.release) deny('REVOKED');
+    return {
+      accountId: this.accountScopeRef,
+      deviceId: this.deviceScopeRef,
+      bootId: this.boot,
+      ownerEpoch: this.epoch,
+      generation: this.release.generation,
+    };
+  }
+  lifecycleReceiptCurrent(epoch: number, value: ManagedLifecycleObservation): boolean {
+    this.ownerCurrent();
+    return this.epoch === epoch && this.completedLifecycle?.epoch === epoch &&
+      this.completedLifecycle.phase === value.phase &&
+      this.release?.root === value.root &&
+      this.release.generation === value.binding.generation &&
+      this.releaseSequenceFloor === value.releaseSequence &&
+      this.lifecycleSequenceFloor === value.lifecycleSequence &&
+      (!['ENTRY_SWITCHED', 'LOADED'].includes(value.phase) || !this.closed);
+  }
+  /** Project only a completed original operation, never a requested phase or supplied JSON. */
+  async produceLifecycle(
+    phase: ManagedLifecyclePhase,
+    enrollmentHandle?: object,
+  ): Promise<object> {
+    const epoch = this.epoch;
+    return this.exclusive(async () => {
+      this.assertEpoch(epoch);
+      const proof = this.completedLifecycle;
+      if (!proof || proof.epoch !== epoch || proof.phase !== phase) deny('LIFECYCLE_PHASE');
+      const state = await this.state(epoch);
+      this.assertEpoch(epoch);
+      const release = state.release;
+      if (
+        state.boot !== this.boot || !release || !state.operationId ||
+        state.sourcePhase !== phase || sha(state) !== proof.stateDigest ||
+        sha(this.release) !== sha(release) ||
+        (phase === 'INSTALLED' && state.state !== 'INSTALLED') ||
+        (['ENTRY_SWITCHED', 'LOADED'].includes(phase) && (state.state !== 'ACTIVE' || this.closed)) ||
+        (['REVOKED', 'DRAINED'].includes(phase) && state.state !== 'REVOKED')
+      ) deny('LIFECYCLE_STATE');
+      let enrollment: ManagedEnrollmentObservation | null = null;
+      if (phase === 'LOADED') {
+        enrollmentHandle ??= proof.enrollment;
+        const enrolled = enrollmentHandle && lifecycleReceipts.get(enrollmentHandle);
+        if (
+          !enrolled || enrollmentHandle !== proof.enrollment || enrolled.owner !== this ||
+          enrolled.epoch !== epoch || enrolled.state !== 'ACTIVE' ||
+          enrolled.value.entryId !== 'canonical-producer'
+        ) deny('LIFECYCLE_ENROLLMENT');
+        enrollment = readManagedEnrollmentReceipt(enrollmentHandle!, this);
+        if (
+          enrollment.generation !== release.generation || enrollment.root !== release.root ||
+          enrollment.sourceDigest !== release.sourceDigest ||
+          enrollment.accountScopeRef !== this.accountScopeRef ||
+          enrollment.deviceScopeRef !== this.deviceScopeRef || enrollment.boot !== this.boot
+        ) deny('LIFECYCLE_ENROLLMENT');
+      } else if (enrollmentHandle !== undefined) deny('LIFECYCLE_ENROLLMENT');
+      if (proof.receipt) {
+        await this.verifyLifecycleReceipt(proof.receipt);
+        return proof.receipt;
+      }
+      const [unresolvedAdmissions, unknownNativeEffects] = await Promise.all([
+        this.store.unresolvedConsumerGuardAdmissions(this.plugin, this.accountScopeRef),
+        this.store.unknownNativePublicationEffects(this.plugin),
+      ]);
+      this.assertEpoch(epoch);
+      if (![unresolvedAdmissions, unknownNativeEffects].every(
+        (value) => Number.isSafeInteger(value) && value >= 0,
+      )) deny('LIFECYCLE_COUNTS');
+      const value: ManagedLifecycleObservation = {
+        schema: 'publication-main-lifecycle-source/v1',
+        scope: 'OWNED_CONTROLLER_ONLY',
+        operationId: state.operationId,
+        binding: {
+          accountId: this.accountScopeRef, deviceId: this.deviceScopeRef, bootId: this.boot,
+          ownerEpoch: epoch, generation: release.generation,
+        },
+        phase, releaseSequence: state.releaseSequence, lifecycleSequence: state.lifecycleSequence,
+        root: release.root, sourceDigest: release.sourceDigest, files: { ...release.files },
+        enrollment, ownedJobs: this.jobs.size, unresolvedAdmissions, unknownNativeEffects,
+      };
+      const key = sha(['publication-main-lifecycle-source/v1', this.boot,
+        state.operationId, state.releaseSequence, state.lifecycleSequence, phase]);
+      const payload = JSON.stringify(value);
+      if (!(await this.store.compareAndSwapConsumerGuardReceipt(
+        this.plugin, this.accountScopeRef, key, undefined, payload,
+      ))) deny('LIFECYCLE_REPLAY');
+      this.assertEpoch(epoch);
+      const handle = Object.freeze(Object.create(null));
+      managedLifecycleReceipts.set(handle, {
+        owner: this, epoch, stateDigest: proof.stateDigest, key,
+        row: { revision: 1, payload }, value: structuredClone(value),
+      });
+      proof.receipt = handle;
+      return handle;
+    });
+  }
+  /** Recheck the original account receipt and release state without renewing or issuing anything. */
+  async verifyLifecycleReceipt(handle: object): Promise<Readonly<ManagedLifecycleObservation>> {
+    const receipt = managedLifecycleReceipts.get(handle);
+    if (!receipt || receipt.owner !== this) deny('LIFECYCLE_RECEIPT');
+    const epoch = receipt.epoch;
+    try {
+      const value = readManagedLifecycleReceipt(handle, this);
+      const state = await this.state(epoch);
+      this.assertEpoch(epoch);
+      if (sha(state) !== receipt.stateDigest || sha(state.release) !== sha(this.release))
+        deny('LIFECYCLE_LEDGER_DRIFT');
+      const row = await this.store.readConsumerGuardReceipt(this.plugin, this.accountScopeRef, receipt.key);
+      this.assertEpoch(epoch);
+      if (!row || row.revision !== receipt.row.revision || row.payload !== receipt.row.payload)
+        deny('LIFECYCLE_LEDGER_DRIFT');
+      readManagedLifecycleReceipt(handle, this);
+      return value;
+    } catch (error) {
+      if (epoch === this.epoch) this.invalidate();
+      throw error;
+    }
   }
   receiptCurrent(epoch: number, root: string): boolean {
     this.ownerCurrent();
@@ -761,17 +1082,16 @@ export class ManagedPublicationController {
   }
   /** Fixed owned lifecycle identity; counts are measured from the original account ledger. */
   async coverageSourceState() {
-    const state = await this.state();
-    this.ownerCurrent();
+    const epoch = this.epoch;
+    const state = await this.state(epoch);
+    const [unresolved, unknownNativeEffects] = await Promise.all([
+      this.store.unresolvedConsumerGuardAdmissions(this.plugin, this.accountScopeRef),
+      this.store.unknownNativePublicationEffects(this.plugin),
+    ]);
+    this.assertEpoch(epoch);
     return {
-      state,
-      epoch: this.epoch,
-      boot: this.boot,
-      ownedJobs: this.jobs.size,
-      unresolved: await this.store.unresolvedConsumerGuardAdmissions(
-        this.plugin,
-        this.accountScopeRef,
-      ),
+      state, epoch, boot: this.boot, ownedJobs: this.jobs.size,
+      unresolved, unknownNativeEffects,
     };
   }
   /** Source-owned lifecycle fact only; never manufactures missing real legacy/CI/namespace data. */
