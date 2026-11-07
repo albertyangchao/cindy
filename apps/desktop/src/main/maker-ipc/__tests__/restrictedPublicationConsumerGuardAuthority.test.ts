@@ -38,6 +38,7 @@ const pureProcess = vi.hoisted(() => ({
   candidate: undefined as any,
   managedMode: 'normal' as string,
   archiveCandidate: undefined as any,
+  syntheticStderr: '' as string,
 }));
 // Fixed pure-child boundary only; no runtime/provider/network endpoint is contacted.
 vi.mock('node:child_process', async (importOriginal) => {
@@ -45,7 +46,15 @@ vi.mock('node:child_process', async (importOriginal) => {
   return {
     ...actual,
     spawn: (...args: any[]) => {
-      if (!pureProcess.reply) return (actual.spawn as any)(...args);
+      if (!pureProcess.reply) {
+        const real = (actual.spawn as any)(...args);
+        real.stderr?.on('data', (b: Buffer) => {
+          pureProcess.syntheticStderr = (pureProcess.syntheticStderr + b.toString('utf8')).slice(
+            -32000,
+          );
+        });
+        return real;
+      }
       const child = new actual.ChildProcess() as any;
       child.stdin = new PassThrough();
       child.stdout = new PassThrough();
@@ -79,7 +88,7 @@ vi.mock('node:child_process', async (importOriginal) => {
           const m = {
             schema: meta.schema,
             jobId: meta.jobId,
-            sequence: (meta.sequence ?? 0) + 1,
+            sequence: (meta.sequence ?? -1) + 1,
             nonce: pureProcess.managedMode === 'wrong-nonce' ? '0'.repeat(64) : meta.nonce,
             operation,
             payload,
@@ -193,7 +202,9 @@ function fixture(change?: (r: ControlledCoverageReport) => void) {
     rootDefinitionDigest: sha('synthetic-definition'),
     deviceScopeRef: sha('synthetic-device'),
     inventoryDigest: sha('registered-full-inventory'),
-    registrationSetDigest: sha('registered-instance-set'),
+    registrationSetDigest: sha(
+      JSON.stringify(coverageEntries.map((_, i) => 'synthetic-instance-' + i).sort()),
+    ),
     instances: coverageEntries.map((entryId, i) => ({
       instanceId: 'synthetic-instance-' + i,
       entryId,
@@ -230,7 +241,7 @@ function fixture(change?: (r: ControlledCoverageReport) => void) {
           launchAuthorityId: 'synthetic-managed-controller',
           admissionReceiptId: 'synthetic-admission-' + m.instanceId,
           releaseGeneration: generation,
-          guardSourceIdentity: sha('guard-source'),
+          guardSourceIdentity: registration.rootIdentity,
           state: m.entryId === 'worksheet-ci' ? 'RETIRED_FENCED' : 'GUARDED',
           effectFenceRevision: 1,
           dispositionReceiptId:

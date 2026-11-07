@@ -5,6 +5,7 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { ChildProcess } from 'node:child_process';
 import type { Readable, Writable } from 'node:stream';
+import { assertConsumerGuards } from './restrictedPublicationConsumerGuards.js';
 import { parseNativeFrame } from './restrictedPublicationProtocol.js';
 import type { createRestrictedPartnerStore } from './restrictedPartnerStore.js';
 
@@ -101,6 +102,31 @@ export function createControlledCoverageController(driver: ControlledCoverageDri
   return handle;
 }
 const authorities = new WeakSet<object>();
+const ownedManagedJobs = new WeakSet<object>();
+const ownedJobContexts = new WeakMap<
+  object,
+  { store: object; plugin: string; account: string; device: string }
+>();
+export function managedJobMatchesOwner(
+  value: unknown,
+  store: object,
+  plugin: string,
+  account: string,
+  device: string,
+): boolean {
+  if (typeof value !== 'object' || value === null) return false;
+  const context = ownedJobContexts.get(value);
+  return (
+    !!context &&
+    context.store === store &&
+    context.plugin === plugin &&
+    context.account === account &&
+    context.device === device
+  );
+}
+export function isOwnedManagedPublicationJob(value: unknown): value is ManagedPublicationJob {
+  return typeof value === 'object' && value !== null && ownedManagedJobs.has(value);
+}
 export function isConsumerGuardCoverageAuthority(
   value: unknown,
 ): value is ConsumerGuardCoverageAuthority {
@@ -582,7 +608,7 @@ export class ConsumerGuardCoverageAuthority {
       s.releaseSequence - 1,
     );
     if (this.clock() >= owned.at + 30000) fail('CHALLENGE_EXPIRED');
-    return Object.freeze({
+    const proof = Object.freeze({
       schema: 'publication-consumer-guard-evidence-contract/v1',
       issuerId: s.issuerId,
       accountScopeRef: this.accountScopeRef,
@@ -603,6 +629,43 @@ export class ConsumerGuardCoverageAuthority {
       unknownNativeEffects: s.report.unknownNativeEffects,
       fenceRef: s.report.fenceRef,
     });
+    // Expected comes only from the already checked Main registration + SQL/controller report.
+    // The old-generation fence receipt is mandatory provenance, not a zero-counter inference.
+    try {
+      assertConsumerGuards(
+        proof,
+        {
+          lifecycleState: s.state,
+          issuerId: this.issuer,
+          accountScopeRef: this.accountScopeRef,
+          rootIdentity: this.driver.registration.rootIdentity,
+          releaseGeneration: s.releaseGeneration,
+          releaseSequence: s.releaseSequence,
+          inventoryDigest: this.driver.registration.inventoryDigest,
+          registrationSetDigest: this.driver.registration.registrationSetDigest,
+          coverageRevision: s.coverageRevision,
+          lifecycleSequence: s.lifecycleSequence,
+          challenge,
+          closedEnrollment: true,
+          members: s.report.members.map(({ dispositionReceiptId: _receipt, ...member }) => member),
+          oldGenerationAdmissions: s.report.oldGenerationAdmissions.unresolved,
+          unknownNativeEffects: s.report.unknownNativeEffects,
+          fenceRef: s.report.fenceRef,
+          oldGenerationFence: { disposition: 'FENCED', fenceRef: s.report.fenceRef },
+          namespaceExclusions: s.report.exclusions.map((x) => ({
+            entryId: x.entryId,
+            receiptId: x.fenceReceiptId,
+            entryDefinitionDigest: x.definitionDigest,
+            effectFenceRevision: x.fenceRevision,
+          })),
+        },
+        this.clock(),
+      );
+    } catch (error) {
+      await this.invalidate('UNKNOWN');
+      throw error;
+    }
+    return proof;
   }
   /** Creates a durable owner-bound job BEFORE the fixed Caller launches a process.
    * The actual child handle/channel is held by Main; JSON, FD numbers and exit0 cannot mint it.
@@ -672,6 +735,7 @@ export class ConsumerGuardCoverageAuthority {
       coverageRevision: proof.coverageRevision,
       expiresAt: proof.expiresAt,
     };
+    Object.freeze(metadata);
     await this.exclusive(async () => {
       current();
       if (await this.read(key)) fail('JOB_ALREADY_CLAIMED');
@@ -732,6 +796,13 @@ export class ConsumerGuardCoverageAuthority {
       },
       () => this.managedJobs.delete(job),
     );
+    ownedManagedJobs.add(job);
+    ownedJobContexts.set(job, {
+      store: this.store.consumerGuardReceiptIdentity,
+      plugin: this.pluginId,
+      account: this.accountScopeRef,
+      device,
+    });
     this.managedJobs.add(job);
     return job;
   }
@@ -937,9 +1008,9 @@ export class ManagedPublicationJob {
       m.schema !== this.metadata.schema ||
       m.jobId !== this.metadata.jobId ||
       m.nonce !== this.nonce ||
-      m.sequence !== this.sequence + 1 ||
+      m.sequence !== this.sequence ||
       !integer(m.sequence) ||
-      m.sequence > 256 ||
+      m.sequence >= 256 ||
       !m.payload ||
       typeof m.payload !== 'object' ||
       Array.isArray(m.payload)
@@ -1093,7 +1164,7 @@ export class ManagedPublicationJob {
     const reply = {
       schema: this.metadata.schema,
       jobId: this.metadata.jobId,
-      sequence: this.sequence,
+      sequence: this.sequence - 1,
       nextNonce: this.nonce,
       ok: true,
       result,

@@ -16,14 +16,17 @@ else:
  if b['artifactRelative']!=relative:raise RuntimeError('NATIVE_ROUTE_MISMATCH')
  slug=pathlib.PurePosixPath(relative).stem
  if op=='stage':
-  from bridge_core.publish_html import publish_html_report
-  text=request['text']
-  if not isinstance(text,str) or len(text.encode())>32000 or hashlib.sha256(text.encode()).hexdigest()!=b['completedOutputSha256']:raise RuntimeError('NATIVE_SOURCE_MISMATCH')
-  try:publish_html_report('long-form',data={'title':'Partner reply','body_markdown':text},title='Partner reply',slug=slug,overwrite=True,scope='core',category='imessage',source='bluebubbles-connect',provenance=marker,template_family='home-kb')
-  except RuntimeError:pass
-  artifact=pathlib.Path(request['artifactRoot'])/relative
-  digest=hashlib.sha256(n._read_regular(artifact,n.MAX_ARTIFACT_BYTES)).hexdigest()
-  v=direct.select(slug=slug,artifact_sha256=digest,latest=False);value=n.NativeRelease.snapshot(v)
+  from bridge_core.publication_consumer_controller import managed_publication_job
+  with managed_publication_job(request['managedExpected']):
+   from bridge_core.publish_html import publish_html_report
+   text=request['text']
+   if not isinstance(text,str) or len(text.encode())>32000 or hashlib.sha256(text.encode()).hexdigest()!=b['completedOutputSha256']:raise RuntimeError('NATIVE_SOURCE_MISMATCH')
+   try:publish_html_report('long-form',data={'title':'Partner reply','body_markdown':text},title='Partner reply',slug=slug,overwrite=True,scope='core',category='imessage',source='bluebubbles-connect',provenance=marker,template_family='home-kb')
+   except RuntimeError as error:
+    if not str(error).startswith('generic HTML publish was not applied:'):raise
+   artifact=pathlib.Path(request['artifactRoot'])/relative
+   digest=hashlib.sha256(n._read_regular(artifact,n.MAX_ARTIFACT_BYTES)).hexdigest()
+   v=direct.select(slug=slug,artifact_sha256=digest,latest=False);value=n.NativeRelease.snapshot(v)
  elif op=='inspect':
   artifact=pathlib.Path(request['artifactRoot'])/relative
   digest=hashlib.sha256(n._read_regular(artifact,n.MAX_ARTIFACT_BYTES)).hexdigest()
@@ -46,4 +49,14 @@ else:
   value={'host':protected_release_host(),'bootstrap':bootstrap,'upload':stage+'/', 'transaction':tx._remote_command(release_id=release,pair=pair,public_url=public,remote_dir=remote,state_dir=state,readback_query_key='generic_release'),'receipt':readReceipt,'verify':'; '.join(checks),'publicUrl':public,'orderedPair':pair,'releaseId':release}
  else:raise RuntimeError('NATIVE_FIXED_OPERATION')
 print(json.dumps(value,ensure_ascii=False,separators=(',',':')))
+`;
+
+/** Fixed generic entry; only Main supplies independently bound expected argv. No arbitrary module. */
+export const publicationManagedEntryPython = String.raw`
+import json,runpy,sys
+root=sys.argv.pop(1);sys.path.insert(0,root)
+expected=json.loads(sys.argv.pop(1))
+from bridge_core.publication_consumer_controller import managed_publication_job
+with managed_publication_job(expected):
+ runpy.run_module('scripts.publish_generic_html_direct',run_name='__main__')
 `;

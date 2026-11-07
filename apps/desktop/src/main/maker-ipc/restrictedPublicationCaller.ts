@@ -1,3 +1,7 @@
+import {
+  ManagedPublicationController,
+  type PublisherReleaseSource,
+} from './restrictedPublicationManagedController.js';
 /** Main-owned canonical transport. Root child packets are candidates, never authority. */
 import { spawn } from 'node:child_process';
 import {
@@ -14,7 +18,7 @@ import {
 import { constants } from 'node:fs';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
-import { publicationPython } from './restrictedPublicationPython.js';
+import { publicationPython, publicationManagedEntryPython } from './restrictedPublicationPython.js';
 import {
   isConsumerGuardCoverageAuthority,
   type ConsumerGuardCoverageAuthority,
@@ -62,6 +66,8 @@ export interface RegisteredPublicationRoot {
   /** Main-private authority, not an Agent proof/boolean or the preflight callback above. */
   consumerCoverage: ConsumerGuardCoverageAuthority;
   consumerRootIdentity: string;
+  /** Optional until actual managed install/enrollment is approved. Never populated from IPC. */
+  managedPublisher?: { controller: ManagedPublicationController; source: PublisherReleaseSource };
 }
 /** No supported installed root/consumer attestation is currently registered. No production enqueue. */
 export const supportedPublicationRoot: RegisteredPublicationRoot | undefined = undefined;
@@ -115,18 +121,21 @@ function boundedProcess(
   deadline = 10000,
   limit = 65536,
   managedJob?: ManagedPublicationJob,
+  createChild?: () => ReturnType<typeof spawn>,
 ): Promise<Result> {
   current();
   return new Promise((resolve, reject) => {
     let ended = false;
     const chunks: Buffer[] = [];
     let size = 0;
-    const child = spawn(executable, args, {
-      ...options,
-      stdio: managedJob
-        ? ['pipe', 'pipe', 'pipe', 'ignore', 'ignore', 'pipe', 'pipe']
-        : ['pipe', 'pipe', 'pipe'],
-    });
+    const child = createChild
+      ? createChild()
+      : spawn(executable, args, {
+          ...options,
+          stdio: managedJob
+            ? ['pipe', 'pipe', 'pipe', 'ignore', 'ignore', 'pipe', 'pipe']
+            : ['pipe', 'pipe', 'pipe'],
+        });
     const finish = (error?: unknown) => {
       if (ended) return;
       ended = true;
@@ -203,6 +212,10 @@ export function controlledPublicationRuntime(
   )
     denied();
   const files = Object.freeze({ ...pin.files });
+  const managedPublisher = pin.managedPublisher;
+  const managedController = managedPublisher?.controller;
+  const managedSourceDigest = managedPublisher ? digest(managedPublisher.source) : undefined;
+  if (managedController && !(managedController instanceof ManagedPublicationController)) denied();
   const coverage = pin.consumerCoverage,
     coverageRoot = pin.consumerRootIdentity;
   const rootDefinition = () =>
@@ -218,6 +231,13 @@ export function controlledPublicationRuntime(
     ]);
   const registeredDefinition = rootDefinition();
   const coverageBindingCurrent = () => {
+    if (
+      pin.managedPublisher !== managedPublisher ||
+      pin.managedPublisher?.controller !== managedController ||
+      (managedPublisher && digest(managedPublisher.source) !== managedSourceDigest)
+    )
+      denied();
+    managedController?.assertCurrent(pin.root);
     if (
       rootDefinition() !== registeredDefinition ||
       pin.consumerCoverage !== coverage ||
@@ -327,12 +347,21 @@ export function controlledPublicationRuntime(
     };
     await verifyFiles();
     current();
+    const launch =
+      managedJob && pin.managedPublisher
+        ? await pin.managedPublisher.controller.prepareOwnedChild(
+            managedJob,
+            pin.managedPublisher.source,
+            { operation: 'stage', artifacts: pin.artifactRoot, queue: pin.queueRoot },
+          )
+        : undefined;
     const result = await boundedProcess(
       pin.python.path,
       ['-I', '-c', publicationPython, pin.root],
       {
         operation,
         ...(a ? { binding: wireBinding(a), artifactRoot: pin.artifactRoot } : {}),
+        ...(managedJob ? { managedExpected: managedPublicationExpected(managedJob) } : {}),
         ...extra,
       },
       {
@@ -345,12 +374,14 @@ export function controlledPublicationRuntime(
       10000,
       65536,
       managedJob,
+      launch,
     );
     current();
     return JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(result.stdout));
   };
   const verify = async () => {
     await verifyFiles();
+    await managedController?.verifyCurrent(pin.root);
     await pin.assertConsumerGuards();
     await coverage.readCurrent(coverageRoot, coverage.freshChallenge(coverageRoot));
     coverageBindingCurrent();
@@ -844,6 +875,20 @@ export function controlledPublicationRuntime(
     const managedJob = readonly ? undefined : await managedJobFor(a, 'generic-direct', current);
     const slug = path.posix.basename(a.artifactRelative, '.html');
     if (!/^imessage-[a-f0-9]{32}$/.test(slug) || !a.artifactSha256) denied();
+    const launch =
+      managedJob && pin.managedPublisher
+        ? await pin.managedPublisher.controller.prepareOwnedChild(
+            managedJob,
+            pin.managedPublisher.source,
+            {
+              operation: 'generic',
+              slug,
+              artifactSha256: a.artifactSha256!,
+              artifacts: pin.artifactRoot,
+              queue: pin.queueRoot,
+            },
+          )
+        : undefined;
     return new Promise<NativePublicationReceipt>((resolve, reject) => {
       let ended = false,
         wire = Buffer.alloc(0),
@@ -852,37 +897,44 @@ export function controlledPublicationRuntime(
         awaiting = false;
       const challenges = new Set<string>();
       let chain = Promise.resolve();
-      const child = spawn(
-        pin.python.path,
-        [
-          '-I',
-          '-c',
-          "import runpy,sys;sys.path.insert(0,sys.argv.pop(1));runpy.run_module('scripts.publish_generic_html_direct',run_name='__main__')",
-          pin.root,
-          readonly ? '--reconcile-native' : '--apply',
-          '--slug',
-          slug,
-          '--artifact-sha256',
-          a.artifactSha256!,
-          '--native-control-read-fd',
-          '3',
-          '--native-control-write-fd',
-          '4',
-        ],
-        {
-          cwd: pin.root,
-          env: managedJob
-            ? {
-                ...env,
-                BRIDGE_CONSUMER_CONTROL_READ_FD: '5',
-                BRIDGE_CONSUMER_CONTROL_WRITE_FD: '6',
-              }
-            : env,
-          stdio: managedJob
-            ? ['ignore', 'pipe', 'pipe', 'pipe', 'pipe', 'pipe', 'pipe']
-            : ['ignore', 'pipe', 'pipe', 'pipe', 'pipe'],
-        },
-      );
+      const child = launch
+        ? launch()
+        : spawn(
+            pin.python.path,
+            [
+              '-I',
+              '-c',
+              readonly
+                ? "import runpy,sys;sys.path.insert(0,sys.argv.pop(1));runpy.run_module('scripts.publish_generic_html_direct',run_name='__main__')"
+                : publicationManagedEntryPython,
+              pin.root,
+              ...(!readonly && managedJob
+                ? [JSON.stringify(managedPublicationExpected(managedJob))]
+                : []),
+              readonly ? '--reconcile-native' : '--apply',
+              '--slug',
+              slug,
+              '--artifact-sha256',
+              a.artifactSha256!,
+              '--native-control-read-fd',
+              '3',
+              '--native-control-write-fd',
+              '4',
+            ],
+            {
+              cwd: pin.root,
+              env: managedJob
+                ? {
+                    ...env,
+                    BRIDGE_CONSUMER_CONTROL_READ_FD: '5',
+                    BRIDGE_CONSUMER_CONTROL_WRITE_FD: '6',
+                  }
+                : env,
+              stdio: managedJob
+                ? ['ignore', 'pipe', 'pipe', 'pipe', 'pipe', 'pipe', 'pipe']
+                : ['ignore', 'pipe', 'pipe', 'pipe', 'pipe'],
+            },
+          );
       let timer: ReturnType<typeof setTimeout>;
       const arm = () => {
         clearTimeout(timer);
@@ -1174,4 +1226,10 @@ export function controlledPublicationRuntime(
     },
   };
   return runtime;
+}
+
+/** Context comes from the Main-owned durable job, never from the child's hello. */
+function managedPublicationExpected(job: ManagedPublicationJob) {
+  const { schema: _schema, jobId: _jobId, expiresAt: _expiresAt, ...expected } = job.metadata;
+  return expected;
 }
