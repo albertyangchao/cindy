@@ -1,3 +1,4 @@
+import { digest as publicationDigest } from './restrictedPublicationProtocol.js';
 import { and, eq, sql } from 'drizzle-orm';
 import type { DbClient } from '../localDb/client/DbClient.js';
 import { pluginTaskRequests } from '../localDb/schema.js';
@@ -28,6 +29,91 @@ export function createRestrictedPartnerStore(db: DbClient, assertOwner: () => vo
   return {
     /** Main-private coverage receipts share this account's existing table. No public SQL port. */
     consumerGuardReceiptIdentity: db,
+    /** Read only actual native publication action records in this owner's account DB. */
+    async unknownNativePublicationEffects(pluginId: string): Promise<number> {
+      assertOwner();
+      const rows = await db.drizzle
+        .select()
+        .from(table)
+        .where(
+          and(
+            eq(table.pluginId, pluginId),
+            sql`(${table.id} LIKE 'native-publication:%' OR ${table.targetId} LIKE 'restricted:publication:%' OR (CASE WHEN json_valid(${table.payload}) THEN json_extract(${table.payload}, '$.schema') ELSE NULL END) = 'native-publication-action/v1')`,
+          ),
+        );
+      assertOwner();
+      let unknown = 0;
+      const deny = (): never => {
+        throw Error('PUBLICATION_NATIVE_EFFECT_FACTS_UNKNOWN');
+      };
+      const states = [
+        'PREPARED_NO_REMOTE_EFFECT',
+        'DISPATCHING_UNKNOWN',
+        'APPLIED_VERIFIED',
+        'REJECTED_NO_DISPATCH',
+        'UNKNOWN',
+      ];
+      const phases = ['remote-staging-prepare', 'remote-staging-upload', 'remote-transaction'];
+      for (const row of rows) {
+        let a: any;
+        try {
+          a = JSON.parse(row.payload);
+        } catch {
+          deny();
+        }
+        if (
+          !a ||
+          a.schema !== 'native-publication-action/v1' ||
+          a.pluginId !== pluginId ||
+          row.operation !== 'target' ||
+          typeof a.nativeActionId !== 'string' ||
+          !/^[a-f0-9-]{36}$/.test(a.nativeActionId) ||
+          row.id !== 'native-publication:' + a.nativeActionId ||
+          !states.includes(a.state) ||
+          a.actionRevision !== 1 ||
+          !Number.isSafeInteger(a.stateRevision) ||
+          a.stateRevision < 1 ||
+          a.stateRevision !== row.revision ||
+          row.fingerprint !== publicationDigest(a)
+        )
+          deny();
+        const bindings = [
+          a.principalId,
+          a.partnerId,
+          a.runId,
+          a.sourceOutputMessageId,
+          a.completedOutputSha256,
+        ];
+        if (
+          bindings.some((v) => typeof v !== 'string' || !v || Buffer.byteLength(v) > 512) ||
+          !/^[a-f0-9]{64}$/.test(a.completedOutputSha256)
+        )
+          deny();
+        const target =
+          'restricted:publication:' + publicationDigest([pluginId, ...bindings, 'PUBLIC_RELEASE']);
+        if (
+          row.targetId !== target ||
+          row.requestKey !== target ||
+          !Array.isArray(a.effects) ||
+          a.effects.length > 3 ||
+          a.effects.some((v: any, i: number) => v !== phases[i])
+        )
+          deny();
+        if (
+          ['PREPARED_NO_REMOTE_EFFECT', 'REJECTED_NO_DISPATCH'].includes(a.state) &&
+          a.effects.length !== 0
+        )
+          deny();
+        if (
+          a.state === 'APPLIED_VERIFIED' &&
+          (a.effects.length !== 3 || !/^[a-f0-9]{64}$/.test(a.receiptSha256))
+        )
+          deny();
+        if (a.state === 'UNKNOWN' || a.state === 'DISPATCHING_UNKNOWN') unknown++;
+      }
+      assertOwner();
+      return unknown;
+    },
     async unresolvedConsumerGuardAdmissions(pluginId: string, accountScopeRef: string) {
       assertOwner();
       const [row] = await db.drizzle

@@ -1,3 +1,8 @@
+import { getCurrentDbClientSnapshot } from '../localDb/client/current.js';
+import {
+  isManagedCoverageDriver,
+  type ManagedCoverageDriver,
+} from './restrictedPublicationCoverageDriver.js';
 import {
   ManagedPublicationController,
   type PublisherReleaseSource,
@@ -71,6 +76,59 @@ export interface RegisteredPublicationRoot {
 }
 /** No supported installed root/consumer attestation is currently registered. No production enqueue. */
 export const supportedPublicationRoot: RegisteredPublicationRoot | undefined = undefined;
+/** Main-private registrations are created only after a real driver transition. No IPC/profile JSON setter. */
+const managedRoots = new WeakMap<
+  object,
+  { pin: RegisteredPublicationRoot; driver: ManagedCoverageDriver; epoch: object }
+>();
+export function bindControlledPublicationRoot(
+  accountSnapshot: object,
+  ownerEpoch: object,
+  authority: ConsumerGuardCoverageAuthority,
+  driver: ManagedCoverageDriver,
+): void {
+  if (!accountSnapshot || !ownerEpoch || !isManagedCoverageDriver(driver)) denied();
+  const live = getCurrentDbClientSnapshot();
+  if (
+    !live ||
+    live !== accountSnapshot ||
+    ownerEpoch !== live ||
+    !driver.matchesAccountDatabase(live.client)
+  )
+    denied();
+  driver.requireReady();
+  const pin = driver.publicationRoot(authority);
+  pin.consumerCoverage.assertRootBinding(
+    pin.consumerRootIdentity,
+    driver.registration.rootDefinitionDigest,
+  );
+  managedRoots.set(accountSnapshot, { pin, driver, epoch: ownerEpoch });
+}
+export function resolveControlledPublicationRoot(
+  accountSnapshot: object | undefined | null,
+  ownerEpoch: object | null,
+  current: () => void,
+): RegisteredPublicationRoot | undefined {
+  current();
+  if (
+    !accountSnapshot ||
+    getCurrentDbClientSnapshot() !== accountSnapshot ||
+    ownerEpoch !== accountSnapshot
+  )
+    return undefined;
+  const x = managedRoots.get(accountSnapshot);
+  if (!x || x.epoch !== ownerEpoch) return undefined;
+  try {
+    x.driver.requireReady();
+    x.pin.managedPublisher!.controller.assertCurrent(x.pin.root);
+    current();
+    return x.pin;
+  } catch {
+    managedRoots.delete(accountSnapshot);
+    return undefined;
+  }
+}
+
 type Result = { stdout: Buffer };
 interface MainTransport {
   execute(

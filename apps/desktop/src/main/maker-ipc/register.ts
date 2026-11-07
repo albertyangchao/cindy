@@ -1,5 +1,5 @@
 import {approveNativePublicRelease} from './restrictedPublicationApproval.js';
-import {controlledPublicationRuntime,supportedPublicationRoot} from './restrictedPublicationCaller.js';
+import {controlledPublicationRuntime,resolveControlledPublicationRoot} from './restrictedPublicationCaller.js';
 import { captureBotPermissionEpoch } from './botPermissionDispatch.js';
 import { captureRestrictedPartnerEpoch } from './restrictedPartnerEpoch.js';
 import { isTrustedAppRendererWindow } from '../security/trustedAppRenderer.js';
@@ -15301,7 +15301,7 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
   const restrictedCompletions = new Map<string,(claim:import('./restrictedPartnerExecution.js').RestrictedPartnerClaim,text:string,current:()=>void)=>Promise<void>>();
   const restrictedPartnerHost = createRestrictedPartnerHost({
     inputUrls:true,
-    publication:{approve:input=>approveNativePublicRelease(input,{window:getDeepLinkMainWindow,trusted:isTrustedAppRendererWindow,show:(win,options)=>dialog.showMessageBox(win,options)}),runtime:(effectCurrent,readCurrent)=>supportedPublicationRoot?controlledPublicationRuntime(supportedPublicationRoot,{effectCurrent,readCurrent}):undefined},
+    publication:{approve:input=>approveNativePublicRelease(input,{window:getDeepLinkMainWindow,trusted:isTrustedAppRendererWindow,show:(win,options)=>dialog.showMessageBox(win,options)}),runtime:(effectCurrent,readCurrent)=>{const snapshot=getCurrentDbClientSnapshot();const pin=resolveControlledPublicationRoot(snapshot,snapshot,readCurrent);return pin?controlledPublicationRuntime(pin,{effectCurrent,readCurrent}):undefined}},
     research:true,
     modelConfiguration:async(id,current)=>{current();const sessionId=await resolvePluginTargetSession('bot',id);current();const meta=await maker.getSessionMeta(sessionId);current();if(!meta||meta.agentKind!=='codex'||meta.remoteHostId||meta.agentDeviceId)throw Error('RESTRICTED_PARTNER_RUNNER_UNSUPPORTED');const providerId=getSessionProvider(sessionId);if(!providerId)throw Error('ROUTE_UNAVAILABLE');const execution=await resolveSessionExecution({agentKind:'codex',model:meta.model,providerId,effort:meta.effort},sessionId);current();if(execution.agentKind!=='codex'||execution.providerId!==providerId)throw Error('RESTRICTED_PARTNER_ROUTE_UNSUPPORTED');return {providerId:execution.providerId,modelId:execution.model};},
     executionReady: async()=>{

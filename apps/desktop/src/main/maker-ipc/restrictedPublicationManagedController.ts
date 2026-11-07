@@ -1,3 +1,4 @@
+import { digest as canonicalDigest } from './restrictedPublicationProtocol.js';
 /** Main-private owned publisher deployment and process lifecycle. No IPC/production registry.
  * Installation facts cover ONLY this owned release tree. Unknown external/old writers never
  * become covered merely because these files/children were installed or exited successfully.
@@ -57,10 +58,38 @@ type Lifecycle = {
 };
 const locks = new WeakMap<object, Promise<unknown>>();
 const launches = new WeakSet<object>();
+const lifecycleReceipts = new WeakMap<
+  object,
+  { owner: ManagedPublicationController; epoch: number; value: ManagedEnrollmentObservation }
+>();
+export interface ManagedEnrollmentObservation {
+  accountScopeRef: string;
+  deviceScopeRef: string;
+  boot: string;
+  generation: string;
+  root: string;
+  sourceDigest: string;
+  entryId: string;
+  nonce: string;
+  files: Record<string, string>;
+  nativeWithoutMain: 'DENIED';
+  inventoryDigest: string;
+}
+export function readManagedEnrollmentReceipt(
+  handle: object,
+  owner: ManagedPublicationController,
+): Readonly<ManagedEnrollmentObservation> {
+  const x = lifecycleReceipts.get(handle);
+  if (!x || x.owner !== owner || !owner.receiptCurrent(x.epoch, x.value.root))
+    deny('ENROLLMENT_RECEIPT');
+  return structuredClone(x.value);
+}
 export class ManagedPublicationController {
   private readonly boot = randomUUID();
   private readonly key = sha('publication-managed-lifecycle/v1');
   private closed = true;
+  private ledgerFloor = 0;
+  private sequenceFloor = 0;
   private epoch = 0;
   private release?: Release;
   private readonly jobs = new Map<
@@ -116,6 +145,23 @@ export class ManagedPublicationController {
     );
     this.ownerCurrent();
     if (!ok) deny('CAS');
+    this.ledgerFloor = Math.max(this.ledgerFloor, (old?.revision ?? 0) + 1);
+    this.sequenceFloor = Math.max(this.sequenceFloor, state.sequence);
+    const auditKey = sha(['publication-managed-event/v1', this.boot, (old?.revision ?? 0) + 1]);
+    if (
+      !(await this.store.compareAndSwapConsumerGuardReceipt(
+        this.plugin,
+        this.accountScopeRef,
+        auditKey,
+        undefined,
+        JSON.stringify({
+          schema: 'publication-managed-event/v1',
+          state,
+          revision: (old?.revision ?? 0) + 1,
+        }),
+      ))
+    )
+      deny('CAS');
   }
   private async state(): Promise<Lifecycle> {
     const row = await this.store.readConsumerGuardReceipt(
@@ -153,6 +199,13 @@ export class ManagedPublicationController {
       s.usedGenerations.some((x) => !opaque(x))
     )
       deny('LEDGER');
+    if (row.revision < this.ledgerFloor || s.sequence < this.sequenceFloor) {
+      this.closed = true;
+      ++this.epoch;
+      deny('LEDGER_ROLLBACK');
+    }
+    this.ledgerFloor = Math.max(this.ledgerFloor, row.revision);
+    this.sequenceFloor = Math.max(this.sequenceFloor, s.sequence);
     // Restart never inherits an ACTIVE process set or a previously verified release lease.
     if (s.boot !== this.boot && s.state === 'ACTIVE') return { ...s, state: 'UNKNOWN' };
     return s;
@@ -511,6 +564,215 @@ export class ManagedPublicationController {
   assertCurrent(root: string): void {
     this.ownerCurrent();
     if (this.closed || !this.release || this.release.root !== root) deny('REVOKED');
+  }
+  /** Main-owned no-business probe. It needs no action, READY lease or paid/job claim. */
+  async probeEnrollment(source: PublisherReleaseSource, entryId: string): Promise<object> {
+    if (
+      ![
+        'canonical-producer',
+        'generic-direct',
+        'worksheet-ci',
+        'worksheet-direct',
+        'tracker-direct',
+        'shared-transaction',
+        'owned-namespace-source',
+      ].includes(entryId)
+    )
+      deny('PROBE_ENTRY');
+    const s = await this.state(),
+      epoch = this.epoch;
+    if (!s.release || s.boot !== this.boot || !['INSTALLED', 'ACTIVE'].includes(s.state))
+      deny('PROBE_STATE');
+    const release = s.release;
+    source = structuredClone(source);
+    if (
+      sha(source.files) !== release.sourceDigest ||
+      !release.files['scripts/publication_consumer_guard_entry.py'] ||
+      !release.files['bridge_core/publication_consumer_enrollment.py']
+    )
+      deny('PROBE_SOURCE');
+    for (const [p, v] of Object.entries(release.files)) await this.bytes(release.root, p, v);
+    await this.bytes(
+      path.dirname(source.python.path),
+      path.basename(source.python.path),
+      source.python.sha256,
+    );
+    this.ownerCurrent();
+    if (this.epoch !== epoch) deny('REVOKED');
+    const nonce = hash(randomUUID());
+    const program =
+      "import sys,runpy;sys.path.insert(0,sys.argv[1]);sys.argv=['publication_consumer_guard_entry','--entry',sys.argv[2],'--probe','--nonce',sys.argv[3],'--generation',sys.argv[4]];runpy.run_module('scripts.publication_consumer_guard_entry',run_name='__main__')";
+    const data = await new Promise<Buffer>((resolve, reject) => {
+      const child = spawn(
+        source.python.path,
+        ['-I', '-c', program, release.root, entryId, nonce, release.generation],
+        {
+          cwd: release.root,
+          env: { PATH: '/usr/bin:/bin', LANG: 'en_US.UTF-8', PYTHONDONTWRITEBYTECODE: '1' },
+          stdio: ['ignore', 'pipe', 'pipe'],
+        },
+      );
+      let done = false,
+        size = 0;
+      const parts: Buffer[] = [];
+      const timer = setTimeout(() => finish(Error('PUBLICATION_MANAGED_PROBE_TIMEOUT')), 10000);
+      const finish = (error?: Error) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        if (error) {
+          child.kill('SIGTERM');
+          reject(error);
+        } else resolve(Buffer.concat(parts));
+      };
+      child.stdout.on('data', (b: Buffer) => {
+        size += b.length;
+        if (size > 65536) finish(Error('PUBLICATION_MANAGED_PROBE_LIMIT'));
+        else parts.push(b);
+      });
+      child.stderr.resume();
+      child.on('error', finish);
+      child.on('close', (c) =>
+        finish(c === 0 ? undefined : Error('PUBLICATION_MANAGED_PROBE_UNKNOWN')),
+      );
+    });
+    this.ownerCurrent();
+    if (this.epoch !== epoch) deny('REVOKED');
+    let value: {
+      schema: string;
+      entryId: string;
+      nonce: string;
+      generation: string;
+      files: Record<string, string>;
+      nativeWithoutMain: string;
+      businessEffects: number;
+      inventory: unknown;
+    };
+    try {
+      value = JSON.parse(data.toString('utf8'));
+    } catch {
+      deny('PROBE_SCHEMA');
+    }
+    if (
+      value!.schema !== 'publication-enrollment-probe/v1' ||
+      value!.entryId !== entryId ||
+      value!.nonce !== nonce ||
+      value!.generation !== release.generation ||
+      value!.nativeWithoutMain !== 'DENIED' ||
+      value!.businessEffects !== 0 ||
+      !value!.files ||
+      !Object.keys(value!.files).length
+    )
+      deny('PROBE_BINDING');
+    for (const [p, v] of Object.entries(value!.files))
+      if (release.files[p] !== v) deny('PROBE_SOURCE');
+    for (const [p, v] of Object.entries(release.files)) await this.bytes(release.root, p, v);
+    if (this.epoch !== epoch) deny('REVOKED');
+    const observation: ManagedEnrollmentObservation = {
+      accountScopeRef: this.accountScopeRef,
+      deviceScopeRef: this.deviceScopeRef,
+      boot: this.boot,
+      generation: release.generation,
+      root: release.root,
+      sourceDigest: release.sourceDigest,
+      entryId,
+      nonce,
+      files: value!.files,
+      nativeWithoutMain: 'DENIED',
+      inventoryDigest: canonicalDigest(value!.inventory),
+    };
+    const key = sha(['publication-loaded-guard/v1', this.boot, release.generation, entryId, nonce]);
+    if (
+      !(await this.store.compareAndSwapConsumerGuardReceipt(
+        this.plugin,
+        this.accountScopeRef,
+        key,
+        undefined,
+        JSON.stringify(observation),
+      ))
+    )
+      deny('CAS');
+    this.ownerCurrent();
+    if (this.epoch !== epoch) deny('REVOKED');
+    const handle = Object.freeze(Object.create(null));
+    lifecycleReceipts.set(handle, { owner: this, epoch, value: structuredClone(observation) });
+    return handle;
+  }
+  /** Actual closed launcher negative control for this installed owned realm only.
+   * Foreign/CI/old deployments need their own source receipt and cannot use this handle. */
+  async namespaceFence(source: PublisherReleaseSource, namespace: string): Promise<object> {
+    if (
+      ![
+        'bulk-report-sync',
+        'reserved-bundle',
+        'private-report-files',
+        'external-subtree-publishers',
+      ].includes(namespace)
+    )
+      deny('NAMESPACE');
+    const before = await this.coverageSourceState();
+    if (before.state.state !== 'ACTIVE' || !before.state.release) deny('NAMESPACE_STATE');
+    let denied = false;
+    try {
+      await this.prepareOwnedChild(Object.create(null), source, {
+        operation: 'namespace:' + namespace,
+      } as never);
+    } catch (e) {
+      denied = e instanceof Error && e.message === 'PUBLICATION_MANAGED_LAUNCH';
+    }
+    if (!denied) deny('NAMESPACE_NEGATIVE_CONTROL');
+    const loaded = readManagedEnrollmentReceipt(
+      await this.probeEnrollment(source, 'owned-namespace-source'),
+      this,
+    );
+    this.assertCurrent(before.state.release.root);
+    if (before.epoch !== this.epoch) deny('REVOKED');
+    const value: ManagedEnrollmentObservation = {
+      ...loaded,
+      entryId: 'namespace:' + namespace,
+      nonce: hash(randomUUID()),
+    };
+    const key = sha([
+      'publication-owned-namespace-fence/v1',
+      this.boot,
+      this.epoch,
+      namespace,
+      value.nonce,
+    ]);
+    if (
+      !(await this.store.compareAndSwapConsumerGuardReceipt(
+        this.plugin,
+        this.accountScopeRef,
+        key,
+        undefined,
+        JSON.stringify({ ...value, scope: 'OWNED_LAUNCHER_ONLY' }),
+      ))
+    )
+      deny('CAS');
+    this.assertCurrent(value.root);
+    if (before.epoch !== this.epoch) deny('REVOKED');
+    const handle = Object.freeze(Object.create(null));
+    lifecycleReceipts.set(handle, { owner: this, epoch: this.epoch, value });
+    return handle;
+  }
+  receiptCurrent(epoch: number, root: string): boolean {
+    this.ownerCurrent();
+    return this.epoch === epoch && this.release?.root === root;
+  }
+  /** Fixed owned lifecycle identity; counts are measured from the original account ledger. */
+  async coverageSourceState() {
+    const state = await this.state();
+    this.ownerCurrent();
+    return {
+      state,
+      epoch: this.epoch,
+      boot: this.boot,
+      ownedJobs: this.jobs.size,
+      unresolved: await this.store.unresolvedConsumerGuardAdmissions(
+        this.plugin,
+        this.accountScopeRef,
+      ),
+    };
   }
   /** Source-owned lifecycle fact only; never manufactures missing real legacy/CI/namespace data. */
   async inspect() {
