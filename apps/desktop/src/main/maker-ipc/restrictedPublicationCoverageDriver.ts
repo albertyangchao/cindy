@@ -280,6 +280,8 @@ export class ManagedCoverageDriver implements ControlledCoverageDriver {
     await this.controller.drain();
     const observed = await this.controller.coverageSourceState();
     if (observed.ownedJobs !== 0 || observed.unresolved !== 0) fail('UNRESOLVED');
+    if ((await this.store.unknownNativePublicationEffects(this.plugin)) !== 0)
+      fail('NATIVE_EFFECT_UNKNOWN');
   }
   async switchRelease(
     generation: string,
@@ -296,6 +298,8 @@ export class ManagedCoverageDriver implements ControlledCoverageDriver {
     )
       fail('GENERATION');
     if (old.value.lifecycleSequence !== previousSequence) fail('SEQUENCE_GAP');
+    if ((await this.store.unknownNativePublicationEffects(this.plugin)) !== 0)
+      fail('NATIVE_EFFECT_UNKNOWN');
     const pending: DriverState = {
       ...old.value,
       boot: this.boot,
@@ -483,14 +487,13 @@ export class ManagedCoverageDriver implements ControlledCoverageDriver {
       this.close();
       fail('FACTS_CHANGED');
     }
-    const observed = await this.controller.coverageSourceState();
-    if (
-      observed.unresolved !== 0 ||
-      (await this.store.unknownNativePublicationEffects(this.plugin)) !== 0 ||
-      epoch !== this.epoch
-    ) {
+    // Release drain/UNKNOWN counts are measured before switching generations.
+    // An admitted current operation deliberately persists UNKNOWN before remote IO;
+    // treating that as an unrelated old-generation claim here would self-revoke it.
+    // Its original Main action/job authority still guards every effect and no-resubmit.
+    if (epoch !== this.epoch) {
       this.close();
-      fail('UNRESOLVED');
+      fail('REVOKED');
     }
     this.requireReady();
     this.leaseUntil = this.clock() + 30000;
