@@ -14,11 +14,31 @@ import { ManagedPublicationController, type PublisherReleaseSource } from '../re
 import { RestrictedPublicationOwnerRegistry, verifyOriginalRetirementReceipt } from '../restrictedPublicationOwnerRegistry.js';
 import { RestrictedPublicationResidentSource } from '../restrictedPublicationResidentSource.js';
 import { assertNoUncertainPublicationCutover, commitPublicationGenerationCutover,
-  preparePublicationGenerationCutover, type MainPublicationGenerationPlan } from '../restrictedPublicationPolicyCutover.js';
+  preparePublicationGenerationCutover, clonePublicationGenerationPlan, publicationGenerationPlanIdentity,
+  type MainPublicationGenerationPlan } from '../restrictedPublicationPolicyCutover.js';
 
 const cleanup: Array<() => Promise<unknown>> = [];
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close(); });
 const rawHash = (raw: string) => createHash('sha256').update(raw).digest('hex');
+
+// Metadata-only regression: structuredClone must retain private Main callbacks
+// outside its serialized value while deeply copying every approved CI target.
+// This does not produce an installation, original source or approval receipt.
+it('clones CI runner expectations without serializing or executing their Main approval', () => {
+  let approvals = 0;
+  const approve = () => { approvals++; };
+  const plan = { generation: 'next', profile: {}, sourcePlan: { operationId: 'next-op', worker: {},
+    ciRunners: [{ instanceId: 'original-controller', effects: [{ schema: 'publication-ci-effect/v1',
+      kind: 'controller-start', identity: { runId: 42 } }], assertEffectApproved: approve }] } } as unknown as MainPublicationGenerationPlan;
+  const identity = publicationGenerationPlanIdentity(plan);
+  const copy = clonePublicationGenerationPlan(plan);
+  expect(copy.sourcePlan.ciRunners![0].assertEffectApproved).toBe(approve);
+  expect(approvals).toBe(0);
+  expect(publicationGenerationPlanIdentity(copy)).toBe(identity);
+  plan.sourcePlan.ciRunners![0].effects[0].identity.runId = 43;
+  expect(copy.sourcePlan.ciRunners![0].effects[0].identity.runId).toBe(42);
+  expect(publicationGenerationPlanIdentity(plan)).not.toBe(identity);
+});
 async function fixture() {
   const directory = await realpath(await mkdtemp(path.join(tmpdir(), 'main-policy-cutover-')));
   cleanup.push(() => rm(directory, { recursive: true, force: true }));

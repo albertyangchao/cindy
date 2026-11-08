@@ -1,7 +1,8 @@
 /** Main's held, kernel-authenticated original-entry listener.
  * Expected descriptors are not census evidence. Only accepted original peers
  * can create a receipt, and C independently binds resident peers to the OS.
- * This module has no business-release or service-start operation.
+ * CI runner effects use separate one-use Main capabilities persisted before
+ * transmission; all original publication/namespace scopes remain non-releasing.
  */
 import { spawn, type ChildProcess } from 'node:child_process';
 import { constants } from 'node:fs';
@@ -16,6 +17,8 @@ import type { PublicationSourceBinding } from './restrictedPublicationCISourceBr
 import { canonical, digest, parseNativeFrame } from './restrictedPublicationProtocol.js';
 import { ManagedPublicationController } from './restrictedPublicationManagedController.js';
 import { verifyOriginalRetirementReceipt, type RestrictedPublicationOwnerRegistry } from './restrictedPublicationOwnerRegistry.js';
+import { consumeOriginalCIEffectPermit, validateOriginalCIEffect,
+  type OriginalCIEffectObservation } from './restrictedPublicationCIProducer.js';
 
 const SCHEMA = 'resident-owner-listener/v1';
 const ENTRY = 'bridge_core/publication_owner_listener.py';
@@ -42,7 +45,12 @@ function binding(value: PublicationSourceBinding) {
   return structuredClone(value);
 }
 export type OriginalOwnerScope = 'RESIDENT_ORIGINAL_ENTRY' | 'REGISTERED_NAMESPACE_OWNER' |
-  'REGISTERED_RESIDENT_NONPUBLISHER';
+  'REGISTERED_RESIDENT_NONPUBLISHER' | 'REGISTERED_CI_PRODUCER';
+const ciOriginalEntries: Readonly<Record<string, string>> = {
+  'core-jit.persistent-bridge-pool': 'macmini-jit-controller/sync-runner-pools.py',
+  'core-jit.bridge-jit-controller': 'macmini-jit-controller/start-approved-jit-runner.sh',
+  'core-jit.bridge-jit-dispatcher': 'macmini-jit-controller/jit-deploy-dispatcher.sh',
+};
 export interface OriginalPublicationOwnerDescriptor {
   instanceId: string;
   ownerId: string;
@@ -78,7 +86,7 @@ export interface OriginalPublicationPeerObservation {
   files: Record<string, string>;
   observation: { state: Phase; loadedNonce: string | null; nativeWithoutMain: 'DENIED' | null;
     activeOperations: number; unknownOperations: number; fenceRevision: number;
-    probe: Record<string, unknown> | null };
+    probe: Record<string, unknown> | null; ciEffect?: OriginalCIEffectObservation | null };
 }
 type Store = Pick<ReturnType<typeof createRestrictedPartnerStore>,
   'consumerGuardReceiptIdentity' | 'readConsumerGuardReceipt' | 'compareAndSwapConsumerGuardReceipt' |
@@ -173,7 +181,8 @@ export class RestrictedPublicationResidentSource {
     for (const o of profile.owners) {
       exact(o, 'instanceId,ownerId,sourceScope,entryScript,originalEntryScript,originalRoot,originalArgv,entryArgv,originalBootstrapSha256,definitionDigest');
       if (!opaque(o.instanceId) || ids.has(o.instanceId) || !opaque(o.ownerId) ||
-          !['RESIDENT_ORIGINAL_ENTRY', 'REGISTERED_NAMESPACE_OWNER', 'REGISTERED_RESIDENT_NONPUBLISHER'].includes(o.sourceScope) ||
+          !['RESIDENT_ORIGINAL_ENTRY', 'REGISTERED_NAMESPACE_OWNER', 'REGISTERED_RESIDENT_NONPUBLISHER',
+            'REGISTERED_CI_PRODUCER'].includes(o.sourceScope) ||
           !relative(o.entryScript) || !relative(o.originalEntryScript) || !hash(o.originalBootstrapSha256) ||
           !hash(o.definitionDigest) || !path.isAbsolute(o.originalRoot) ||
           path.normalize(o.originalRoot) !== o.originalRoot || !Array.isArray(o.originalArgv) ||
@@ -181,6 +190,9 @@ export class RestrictedPublicationResidentSource {
           !Array.isArray(o.entryArgv) || o.entryArgv.length < 4 || o.entryArgv.length > 64 ||
           !o.entryArgv.every(opaque) || canonical(o.entryArgv.slice(0, 4)) !==
             canonical([profile.python.path, '-I', '-B', path.join(profile.root, o.entryScript)])) fail('PROFILE');
+      if (o.sourceScope === 'REGISTERED_CI_PRODUCER' &&
+          (o.entryScript !== 'bridge_core/publication_ci_producer.py' ||
+           !Object.hasOwn(ciOriginalEntries, o.ownerId) || ciOriginalEntries[o.ownerId] !== o.originalEntryScript)) fail('PROFILE');
       ids.add(o.instanceId);
     }
     this.profile = structuredClone(profile);
@@ -415,7 +427,9 @@ export class RestrictedPublicationResidentSource {
   private peerResult(value: Record<string, any>, previous?: PeerRecord) {
     exact(value, 'peerId,instanceId,ownerId,sourceScope,entryScript,originalEntryScript,root,sourceDigest,definitionDigest,process,files,observation');
     exact(value.process, 'processId,uid,startIdentity,executable,argv,cwd');
-    exact(value.observation, 'state,loadedNonce,nativeWithoutMain,activeOperations,unknownOperations,fenceRevision,probe');
+    const ci = value.sourceScope === 'REGISTERED_CI_PRODUCER';
+    exact(value.observation, 'state,loadedNonce,nativeWithoutMain,activeOperations,unknownOperations,fenceRevision,probe' +
+      (ci ? ',ciEffect' : ''));
     const descriptor = this.profile.owners.find(x => x.instanceId === value.instanceId);
     if (!descriptor || !opaque(value.peerId) || value.root !== this.profile.root ||
         value.sourceDigest !== this.profile.sourceDigest || canonical(value.files) !== canonical(this.profile.files) ||
@@ -437,6 +451,15 @@ export class RestrictedPublicationResidentSource {
           value.observation.unknownOperations !== 0 || value.observation.fenceRevision !== 0) fail('PEER_BINDING');
     } else if (value.observation.nativeWithoutMain !== 'DENIED' || !hash(value.observation.loadedNonce)) {
       fail('PEER_BINDING');
+    }
+    if (ci) {
+      validateOriginalCIEffect(value.observation.ciEffect);
+      if (value.observation.activeOperations > 1 || value.observation.unknownOperations > 1 ||
+          (['CONNECTED', 'LOADED'].includes(value.observation.state) && value.observation.ciEffect !== null) ||
+          (value.observation.state === 'RUNNING' && value.observation.activeOperations !== 1) ||
+          (['FINISHED', 'FENCED', 'DRAINED', 'RETIRED'].includes(value.observation.state) &&
+            (value.observation.activeOperations !== 0 || value.observation.unknownOperations !== 0 ||
+             (value.observation.ciEffect !== null && value.observation.ciEffect.state !== 'ACKNOWLEDGED')))) fail('CI_PEER_BINDING');
     }
     const observed = structuredClone(value) as OriginalPublicationPeerObservation;
     if (previous && (previous.peerId !== observed.peerId || previous.instanceId !== observed.instanceId ||
@@ -536,12 +559,72 @@ export class RestrictedPublicationResidentSource {
       return this.receipt(peer, observed);
     });
   }
+  /** CI preparation retains the original local control locks/state/log writes.
+   * Runner, controller and remote lifecycle effects pause individually until
+   * a durable Main permit arrives; preparation is not a read-only OS probe. */
+  async prepareCI(handle: object) { return this.ciExchange(handle, 'ci-prepare'); }
+  /** The original peer condition wait is bounded by the unchanged session TTL. */
+  async pollCI(handle: object) { return this.ciExchange(handle, 'ci-poll'); }
+  async admitCIEffect(handle: object, permit: object) { return this.ciExchange(handle, 'effect-admit', permit); }
+  async acknowledgeCIEffect(handle: object, permit: object) { return this.ciExchange(handle, 'effect-ack', permit); }
+  private async ciExchange(handle: object, method: 'ci-prepare' | 'ci-poll' | 'effect-admit' | 'effect-ack', permit?: object) {
+    return this.exclusive(async () => {
+      const previous = readOriginalPublicationPeerReceipt(handle, this);
+      const peer = this.ledger.peers.find(x => x.peerId === previous.peerId)!;
+      if (previous.sourceScope !== 'REGISTERED_CI_PRODUCER' || previous.observation.unknownOperations !== 0 ||
+          (method === 'ci-prepare' ? previous.observation.state !== 'LOADED' :
+            !['RUNNING', 'FINISHED'].includes(previous.observation.state))) fail('CI_PHASE');
+      const before = previous.observation.ciEffect;
+      if ((method === 'ci-prepare' && before !== null) ||
+          (method === 'effect-admit' && before?.state !== 'REQUESTED') ||
+          (method === 'effect-ack' && before?.state !== 'SUCCEEDED')) fail('CI_PHASE');
+      const args: Record<string, unknown> = { peerId: peer.peerId };
+      if (method === 'effect-admit' || method === 'effect-ack') {
+        if (!permit) fail('CI_PRIVATE_PERMIT_REQUIRED');
+        Object.assign(args, await consumeOriginalCIEffectPermit(permit, this, previous,
+          method === 'effect-admit' ? 'admit' : 'ack'));
+      }
+      const observed = this.peerResult(await this.request(method, args), peer).observed;
+      const after = observed.observation.ciEffect;
+      if (observed.observation.loadedNonce !== previous.observation.loadedNonce ||
+          observed.observation.fenceRevision !== previous.observation.fenceRevision ||
+          observed.observation.unknownOperations !== 0 || observed.observation.state === 'UNKNOWN' ||
+          after?.state === 'UNKNOWN') fail('CI_OUTCOME_UNKNOWN');
+      if (method === 'ci-prepare') {
+        if (observed.observation.state !== 'RUNNING' || after !== null) fail('CI_PHASE');
+      } else if (method === 'effect-admit' || method === 'effect-ack') {
+        if (!before || !after || observed.observation.state !== 'RUNNING' || after.sequence !== before.sequence ||
+            after.effectId !== before.effectId || canonical(after.descriptor) !== canonical(before.descriptor) ||
+            after.admissionId !== args.admissionId || after.state !== (method === 'effect-admit' ? 'ADMITTED' : 'ACKNOWLEDGED') ||
+            (method === 'effect-ack' && after.outcomeSha256 !== args.outcomeSha256)) fail('CI_EFFECT_BINDING');
+      } else if (before === null) {
+        if (after !== null && (after?.state !== 'REQUESTED' || after.sequence !== 1)) fail('CI_EFFECT_SEQUENCE');
+      } else if (before && after && before.state === 'ACKNOWLEDGED' && after.state === 'REQUESTED') {
+        if (after.sequence !== before.sequence + 1 || after.effectId === before.effectId) fail('CI_EFFECT_SEQUENCE');
+      } else {
+        if (!before || !after || after.sequence !== before.sequence || after.effectId !== before.effectId ||
+            canonical(after.descriptor) !== canonical(before.descriptor) || after.admissionId !== before.admissionId ||
+            !({ REQUESTED: ['REQUESTED'], ADMITTED: ['ADMITTED', 'RUNNING', 'SUCCEEDED'],
+              RUNNING: ['RUNNING', 'SUCCEEDED'], SUCCEEDED: ['SUCCEEDED'], ACKNOWLEDGED: ['ACKNOWLEDGED'],
+              UNKNOWN: [] } as Record<string, string[]>)[before.state].includes(after.state) ||
+            (before.outcomeSha256 !== null && after.outcomeSha256 !== before.outcomeSha256)) fail('CI_EFFECT_SEQUENCE');
+      }
+      if (observed.observation.state === 'FINISHED' &&
+          (after !== null && after?.state !== 'ACKNOWLEDGED')) fail('CI_OUTCOME_UNKNOWN');
+      peer.phase = observed.observation.state; peer.revision++; peer.observation = observed;
+      await this.save();
+      return this.receipt(peer);
+    });
+  }
   async transition(handle: object, method: 'fence' | 'drain' | 'retire') {
     return this.exclusive(async () => {
       const previous = readOriginalPublicationPeerReceipt(handle, this);
       const peer = this.ledger.peers.find(x => x.peerId === previous.peerId)!;
       const expectedPhase = { fence: 'LOADED', drain: 'FENCED', retire: 'DRAINED' }[method];
-      if (peer.phase !== expectedPhase) fail('PHASE');
+      const completedCI = method === 'fence' && previous.sourceScope === 'REGISTERED_CI_PRODUCER' &&
+        peer.phase === 'FINISHED' && previous.observation.activeOperations === 0 &&
+        previous.observation.unknownOperations === 0;
+      if (peer.phase !== expectedPhase && !completedCI) fail('PHASE');
       peer.phase = { fence: 'FENCING', drain: 'DRAINING', retire: 'RETIRING' }[method] as PeerRecord['phase'];
       peer.revision++;
       await this.save();

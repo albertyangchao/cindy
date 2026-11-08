@@ -66,18 +66,24 @@ async function syncDirectory(directoryPath: string) {
   const fd = await open(directoryPath, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
   try { await fd.sync(); } finally { await fd.close(); }
 }
-/** Pure approval identity. The only function allowed in a plan is the existing
- * Main dispatch approval, retained privately by Driver and never a fact source. */
+/** Pure approval identity. Original Main dispatch/runner approval callbacks
+ * remain private; the complete target descriptors are part of the identity. */
 export function publicationGenerationPlanIdentity(plan: MainPublicationGenerationPlan) {
   const ci = plan.sourcePlan.ci;
+  const runners = plan.sourcePlan.ciRunners;
   return digest({ ...plan, sourcePlan: { ...plan.sourcePlan,
+    ...(runners ? { ciRunners: runners.map(x => ({ instanceId: x.instanceId, effects: x.effects })) } : {}),
     ...(ci ? { ci: { instanceId: ci.instanceId, head: ci.head, workflowSha256: ci.workflowSha256 } } : {}) } });
 }
 export function clonePublicationGenerationPlan(plan: MainPublicationGenerationPlan): MainPublicationGenerationPlan {
   const ci = plan.sourcePlan.ci;
+  const runners = plan.sourcePlan.ciRunners;
   const cloned = structuredClone({ ...plan, sourcePlan: { ...plan.sourcePlan,
+    ...(runners ? { ciRunners: runners.map(x => ({ instanceId: x.instanceId, effects: x.effects })) } : {}),
     ...(ci ? { ci: { instanceId: ci.instanceId, head: ci.head, workflowSha256: ci.workflowSha256 } } : {}) } });
   return { ...cloned, sourcePlan: { ...cloned.sourcePlan,
+    ...(runners ? { ciRunners: cloned.sourcePlan.ciRunners!.map((x, index) => ({ ...x,
+      assertEffectApproved: runners[index].assertEffectApproved })) } : {}),
     ...(ci ? { ci: { ...ci } } : {}) } } as MainPublicationGenerationPlan;
 }
 export async function assertNoUncertainPublicationCutover(store: Store, plugin: string, account: string) {
@@ -116,6 +122,8 @@ async function definitionMatches(plan: MainPublicationGenerationPlan, root: stri
       x.serviceLabel === owner.ownerId && x.definitionDigest === owner.definitionDigest &&
       value.residentNonPublisherSources?.some((y: any) => y.sourceProfileId === x.sourceProfileId &&
         y.sourceRoot === original.root && canonical(y.sourceFiles) === canonical(original.files)))) fail('DEFINITION_OWNER_MISMATCH');
+    if (owner.sourceScope === 'REGISTERED_CI_PRODUCER' &&
+        !plan.sourcePlan.ciRunners?.some(x => x.instanceId === owner.instanceId)) fail('DEFINITION_OWNER_MISMATCH');
   }
   return value as OriginalPublicationRegistryProfile;
 }
@@ -137,6 +145,8 @@ function bootstrapPaths(profile: PinnedPublicationResidentSource) {
         owner.entryScript, 'bridge_core/publication_consumer_enrollment.py',
         'bridge_core/publication_consumer_guards.py', 'bridge_core/publish_queue_consumers.py',
         'bridge_core/html_contract.py', 'bridge_core/template_families.py']) names.add(name);
+      if (owner.sourceScope === 'REGISTERED_CI_PRODUCER') for (const name of [
+        'bridge_core/publication_ci_producer.py', 'macmini-jit-controller/publication_ci_owner.py']) names.add(name);
     }
     for (const relativePath of names) {
       const sha256 = relativePath === owner.originalEntryScript

@@ -28,6 +28,8 @@ import {
   type PinnedPublicationResidentSource,
 } from './restrictedPublicationResidentSource.js';
 import { RestrictedPublicationOwnerRegistry } from './restrictedPublicationOwnerRegistry.js';
+import { RestrictedPublicationCIProducer, originalCIEffectIdentity, originalCIEffectTarget,
+  type OriginalCIRunnerPlan, type OriginalCIEffectDescriptor } from './restrictedPublicationCIProducer.js';
 import { assertNoUncertainPublicationCutover, clonePublicationGenerationPlan, publicationGenerationPlanIdentity,
   preparePublicationGenerationCutover, commitPublicationGenerationCutover,
   type MainPublicationGenerationPlan } from './restrictedPublicationPolicyCutover.js';
@@ -118,6 +120,9 @@ export interface MainPublicationSourcePlan {
   /** Fixed original-entry listeners. Descriptors remain expectations until the
    * kernel-authenticated original processes connect; this never starts a service. */
   originalSources?: ReadonlyArray<PinnedPublicationResidentSource>;
+  /** Additional original runner owners. Their effects retain separate original
+   * Main approvals and never substitute for complete CI workflow history. */
+  ciRunners?: ReadonlyArray<OriginalCIRunnerPlan>;
   ci?: {
     instanceId: string;
     head: string;
@@ -130,6 +135,7 @@ type SourcePlanMetadata = {
   worker: PinnedPublicationSourceWorker;
   ownerSource?: MainPublicationSourcePlan['ownerSource'];
   originalSources?: MainPublicationSourcePlan['originalSources'];
+  ciRunners?: Array<Pick<OriginalCIRunnerPlan, 'instanceId' | 'effects'>>;
   ci?: { instanceId: string; head: string; workflowSha256: string };
 };
 type DriverState = {
@@ -145,19 +151,36 @@ type DriverState = {
   registrationSha256?: string | null;
   state: 'QUIESCING' | 'READY' | 'UNKNOWN';
 };
-function normalizeSourcePlan(sourcePlan?: MainPublicationSourcePlan): { metadata?: SourcePlanMetadata; approval?: () => void } {
+function normalizeSourcePlan(sourcePlan?: MainPublicationSourcePlan): { metadata?: SourcePlanMetadata; approval?: () => void;
+  runnerApprovals?: Map<string, OriginalCIRunnerPlan['assertEffectApproved']> } {
   if (sourcePlan) {
       if (!/^[A-Za-z0-9_-]{1,100}$/.test(sourcePlan.operationId) || !sourcePlan.worker?.definition)
         fail('SOURCE_PLAN');
       const ci = sourcePlan.ci;
       const held = sourcePlan.ownerSource;
       const original = sourcePlan.originalSources;
+      const runners = sourcePlan.ciRunners;
       if (original && (!Array.isArray(original) || original.length < 1 || original.length > 16 ||
           new Set(original.map(x => x.runtimeDirectory)).size !== original.length ||
           original.some(x => !Array.isArray(x.owners)) ||
           original.reduce((count, x) => count + x.owners.length, 0) > 64 ||
           new Set(original.flatMap((x: PinnedPublicationResidentSource) => x.owners.map(y => y.instanceId))).size !==
             original.reduce((count, x) => count + x.owners.length, 0))) fail('SOURCE_PLAN');
+      const ciOwners = original?.flatMap(x => x.owners).filter(x => x.sourceScope === 'REGISTERED_CI_PRODUCER') ?? [];
+      if (runners && (!Array.isArray(runners) || !runners.length || runners.length > 64 ||
+          new Set(runners.map(x => x.instanceId)).size !== runners.length)) fail('SOURCE_PLAN');
+      if (ciOwners.length !== (runners?.length ?? 0) || ciOwners.some(x => !runners?.some(y => y.instanceId === x.instanceId)))
+        fail('SOURCE_PLAN');
+      const runnerApprovals = new Map<string, OriginalCIRunnerPlan['assertEffectApproved']>();
+      for (const runner of runners ?? []) {
+        if (!opaque(runner.instanceId) || typeof runner.assertEffectApproved !== 'function' ||
+            !Array.isArray(runner.effects) || !runner.effects.length || runner.effects.length > 64 ||
+            Object.keys(runner).sort().join(',') !== 'assertEffectApproved,effects,instanceId') fail('SOURCE_PLAN');
+        const ids = runner.effects.map((effect: OriginalCIEffectDescriptor) => originalCIEffectIdentity(effect));
+        if (new Set(ids).size !== ids.length ||
+            new Set(runner.effects.map(originalCIEffectTarget)).size !== ids.length) fail('SOURCE_PLAN');
+        runnerApprovals.set(runner.instanceId, runner.assertEffectApproved);
+      }
       if (held && (Object.keys(held).sort().join(',') !== 'definitionDigest,instanceId,profileId' ||
           !opaque(held.instanceId) || !validHash(held.definitionDigest) ||
           !['canonical-producer', 'core.monitor.publish'].includes(held.profileId))) fail('SOURCE_PLAN');
@@ -167,8 +190,9 @@ function normalizeSourcePlan(sourcePlan?: MainPublicationSourcePlan): { metadata
       const metadata: SourcePlanMetadata = structuredClone({ operationId: sourcePlan.operationId, worker: sourcePlan.worker,
         ...(held ? { ownerSource: held } : {}),
         ...(original ? { originalSources: original } : {}),
+        ...(runners ? { ciRunners: runners.map(x => ({ instanceId: x.instanceId, effects: x.effects })) } : {}),
         ...(ci ? { ci: { instanceId: ci.instanceId, head: ci.head, workflowSha256: ci.workflowSha256 } } : {}) });
-      return { metadata, approval: ci?.assertDispatchApproved };
+      return { metadata, approval: ci?.assertDispatchApproved, runnerApprovals };
     }
   return {};
 }
@@ -252,6 +276,7 @@ export class ManagedCoverageDriver implements ControlledCoverageDriver {
   private accepted?: ControlledCoverageReport;
   private sourcePlan?: SourcePlanMetadata;
   private sourceApproval?: () => void;
+  private runnerApprovals = new Map<string, OriginalCIRunnerPlan['assertEffectApproved']>();
   private sourceBroker?: RestrictedPublicationCISourceBroker;
   private originalSources: RestrictedPublicationResidentSource[] = [];
   private ownerRegistry?: RestrictedPublicationOwnerRegistry;
@@ -287,6 +312,7 @@ export class ManagedCoverageDriver implements ControlledCoverageDriver {
     const configured = normalizeSourcePlan(sourcePlan);
     this.sourcePlan = configured.metadata;
     this.sourceApproval = configured.approval;
+    this.runnerApprovals = configured.runnerApprovals ?? new Map();
     this.registration = structuredClone(this.profile.registration);
     validateCoverageConfiguration(this.profile, this.sourcePlan);
     this.activePlanHash = this.sourcePlan ? sha({ profile: this.profile, sourcePlan: this.sourcePlan }) : sha(this.profile);
@@ -441,6 +467,8 @@ export class ManagedCoverageDriver implements ControlledCoverageDriver {
       if (!this.store.capturePublicationOwnerHistory || !this.store.assertPublicationOwnerHistoryCurrent)
         fail('ORIGINAL_HISTORY_SOURCE_REQUIRED');
       const sourceStore = this.store as Parameters<typeof RestrictedPublicationOwnerRegistry.startOwned>[0];
+      const runnerPeers: Array<{ source: RestrictedPublicationResidentSource; handle: object;
+        plan: Pick<OriginalCIRunnerPlan, 'instanceId' | 'effects'> }> = [];
       const profile = broker.definitionExpectations();
       const registry = await RestrictedPublicationOwnerRegistry.startOwned(sourceStore, this.plugin,
         plan.operationId, profile, this.controller, lifecycle);
@@ -476,6 +504,10 @@ export class ManagedCoverageDriver implements ControlledCoverageDriver {
               peer = await owner.transition(peer, 'retire');
             }
             await registry.bindOriginal(actual.instanceId, owner, peer);
+          } else if (actual.sourceScope === 'REGISTERED_CI_PRODUCER') {
+            const runner = plan.ciRunners?.find(x => x.instanceId === actual.instanceId);
+            if (!runner || !this.runnerApprovals.has(actual.instanceId)) fail('CI_RUNNER_PLAN_REQUIRED');
+            runnerPeers.push({ source: owner, handle: peer, plan: runner });
           } else {
             peer = await owner.transition(peer, 'fence');
             peer = await owner.transition(peer, 'drain');
@@ -490,6 +522,22 @@ export class ManagedCoverageDriver implements ControlledCoverageDriver {
       // This real preflight precedes the only dispatch approval callback.
       // Missing census/history/namespace producers leave approval count zero.
       await registry.preflightNonCI();
+      // No original runner preparation, registration token, configuration or launch
+      // precedes the real source preflight. Workflow history remains a separate
+      // mandatory owner source; these runner receipts cannot satisfy it.
+      for (const runner of runnerPeers) {
+        const approval = this.runnerApprovals.get(runner.plan.instanceId)!;
+        const producer = RestrictedPublicationCIProducer.fromOriginal(sourceStore, this.plugin,
+          runner.source, runner.handle, { ...runner.plan, assertEffectApproved: async effect => {
+            this.ownerCurrent(); if (epoch !== this.epoch) fail('REVOKED');
+            await approval(effect);
+            this.ownerCurrent(); if (epoch !== this.epoch) fail('REVOKED');
+          } });
+        let peer = await producer.run();
+        peer = await runner.source.transition(peer, 'fence');
+        peer = await runner.source.transition(peer, 'drain');
+        await runner.source.transition(peer, 'retire');
+      }
       if (plan.ci) {
         await broker.dispatchOriginalCI(plan.ci.head, plan.ci.workflowSha256, this.sourceApproval!);
         ciHandle = await broker.inspectCI();
@@ -788,6 +836,7 @@ export class ManagedCoverageDriver implements ControlledCoverageDriver {
         const configured = normalizeSourcePlan(committed.plan.sourcePlan);
         this.sourcePlan = configured.metadata;
         this.sourceApproval = configured.approval;
+        this.runnerApprovals = configured.runnerApprovals ?? new Map();
         validateCoverageConfiguration(this.profile, this.sourcePlan);
         for (const key of Object.keys(this.registration)) delete (this.registration as unknown as Record<string, unknown>)[key];
         Object.assign(this.registration, structuredClone(this.profile.registration));

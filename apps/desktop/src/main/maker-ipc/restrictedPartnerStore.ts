@@ -68,7 +68,7 @@ export function createRestrictedPartnerStore(db: DbClient, assertOwner: () => vo
     eq(table.operation, 'target'),
     eq(table.pluginId, pluginId),
     sql`${table.targetId} LIKE ${`publication-coverage:${accountScopeRef}:%`}`,
-    sql`json_extract(${table.payload}, '$.schema') IN ('publication-coverage-admission/v1', 'publication-managed-job/v1')`,
+    sql`json_extract(${table.payload}, '$.schema') IN ('publication-coverage-admission/v1', 'publication-managed-job/v1', 'publication-ci-runner-effect/v1')`,
     sql`coalesce(json_extract(${table.payload}, '$.state'), 'UNKNOWN') <> 'COMPLETE'`,
   );
   const ownerHistoryPredicate = (pluginId: string, accountScopeRef: string) => and(

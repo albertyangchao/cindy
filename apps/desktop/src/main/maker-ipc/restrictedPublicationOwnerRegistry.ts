@@ -40,6 +40,38 @@ type Namespace = { entryId: string; definitionDigest: string; censusSourceId: st
   sourceFiles: Record<string, string>; origin: 'owned-controller' | 'foreign-controller' };
 type NonPublisher = { serviceLabel: string; definitionDigest: string; sourceProfileId: string; censusSourceId: string };
 type NonPublisherSource = Omit<Namespace, 'entryId' | 'definitionDigest'>;
+type CensusRecord = { instanceId: string; entryId: string; definitionDigest: string;
+  generation: string; state: Member['state']; serviceLabel?: string };
+const utf8Order = (a: string, b: string) => Buffer.compare(Buffer.from(a), Buffer.from(b));
+/** Wire commitment only, never an owner receipt or a history completeness claim.
+ * The registry calls this only after sealing its actual source handles and SQL
+ * history. C recomputes it from every acquired page before accepting the census. */
+export function publicationCensusCommitment(source: Source, snapshotId: string, revision: number,
+  generation: string, records: readonly CensusRecord[], nonPublishers: readonly NonPublisher[]) {
+  if (!opaque(snapshotId) || !Number.isSafeInteger(revision) || revision < 1 || !opaque(generation) ||
+      records.length > MAX_INSTANCES || new Set(records.map(x => x.instanceId)).size !== records.length ||
+      nonPublishers.length > 2048 || new Set(nonPublishers.map(x => x.serviceLabel)).size !== nonPublishers.length ||
+      records.some(x => !opaque(x.instanceId) || !opaque(x.generation) || !hex(x.definitionDigest) ||
+        !['GUARDED', 'NATIVE_NAMESPACE_DENIED', 'RETIRED_FENCED'].includes(x.state) ||
+        (x.generation !== generation && x.state !== 'RETIRED_FENCED')) ||
+      nonPublishers.some(x => x.censusSourceId !== source.sourceId) ||
+      (source.kind !== 'resident' && nonPublishers.length !== 0)) fail('CENSUS_COMMITMENT');
+  const sortedRecords = [...records].sort((a, b) => utf8Order(a.instanceId, b.instanceId));
+  const sortedNonPublishers = [...nonPublishers].sort((a, b) => utf8Order(a.serviceLabel, b.serviceLabel));
+  const currentRecordCount = records.filter(x => x.generation === generation).length;
+  return { schema: 'publication-owner-census-commitment/v1' as const, ...source, snapshotId, revision,
+    currentRecordCount, historicalRecordCount: records.length - currentRecordCount,
+    nonPublisherCount: nonPublishers.length, recordsSha256: digest(sortedRecords),
+    nonPublishersSha256: digest(sortedNonPublishers) };
+}
+/** A lossless set commitment for already acquired opaque receipt IDs. */
+export function publicationReceiptSet(ids: readonly string[]) {
+  if (ids.some(x => !opaque(x)) || new Set(ids).size !== ids.length) fail('RECEIPT_SET');
+  return { schema: 'publication-receipt-set/v1' as const, count: ids.length,
+    sha256: digest([...ids].sort(utf8Order)) };
+}
+type FrozenCensus = { records: CensusRecord[]; nonPublishers: NonPublisher[];
+  commitment: ReturnType<typeof publicationCensusCommitment> };
 export interface OriginalPublicationRegistryProfile {
   schema: 'publication-definition-profile/v1';
   sourceIdentity: string;
@@ -108,11 +140,12 @@ export class RestrictedPublicationOwnerRegistry {
   private readonly namespacePeers = new Map<string, HeldPeer>();
   private readonly nonPublisherPeers = new Map<string, HeldPeer>();
   private readonly pages = new Map<string, Record<string, any>[]>();
+  private readonly frozenCensus = new Map<string, FrozenCensus>();
   private readonly censusReceiptIds: string[] = [];
   private readonly issued = new Set<string>();
   private residentSnapshot?: string;
   private currentDigest?: string;
-  private currentReceiptIds?: string[];
+  private currentReceiptBinding?: string;
   private closed = false;
   private busy = false;
   private unsubscribe?: () => void;
@@ -569,6 +602,22 @@ export class RestrictedPublicationOwnerRegistry {
     this.ledger.state = 'SEALED';
     await this.save(true);
     await this.captureHistory();
+    // Freeze the complete projection once, from the same sealed original row
+    // and retained history. A later request cannot redefine the total or root.
+    for (const source of this.profile.censusSources) {
+      const records = [...this.ledger.members, ...this.historical]
+        .filter(x => x.sourceId === source.sourceId).map(x => this.record(x))
+        .sort((a, b) => utf8Order(a.instanceId, b.instanceId));
+      const nonPublishers = source.kind === 'resident' ? this.profile.residentNonPublishers
+        .filter(x => x.censusSourceId === source.sourceId)
+        .map(x => ({ serviceLabel: x.serviceLabel, definitionDigest: x.definitionDigest,
+          sourceProfileId: x.sourceProfileId, censusSourceId: x.censusSourceId }))
+        .sort((a, b) => utf8Order(a.serviceLabel, b.serviceLabel)) : [];
+      const snapshotId = digest([this.row, source.sourceId, records, nonPublishers]);
+      this.frozenCensus.set(source.sourceId, { records, nonPublishers,
+        commitment: publicationCensusCommitment(source, snapshotId, this.row!.revision,
+          this.lifecycle.binding.generation, records, nonPublishers) });
+    }
     const handle = Object.freeze(Object.create(null)) as object;
     seals.set(handle, { registry: this, revision: this.row!.revision, ci: true });
     return handle;
@@ -623,17 +672,18 @@ export class RestrictedPublicationOwnerRegistry {
     let pages = this.pages.get(source.sourceId);
     if (!pages) { if (args.cursor !== 0) fail('CENSUS_GAP'); pages = []; this.pages.set(source.sourceId, pages); }
     if (args.cursor !== pages.length) fail('CENSUS_REPLAY');
-    const all = [...this.ledger.members, ...this.historical].filter(x => x.sourceId === source.sourceId)
-      .sort((a, b) => a.instanceId.localeCompare(b.instanceId));
-    if (all.length > MAX_INSTANCES) fail('CENSUS_LIMIT');
-    const nonPublishers = resident ? this.profile.residentNonPublishers.filter(x => x.censusSourceId === source.sourceId) : [];
-    const pageCount = Math.max(1, Math.ceil(all.length / PAGE_SIZE), Math.ceil(nonPublishers.length / NONPUBLISHER_PAGE_SIZE));
+    const frozen = this.frozenCensus.get(source.sourceId);
+    if (!frozen || frozen.commitment.revision !== this.row!.revision) fail('CENSUS_NOT_SEALED');
+    const pageCount = Math.max(1, Math.ceil(frozen.records.length / PAGE_SIZE),
+      Math.ceil(frozen.nonPublishers.length / NONPUBLISHER_PAGE_SIZE));
     if (pageCount > MAX_PAGES || args.cursor >= pageCount) fail('CENSUS_LIMIT');
-    const records = all.slice(args.cursor * PAGE_SIZE, (args.cursor + 1) * PAGE_SIZE).map(x => this.record(x));
-    const receiptId = this.issue('census', { source, cursor: args.cursor, records });
+    const records = structuredClone(frozen.records.slice(args.cursor * PAGE_SIZE, (args.cursor + 1) * PAGE_SIZE));
+    const commitment = { ...frozen.commitment,
+      ...(resident ? { residentSnapshotSha256: args.residentSnapshotSha256 } : {}) };
+    const receiptId = this.issue('census', { source, cursor: args.cursor, records, commitment });
     const value: Record<string, any> = { ...this.base('publication-owner-census/v1'), ...source,
       cursor: args.cursor, previousPageSha256: pages.length ? digest(pages[pages.length - 1]) : null,
-      snapshotId: digest([this.row, source.sourceId]), revision: this.row!.revision, receiptId, records,
+      snapshotId: frozen.commitment.snapshotId, revision: this.row!.revision, receiptId, records, commitment,
       nextCursor: args.cursor + 1 < pageCount ? args.cursor + 1 : null };
     if (resident) {
       value.residentSnapshotSha256 = args.residentSnapshotSha256;
@@ -729,7 +779,9 @@ export class RestrictedPublicationOwnerRegistry {
   }
   private async nonPublishers(source: Source, censusReceiptId: string, args: Record<string, any>) {
     const result = [];
-    for (const expected of this.profile.residentNonPublishers.filter(x => x.censusSourceId === source.sourceId)
+    const frozen = this.frozenCensus.get(source.sourceId);
+    if (!frozen) fail('CENSUS_NOT_SEALED');
+    for (const expected of frozen.nonPublishers
       .slice(args.cursor * NONPUBLISHER_PAGE_SIZE, (args.cursor + 1) * NONPUBLISHER_PAGE_SIZE)) {
       const held = this.nonPublisherPeers.get(expected.serviceLabel);
       const provider = this.profile.residentNonPublisherSources.find(x => x.sourceProfileId === expected.sourceProfileId);
@@ -751,11 +803,17 @@ export class RestrictedPublicationOwnerRegistry {
       const subject = { ...common, operationId: this.operationId, binding: this.lifecycle.binding,
         fenceRevision: held.value.observation.fenceRevision };
       const probeId = this.issue('resident-nonpublisher-probe', { subject, raw, nonce });
-      result.push({ ...this.base('publication-resident-nonpublisher-exclusion/v1'), ...subject,
+      const sourceFilesRef = { schema: 'publication-source-files-reference/v1',
+        sourceProfileId: provider.sourceProfileId, sha256: digest(provider.sourceFiles) };
+      // Keep full pins in the authenticated subject/receipt. Only the repeated
+      // wire value is replaced; C resolves the reference against its pinned
+      // profile and then performs the unchanged full proof checks.
+      const { sourceFiles: _sourceFiles, ...wireSubject } = subject;
+      result.push({ ...this.base('publication-resident-nonpublisher-exclusion/v1'), ...wireSubject, sourceFilesRef,
         receiptId: this.issue('resident-nonpublisher', subject), proof: { kind: 'resident-nonpublisher-fence',
           scope: 'REGISTERED_RESIDENT_NONPUBLISHER', nativeIntersection: 'DENIED',
           ownerReceiptId: this.issue('resident-owner', subject), fenceReceiptId: this.issue('resident-namespace-fence', subject),
-          sourceProbeReceiptId: probeId, sourceProbe: { schema: 'publication-resident-nonpublisher-probe/v1', ...subject,
+          sourceProbeReceiptId: probeId, sourceProbe: { schema: 'publication-resident-nonpublisher-probe/v1', ...wireSubject, sourceFilesRef,
             scope: 'REGISTERED_RESIDENT_NONPUBLISHER', nativeIntersection: 'DENIED', receiptId: probeId, nonce,
             publicationScopeSha256: scope } } });
     }
@@ -785,17 +843,24 @@ export class RestrictedPublicationOwnerRegistry {
       drainReceiptId: this.issue('drain-all', this.censusReceiptIds), oldInstances };
   }
   private current(args: Record<string, any>) {
-    if (Object.keys(args).sort().join(',') !== 'lifecycleSequence,receiptDigest,receiptIds,residentSnapshotSha256' ||
-        !hex(args.receiptDigest) || !Array.isArray(args.receiptIds) || args.receiptIds.some((x: unknown) => !opaque(x)) ||
-        new Set(args.receiptIds).size !== args.receiptIds.length || args.receiptIds.length !== this.issued.size ||
-        args.receiptIds.some((x: string) => !this.issued.has(x)) || args.lifecycleSequence !== this.lifecycle.lifecycleSequence ||
+    const compact = Object.hasOwn(args, 'receiptSet');
+    const receiptKey = compact ? 'receiptSet' : 'receiptIds';
+    if (Object.keys(args).sort().join(',') !== `lifecycleSequence,receiptDigest,${receiptKey},residentSnapshotSha256` ||
+        !hex(args.receiptDigest) || args.lifecycleSequence !== this.lifecycle.lifecycleSequence ||
         args.residentSnapshotSha256 !== this.residentSnapshot) fail('CURRENT_BINDING');
-    if (this.currentDigest && (this.currentDigest !== args.receiptDigest || canonical(this.currentReceiptIds) !== canonical(args.receiptIds)))
+    if (compact) {
+      if (canonical(args.receiptSet) !== canonical(publicationReceiptSet([...this.issued]))) fail('CURRENT_BINDING');
+    } else if (!Array.isArray(args.receiptIds) || args.receiptIds.some((x: unknown) => !opaque(x)) ||
+        new Set(args.receiptIds).size !== args.receiptIds.length || args.receiptIds.length !== this.issued.size ||
+        args.receiptIds.some((x: string) => !this.issued.has(x))) fail('CURRENT_BINDING');
+    const receiptBinding = canonical({ [receiptKey]: args[receiptKey] });
+    if (this.currentDigest && (this.currentDigest !== args.receiptDigest || this.currentReceiptBinding !== receiptBinding))
       fail('CURRENT_CHANGED');
-    this.currentDigest = args.receiptDigest; this.currentReceiptIds = [...args.receiptIds];
-    return { ...this.base('publication-owner-current/v1'), root: this.profile.sourceRoot, sourceDigest: this.profile.sourceDigest,
+    this.currentDigest = args.receiptDigest; this.currentReceiptBinding = receiptBinding;
+    return { ...this.base(compact ? 'publication-owner-current/v2' : 'publication-owner-current/v1'),
+      root: this.profile.sourceRoot, sourceDigest: this.profile.sourceDigest,
       releaseSequence: this.lifecycle.releaseSequence, lifecycleSequence: this.lifecycle.lifecycleSequence,
-      receiptDigest: args.receiptDigest, receiptIds: args.receiptIds, residentSnapshotSha256: this.residentSnapshot };
+      receiptDigest: args.receiptDigest, [receiptKey]: structuredClone(args[receiptKey]), residentSnapshotSha256: this.residentSnapshot };
   }
   async revoke(state: 'UNKNOWN' | 'REVOKED' = 'REVOKED') {
     if (this.closed) return;
