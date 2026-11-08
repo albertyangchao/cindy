@@ -17,7 +17,8 @@ import type { PublicationSourceBinding } from './restrictedPublicationCISourceBr
 import { canonical, digest, parseNativeFrame } from './restrictedPublicationProtocol.js';
 import { ManagedPublicationController } from './restrictedPublicationManagedController.js';
 import { verifyOriginalRetirementReceipt, type RestrictedPublicationOwnerRegistry } from './restrictedPublicationOwnerRegistry.js';
-import { consumeOriginalCIEffectPermit, validateOriginalCIEffect,
+import { consumeOriginalCIEffectPermit, consumeOriginalCIObservationCheckpoint,
+  verifyOriginalCIObservationCheckpoint, validateOriginalCIEffect,
   type OriginalCIEffectObservation } from './restrictedPublicationCIProducer.js';
 
 const SCHEMA = 'resident-owner-listener/v1';
@@ -25,6 +26,7 @@ const ENTRY = 'bridge_core/publication_owner_listener.py';
 const FRAME = 65536;
 const TOTAL = 1048576;
 const TTL = 60000;
+const OBSERVATION_FRAME_TTL = 3000;
 const hash = (v: unknown): v is string => typeof v === 'string' && /^[a-f0-9]{64}$/.test(v);
 const opaque = (v: unknown): v is string => typeof v === 'string' && v.length > 0 &&
   Buffer.byteLength(v) <= 512 && !/[\u0000-\u001f\u007f-\u009f]/.test(v);
@@ -116,7 +118,8 @@ type PeerRecord = { instanceId: string; peerId: string; identity: string; phase:
 type Ledger = { schema: 'publication-original-owner-listener/v1'; scope: 'ORIGINAL_PEERS_ONLY';
   operationId: string; binding: PublicationSourceBinding; profileSha256: string;
   runtimeDirectory: string;
-  state: 'STARTING' | 'OPEN' | 'CUTOVER_HELD' | 'ROTATING_UNKNOWN' | 'POLICY_PREPARED' | 'UNKNOWN' | 'REVOKED';
+  state: 'STARTING' | 'OPEN' | 'PARKING_UNKNOWN' | 'OBSERVING' | 'RESUMING_UNKNOWN' |
+    'CUTOVER_HELD' | 'ROTATING_UNKNOWN' | 'POLICY_PREPARED' | 'UNKNOWN' | 'REVOKED';
   listenerPid: number | null; peers: PeerRecord[];
   preparedPolicy?: { previousPolicySha256: string; nextPolicySha256: string; revision: number } };
 type Pin = { file: string; sha256: string; identity: string; maximum: number };
@@ -145,6 +148,10 @@ type RetainedCutover = { owner: RestrictedPublicationResidentSource; controller:
   binding: PublicationSourceBinding; row: NonNullable<Row>; peerIds: string[];
   policyRevision: number; policySha256: string; consumed: boolean };
 const cutovers = new WeakMap<object, RetainedCutover>();
+type RetainedObservation = { owner: RestrictedPublicationResidentSource; row: NonNullable<Row>;
+  peers: Map<string, OriginalPublicationPeerObservation>; checkpoints: readonly object[];
+  waiting: boolean; ready: boolean; consumed: boolean };
+const observations = new WeakMap<object, RetainedObservation>();
 export function isOriginalPublicationSource(value: unknown): value is RestrictedPublicationResidentSource {
   return !!value && typeof value === 'object' && owners.has(value);
 }
@@ -158,8 +165,11 @@ export function readOriginalPublicationPeerReceipt(handle: object, owner: Restri
 export class RestrictedPublicationResidentSource {
   private readonly profile: PinnedPublicationResidentSource;
   private readonly expected: PublicationSourceBinding;
-  private readonly sessionId = randomBytes(32).toString('hex');
-  private readonly started = performance.now();
+  private sessionId = randomBytes(32).toString('hex');
+  private started = performance.now();
+  private sessionPhase: 'ACTIVE' | 'PARKED' = 'ACTIVE';
+  private epoch = 0;
+  private retainedObservation?: object;
   private readonly key: string;
   private readonly pins: Pin[] = [];
   private readonly directories = new Map<string, string>();
@@ -184,7 +194,7 @@ export class RestrictedPublicationResidentSource {
   private buffer = Buffer.alloc(0);
   private inputBytes = 0;
   private outputBytes = 0;
-  private pending?: { seq: number; terminal: boolean; timer: ReturnType<typeof setTimeout>;
+  private pending?: { seq: number; terminal: boolean; sessionId: string; timer?: ReturnType<typeof setTimeout>;
     resolve: (value: Record<string, any>) => void; reject: (error: Error) => void };
   private constructor(private readonly store: Store, private readonly plugin: string,
     readonly operationId: string, profile: PinnedPublicationResidentSource,
@@ -236,7 +246,7 @@ export class RestrictedPublicationResidentSource {
       const value = JSON.parse(row.payload) as Record<string, unknown>;
       if (value.schema === 'publication-original-owner-listener/v1' &&
           (value.runtimeDirectory === profile.runtimeDirectory || value.runtimeDirectory === undefined) &&
-          ['UNKNOWN', 'ROTATING_UNKNOWN', 'CUTOVER_HELD'].includes(String(value.state)))
+          ['UNKNOWN', 'ROTATING_UNKNOWN', 'CUTOVER_HELD', 'PARKING_UNKNOWN', 'OBSERVING', 'RESUMING_UNKNOWN'].includes(String(value.state)))
         fail('PRIOR_POLICY_CUTOVER_UNKNOWN');
       if ((value.schema === 'publication-original-policy-cutover/v1' ||
            value.schema === 'publication-managed-prepared-install/v1') && value.state !== 'COMMITTED')
@@ -274,7 +284,7 @@ export class RestrictedPublicationResidentSource {
               value.schema === 'publication-managed-prepared-install/v1') && value.state !== 'COMMITTED') ||
             (value.schema === 'publication-original-owner-listener/v1' &&
               (value.runtimeDirectory === profile.runtimeDirectory || value.runtimeDirectory === undefined) &&
-              ['UNKNOWN', 'ROTATING_UNKNOWN', 'CUTOVER_HELD'].includes(String(value.state))))
+              ['UNKNOWN', 'ROTATING_UNKNOWN', 'CUTOVER_HELD', 'PARKING_UNKNOWN', 'OBSERVING', 'RESUMING_UNKNOWN'].includes(String(value.state))))
           fail('PRIOR_POLICY_CUTOVER_UNKNOWN');
       }
       if (!await store.compareAndSwapConsumerGuardReceipt(plugin, expected.accountId, self.key,
@@ -346,8 +356,15 @@ export class RestrictedPublicationResidentSource {
     this.assertCurrent();
   }
   assertCurrent() {
-    if (this.retainedCutover || this.closed || this.childClosed || performance.now() - this.started >= TTL ||
+    if (this.sessionPhase !== 'ACTIVE' || this.retainedCutover || this.closed || this.childClosed || this.responseEOF ||
+        performance.now() - this.started >= TTL ||
         canonical(binding(this.currentBinding())) !== canonical(this.expected)) fail('CLOSED');
+  }
+  /** Epoch metadata can invalidate Main seals while parked. It is never a
+   * lease, and reading it does not make an old peer receipt current again. */
+  continuityEpoch() {
+    if (!owners.has(this)) fail('PRIVATE_SOURCE_REQUIRED');
+    return this.epoch;
   }
   assertPeerRevision(peerId: string, revision: number) {
     this.assertCurrent();
@@ -374,7 +391,10 @@ export class RestrictedPublicationResidentSource {
     if (!input || !('read' in input)) fail('TRANSPORT');
     this.output();
     input.on('data', (chunk: Buffer) => this.receive(chunk));
-    input.once('end', () => { this.responseEOF = true; });
+    input.once('end', () => {
+      this.responseEOF = true;
+      if (!this.closed && !(this.terminalExpected && this.terminalFrameReceived)) this.rejectPending('RESPONSE_EOF_UNKNOWN');
+    });
     input.once('error', () => this.rejectPending('RESPONSE_STREAM_FAILED'));
     input.once('close', () => {
       if (!this.closed && !this.responseEOF) this.rejectPending('RESPONSE_EOF_UNKNOWN');
@@ -389,6 +409,12 @@ export class RestrictedPublicationResidentSource {
   }
   private receive(chunk: Buffer) {
     try {
+      if (!this.pending) fail('UNEXPECTED_FRAME');
+      // A parked observation may await its first byte for the original job's
+      // duration. Once a reply starts, partial frames get one fixed deadline;
+      // trickling more bytes must not keep the held channel alive indefinitely.
+      if (this.pending.timer === undefined)
+        this.pending.timer = setTimeout(() => this.rejectPending('TIMEOUT'), OBSERVATION_FRAME_TTL);
       this.inputBytes += chunk.length;
       if (this.inputBytes > TOTAL) fail('FRAME_LIMIT');
       this.buffer = Buffer.concat([this.buffer, chunk]);
@@ -399,7 +425,7 @@ export class RestrictedPublicationResidentSource {
       this.buffer = Buffer.alloc(0);
       exact(frame, 'schema,sessionId,operationId,binding,seq,nextNonce,ok,code,result');
       const p = this.pending;
-      if (frame.schema !== SCHEMA || frame.sessionId !== this.sessionId || frame.operationId !== this.operationId ||
+      if (frame.schema !== SCHEMA || frame.sessionId !== p.sessionId || frame.operationId !== this.operationId ||
           canonical(frame.binding) !== canonical(this.expected) || frame.seq !== p.seq ||
           frame.ok !== true || frame.code !== null ||
           (p.terminal ? frame.nextNonce !== null : !hash(frame.nextNonce)) ||
@@ -412,16 +438,18 @@ export class RestrictedPublicationResidentSource {
       p.resolve(frame.result);
     } catch { this.rejectPending('FRAME_INVALID'); }
   }
-  private async exchange(frame: Record<string, unknown>, seq: number, terminal = false) {
-    if (!terminal) this.assertCurrent();
+  private async exchange(frame: Record<string, unknown>, seq: number, terminal = false,
+    observation?: { wait: boolean; sessionId: string }) {
+    if (observation) this.assertObservationContinuity();
+    else if (!terminal) this.assertCurrent();
     else if (!this.retainedCutover || this.closed || this.childClosed || performance.now() - this.started >= TTL)
       fail('CUTOVER_CLOSED');
     if (this.pending || seq > 128) fail('SEQUENCE');
     const bytes = Buffer.from(canonical(frame) + '\n');
     if (bytes.length > FRAME || (this.outputBytes += bytes.length) > TOTAL) fail('FRAME_LIMIT');
     return new Promise<Record<string, any>>((resolve, reject) => {
-      const timer = setTimeout(() => this.rejectPending('TIMEOUT'), 10000);
-      this.pending = { seq, terminal, resolve, reject, timer };
+      const timer = observation?.wait ? undefined : setTimeout(() => this.rejectPending('TIMEOUT'), 10000);
+      this.pending = { seq, terminal, sessionId: observation?.sessionId ?? this.sessionId, resolve, reject, timer };
       this.output().write(bytes, error => { if (error) this.rejectPending('WRITE_FAILED'); });
     });
   }
@@ -438,12 +466,14 @@ export class RestrictedPublicationResidentSource {
     await this.verifyPins();
     return result;
   }
-  private listenerResult(value: Record<string, any>) {
+  private listenerResult(value: Record<string, any>, state = 'LISTENING', continued = false) {
     exact(value, 'state,processId,runtimeDirectory,sourceRoot,sourceDigest,peerCount,policyRevision,policySha256');
     if (value.processId !== this.child!.pid || value.runtimeDirectory !== this.profile.runtimeDirectory ||
         value.sourceRoot !== this.profile.root || value.sourceDigest !== this.profile.sourceDigest ||
         !count(value.peerCount) || value.peerCount > 64 || !count(value.policyRevision) ||
-        !hash(value.policySha256) || value.state !== 'LISTENING') fail('LISTENER_BINDING');
+        !hash(value.policySha256) || value.state !== state ||
+        (continued && (value.policyRevision !== this.policyRevision || value.policySha256 !== this.policySha256 ||
+          value.peerCount !== this.ledger.peers.length))) fail('LISTENER_BINDING');
     this.policyRevision = value.policyRevision;
     this.policySha256 = value.policySha256;
   }
@@ -538,6 +568,7 @@ export class RestrictedPublicationResidentSource {
   }
   async acceptOriginal() {
     return this.exclusive(async () => {
+      if (this.epoch !== 0 || this.retainedObservation) fail('OBSERVATION_NEW_PEER_DENIED');
       const { descriptor, observed } = this.peerResult(await this.request('accept', {}));
       if (observed.observation.state !== 'CONNECTED' || this.ledger.peers.some(x =>
           x.instanceId === observed.instanceId || x.peerId === observed.peerId || x.identity === digest(observed.process)))
@@ -590,6 +621,161 @@ export class RestrictedPublicationResidentSource {
   async pollCI(handle: object) { return this.ciExchange(handle, 'ci-poll'); }
   async admitCIEffect(handle: object, permit: object) { return this.ciExchange(handle, 'effect-admit', permit); }
   async acknowledgeCIEffect(handle: object, permit: object) { return this.ciExchange(handle, 'effect-ack', permit); }
+  private assertObservationContinuity() {
+    if (this.sessionPhase !== 'PARKED' || this.closed || this.childClosed || this.responseEOF ||
+        !this.child || !this.retainedObservation || this.retainedCutover ||
+        canonical(binding(this.currentBinding())) !== canonical(this.expected)) fail('OBSERVATION_CLOSED');
+  }
+  private observationRecord(handle: object) {
+    this.assertObservationContinuity();
+    const retained = observations.get(handle);
+    if (!retained || retained.owner !== this || this.retainedObservation !== handle || retained.consumed ||
+        !['OBSERVING', 'RESUMING_UNKNOWN'].includes(this.ledger.state)) fail('PRIVATE_OBSERVATION_REQUIRED');
+    return retained;
+  }
+  private async verifyObservationRecord(retained: RetainedObservation) {
+    this.assertObservationContinuity();
+    await this.verifyPinnedFiles();
+    if (canonical(this.row) !== canonical(retained.row) ||
+        canonical(await this.store.readConsumerGuardReceipt(this.plugin, this.expected.accountId, this.key)) !==
+          canonical(retained.row)) fail('OBSERVATION_LEDGER_CHANGED');
+    for (const checkpoint of retained.checkpoints) await verifyOriginalCIObservationCheckpoint(checkpoint, this);
+    this.assertObservationContinuity();
+  }
+  private async saveObservation() {
+    this.assertObservationContinuity();
+    const history = await this.store.capturePublicationOwnerHistory(this.plugin, this.expected.accountId);
+    if (!this.row || !await this.store.compareAndSwapConsumerGuardReceipt(this.plugin, this.expected.accountId,
+        this.key, this.row, this.payload(), false, history)) fail('LEDGER_CHANGED');
+    const expected = { revision: this.row.revision + 1, payload: this.payload() };
+    if (canonical(await this.store.readConsumerGuardReceipt(this.plugin, this.expected.accountId, this.key)) !==
+        canonical(expected)) fail('LEDGER_CHANGED');
+    this.row = expected;
+    this.assertObservationContinuity();
+  }
+  private async observationRequest(method: 'observe-wait' | 'observe-resume', args: Record<string, unknown>,
+    responseSession = this.sessionId) {
+    this.assertObservationContinuity();
+    await this.verifyPinnedFiles();
+    this.assertObservationContinuity();
+    const result = await this.exchange({ schema: SCHEMA, sessionId: this.sessionId, operationId: this.operationId,
+      binding: this.expected, seq: this.sequence + 1, nonce: this.nextNonce, method, args }, this.sequence + 1,
+    false, { wait: method === 'observe-wait', sessionId: responseSession });
+    await this.verifyPinnedFiles();
+    this.assertObservationContinuity();
+    return result;
+  }
+  /** End the first effect session once, while it is still current. The held
+   * listener and original peers survive only as an observation chain. No old
+   * receipt, permit, nonce or deadline authorizes an effect while parked. */
+  async parkForObservation(checkpoints: readonly object[] = []) {
+    return this.exclusive(async () => {
+      if (this.epoch !== 0 || this.retainedObservation || this.ledger.state !== 'OPEN' ||
+          this.ledger.peers.length !== this.profile.owners.length || !Array.isArray(checkpoints)) fail('OBSERVATION_PHASE');
+      const approved = new Map<string, OriginalPublicationPeerObservation>();
+      for (const checkpoint of checkpoints) {
+        const original = await consumeOriginalCIObservationCheckpoint(checkpoint, this);
+        if (approved.has(original.peerId)) fail('OBSERVATION_CHECKPOINT_REUSED');
+        approved.set(original.peerId, original);
+      }
+      const peers = new Map<string, OriginalPublicationPeerObservation>();
+      for (const peer of this.ledger.peers) {
+        const observed = peer.observation, value = observed.observation;
+        if (peer.phase !== value.state || value.unknownOperations !== 0 || !hash(value.loadedNonce) ||
+            value.nativeWithoutMain !== 'DENIED') fail('OBSERVATION_PHASE');
+        if (value.state === 'RUNNING') {
+          if (observed.sourceScope !== 'REGISTERED_CI_PRODUCER' ||
+              observed.ownerId !== 'core-jit.bridge-jit-controller' || value.activeOperations !== 1 ||
+              value.ciEffect?.state !== 'ACKNOWLEDGED' || value.ciEffect.descriptor.kind !== 'jit-register-start' ||
+              canonical(approved.get(peer.peerId)) !== canonical(observed)) fail('OBSERVATION_PHASE');
+          approved.delete(peer.peerId);
+        } else if (!['LOADED', 'FINISHED', 'FENCED', 'DRAINED', 'RETIRED'].includes(value.state) ||
+            value.activeOperations !== 0 || (value.ciEffect !== undefined && value.ciEffect !== null &&
+              value.ciEffect.state !== 'ACKNOWLEDGED')) fail('OBSERVATION_PHASE');
+        peers.set(peer.peerId, structuredClone(observed));
+      }
+      if (approved.size) fail('OBSERVATION_CHECKPOINT_UNUSED');
+      this.ledger.state = 'PARKING_UNKNOWN';
+      await this.save();
+      this.listenerResult(await this.request('observe-park', {}), 'PARKED', true);
+      // Clearing a completed session's timer does not extend it: every effect
+      // entry now rejects, and the next phase needs a fresh private handshake.
+      this.sessionPhase = 'PARKED'; this.epoch++;
+      for (const peer of this.ledger.peers) peer.revision++;
+      if (this.deadline) clearTimeout(this.deadline);
+      this.deadline = undefined;
+      const handle = this.retainedObservation = Object.freeze(Object.create(null)) as object;
+      this.ledger.state = 'OBSERVING';
+      await this.saveObservation();
+      observations.set(handle, { owner: this, row: structuredClone(this.row!), peers,
+        checkpoints: [...checkpoints], waiting: false, ready: false, consumed: false });
+      return handle;
+    });
+  }
+  /** At most one blocking wake per actual active CI peer. Long observation
+   * sends no polls, effects or refreshes, and retains the lifetime frame budget. */
+  async waitForObservation(handle: object) {
+    const retained = this.observationRecord(handle);
+    if (this.busy || retained.waiting || retained.ready) fail('OBSERVATION_WAIT_CONSUMED');
+    retained.waiting = true; this.busy = true;
+    try {
+      await this.verifyObservationRecord(retained);
+      for (const [peerId, previous] of retained.peers) {
+        if (previous.observation.state !== 'RUNNING') continue;
+        const peer = this.ledger.peers.find(x => x.peerId === peerId)!;
+        const observed = this.peerResult(await this.observationRequest('observe-wait', { peerId }), peer).observed;
+        const stable = (value: OriginalPublicationPeerObservation) => ({ ...value,
+          observation: { ...value.observation, probe: null } });
+        if (canonical(stable(observed)) !== canonical(stable(previous))) fail('OBSERVATION_PEER_CHANGED');
+        await this.verifyObservationRecord(retained);
+      }
+      retained.ready = true;
+    } catch (error) { await this.terminate('UNKNOWN'); throw error; }
+    finally { this.busy = false; }
+  }
+  /** A second and final short session on the same physical chain. Old peers
+   * remain the same objects/processes; only the live challenge becomes fresh.
+   * RETIRED peers remain historical terminal facts, independently rechecked by
+   * the original listener, and can never become live/effect capabilities. */
+  async resumeAfterObservation(handle: object): Promise<ReadonlyMap<string, object>> {
+    const retained = this.observationRecord(handle);
+    if (this.busy || !retained.ready || !retained.waiting) fail('OBSERVATION_NOT_READY');
+    this.busy = true;
+    try {
+      await this.verifyObservationRecord(retained);
+      this.ledger.state = 'RESUMING_UNKNOWN';
+      await this.saveObservation();
+      retained.row = structuredClone(this.row!);
+      await this.verifyObservationRecord(retained);
+      const sessionId = randomBytes(32).toString('hex'), started = performance.now();
+      if (sessionId === this.sessionId) fail('OBSERVATION_SESSION_REUSED');
+      const result = await this.observationRequest('observe-resume', { sessionId, expiresAt: Date.now() + TTL - 1000 }, sessionId);
+      this.listenerResult(result, 'LISTENING', true);
+      this.sessionId = sessionId; this.started = started; this.sessionPhase = 'ACTIVE';
+      this.deadline = setTimeout(() => { void this.terminate('UNKNOWN'); }, Math.max(1, TTL - (performance.now() - started)));
+      retained.consumed = true;
+      for (const peer of this.ledger.peers) {
+        const previous = retained.peers.get(peer.peerId)!;
+        const observed = this.peerResult(await this.request('current', { peerId: peer.peerId }), peer).observed;
+        const before = previous.observation, after = observed.observation;
+        const nextCleanup = before.state === 'RUNNING' && before.ciEffect?.state === 'ACKNOWLEDGED' &&
+          before.ciEffect.descriptor.kind === 'jit-register-start' && after.ciEffect?.state === 'REQUESTED' &&
+          after.ciEffect.sequence === before.ciEffect.sequence + 1 && after.ciEffect.descriptor.kind === 'jit-cleanup' &&
+          canonical(after.ciEffect.descriptor.identity) === canonical(before.ciEffect.descriptor.identity);
+        const stable = (value: OriginalPublicationPeerObservation) => ({ ...value, observation: {
+          ...value.observation, loadedNonce: null, probe: null,
+          ...(value.sourceScope === 'REGISTERED_CI_PRODUCER' ? { ciEffect: null } : {}) } });
+        if (canonical(stable(observed)) !== canonical(stable(previous)) ||
+            (before.state === 'RETIRED' ? after.loadedNonce !== before.loadedNonce : after.loadedNonce === before.loadedNonce) ||
+            (!nextCleanup && canonical(after.ciEffect) !== canonical(before.ciEffect))) fail('OBSERVATION_PEER_CHANGED');
+        peer.observation = observed; peer.phase = after.state; peer.revision++;
+      }
+      this.ledger.state = 'OPEN';
+      await this.save();
+      return new Map(this.ledger.peers.map(peer => [peer.instanceId, this.receipt(peer)]));
+    } catch (error) { await this.terminate('UNKNOWN'); throw error; }
+    finally { this.busy = false; }
+  }
   private async ciExchange(handle: object, method: 'ci-prepare' | 'ci-poll' | 'effect-admit' | 'effect-ack', permit?: object) {
     return this.exclusive(async () => {
       const previous = readOriginalPublicationPeerReceipt(handle, this);
@@ -876,8 +1062,10 @@ export class RestrictedPublicationResidentSource {
         if (!exited && this.child && !this.childClosed) { this.child.kill('SIGKILL'); await this.childExit; }
       }
       if (this.row) {
-        const next = { ...this.ledger, state: ['UNKNOWN', 'ROTATING_UNKNOWN', 'CUTOVER_HELD'].includes(this.ledger.state)
-          ? 'UNKNOWN' as const : state };
+        const observationUnknown = ['PARKING_UNKNOWN', 'OBSERVING', 'RESUMING_UNKNOWN'].includes(this.ledger.state) ||
+          (this.retainedObservation !== undefined && this.ledger.peers.some(peer => peer.phase !== 'RETIRED'));
+        const next = { ...this.ledger, state: observationUnknown ? 'PARKING_UNKNOWN' as const :
+          ['UNKNOWN', 'ROTATING_UNKNOWN', 'CUTOVER_HELD'].includes(this.ledger.state) ? 'UNKNOWN' as const : state };
         try {
           if (await this.store.compareAndSwapConsumerGuardReceipt(this.plugin, this.expected.accountId,
               this.key, this.row, this.payload(next))) this.ledger = next;

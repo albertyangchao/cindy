@@ -11,7 +11,8 @@ import type { DbClient } from '../../localDb/client/DbClient.js';
 import { createRestrictedPartnerStore } from '../restrictedPartnerStore.js';
 import { canonical, digest } from '../restrictedPublicationProtocol.js';
 import { RestrictedPublicationResidentSource } from '../restrictedPublicationResidentSource.js';
-import { RestrictedPublicationCIProducer, consumeOriginalCIEffectPermit, originalCIEffectIdentity,
+import { RestrictedPublicationCIProducer, consumeOriginalCIEffectPermit, consumeOriginalCIObservationCheckpoint,
+  verifyOriginalCIObservationCheckpoint, originalCIEffectIdentity,
   originalCIEffectTarget, originalCIEffectPlanIdentity, matchesOriginalCIEffectPlan,
   validateOriginalCIEffect, type OriginalCIEffectDescriptor } from '../restrictedPublicationCIProducer.js';
 
@@ -75,6 +76,8 @@ it('caller JSON and class prototypes cannot create a runner owner or effect perm
   for (const handle of [{}, { state: 'DISPATCHING_UNKNOWN', admissionId: digest('forged') }]) {
     await expect(consumeOriginalCIEffectPermit(handle, source, {} as never, 'admit')).rejects.toThrow('PRIVATE_PERMIT_REQUIRED');
     await expect(consumeOriginalCIEffectPermit(handle, source, {} as never, 'ack')).rejects.toThrow('PRIVATE_PERMIT_REQUIRED');
+    await expect(consumeOriginalCIObservationCheckpoint(handle, source)).rejects.toThrow('PRIVATE_OBSERVATION_CHECKPOINT_REQUIRED');
+    await expect(verifyOriginalCIObservationCheckpoint(handle, source)).rejects.toThrow('PRIVATE_OBSERVATION_CHECKPOINT_REQUIRED');
   }
 });
 

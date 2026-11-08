@@ -94,12 +94,15 @@ type StoredMember = Member & { generation: string; sourceId: string; authorityId
     checkRunId: number; head: string; workflowSha256: string; operationNonce: string } };
 type Ledger = { schema: 'publication-original-owner-registry/v1'; operationId: string;
   binding: PublicationSourceBinding; profileSha256: string;
-  state: 'ENROLLING' | 'SEALED' | 'RETIRING' | 'RETIRED' | 'UNKNOWN' | 'REVOKED';
+  state: 'ENROLLING' | 'OBSERVING' | 'SEALED' | 'RETIRING' | 'RETIRED' | 'UNKNOWN' | 'REVOKED';
   members: StoredMember[]; namespaceIds: string[]; nonPublisherLabels: string[] };
 type Row = Awaited<ReturnType<Store['readConsumerGuardReceipt']>>;
 type HeldPeer = { source: RestrictedPublicationResidentSource; handle: object; value: OriginalPublicationPeerObservation };
 const registries = new WeakSet<object>();
-const seals = new WeakMap<object, { registry: RestrictedPublicationOwnerRegistry; revision: number; ci: boolean }>();
+const seals = new WeakMap<object, { registry: RestrictedPublicationOwnerRegistry; revision: number;
+  epoch: number; sources: ReadonlyMap<RestrictedPublicationResidentSource, number>; ci: boolean }>();
+const observations = new WeakMap<object, { registry: RestrictedPublicationOwnerRegistry;
+  sources: ReadonlyMap<RestrictedPublicationResidentSource, number>; consumed: boolean }>();
 const retirements = new WeakMap<object, { registry: RestrictedPublicationOwnerRegistry;
   row: NonNullable<Row>; consumed: boolean;
   cutovers?: Array<{ source: RestrictedPublicationResidentSource; handle: object }> }>();
@@ -123,7 +126,7 @@ export function isOriginalPublicationRegistry(value: unknown): value is Restrict
 export function readOriginalPublicationRegistrySeal(handle: object, registry: RestrictedPublicationOwnerRegistry) {
   const value = seals.get(handle);
   if (!value || value.registry !== registry || !registries.has(registry)) fail('PRIVATE_SEAL_REQUIRED');
-  registry.assertRevision(value.revision);
+  registry.assertRevision(value.revision, value.epoch, value.sources);
   return { nonCIComplete: true as const, ciComplete: value.ci };
 }
 
@@ -150,6 +153,9 @@ export class RestrictedPublicationOwnerRegistry {
   private busy = false;
   private unsubscribe?: () => void;
   private retirementPrepared = false;
+  private phaseEpoch = 0;
+  private observing = false;
+  private observationUsed = false;
   private ciBinding?: { broker: RestrictedPublicationCISourceBroker; ci: object; inventoryHandle: object;
     value: Record<string, any>; inventory: Record<string, any> };
   private constructor(private readonly store: Store, private readonly plugin: string,
@@ -194,15 +200,24 @@ export class RestrictedPublicationOwnerRegistry {
     if (!self.row || self.row.revision !== 1 || self.row.payload !== canonical(self.ledger)) fail('LEDGER_CHANGED');
     return self;
   }
-  assertCurrent() {
+  private assertOwner() {
     if (this.closed) fail('CLOSED');
     const value = readManagedLifecycleReceipt(this.lifecycleHandle, this.controller);
     if (canonical(value.binding) !== canonical(this.lifecycle.binding) || value.operationId !== this.operationId)
       fail('BINDING');
   }
-  assertRevision(revision: number) {
+  assertCurrent() {
+    this.assertOwner();
+    if (this.observing) fail('OBSERVATION_PHASE');
+  }
+  assertRevision(revision: number, epoch: number, sources: ReadonlyMap<RestrictedPublicationResidentSource, number>) {
     this.assertCurrent();
-    if (!this.row || this.row.revision !== revision || !['ENROLLING', 'SEALED'].includes(this.ledger.state)) fail('STALE_SEAL');
+    if (!this.row || this.row.revision !== revision || epoch !== this.phaseEpoch ||
+        !['ENROLLING', 'SEALED'].includes(this.ledger.state)) fail('STALE_SEAL');
+    for (const [source, expected] of sources) {
+      source.assertCurrent();
+      if (source.continuityEpoch() !== expected) fail('STALE_SEAL');
+    }
   }
   binding() { this.assertCurrent(); return structuredClone(this.lifecycle.binding); }
   profileSha256() { return digest(this.profile); }
@@ -216,8 +231,8 @@ export class RestrictedPublicationOwnerRegistry {
     if (!source) fail('SOURCE_REQUIRED');
     return source;
   }
-  private async save(drained = false) {
-    this.assertCurrent();
+  private async save(drained = false, observationTransition = false) {
+    if (observationTransition) this.assertOwner(); else this.assertCurrent();
     const account = this.lifecycle.binding.accountId;
     const history = await this.store.capturePublicationOwnerHistory(this.plugin, account);
     if (!this.row || !await this.store.compareAndSwapConsumerGuardReceipt(this.plugin, account, this.key,
@@ -227,7 +242,7 @@ export class RestrictedPublicationOwnerRegistry {
     if (!actual || canonical(actual) !== canonical(next)) fail('LEDGER_CHANGED');
     this.row = actual;
     this.history = undefined;
-    this.assertCurrent();
+    if (observationTransition) this.assertOwner(); else this.assertCurrent();
   }
   async bindManaged(instanceId: string, handle: object) {
     this.assertCurrent();
@@ -444,6 +459,79 @@ export class RestrictedPublicationOwnerRegistry {
     }
     this.assertCurrent();
   }
+  private originalSourceEpochs() {
+    return new Map([...this.peers.values(), ...this.namespacePeers.values(), ...this.nonPublisherPeers.values()]
+      .map(held => [held.source, held.source.continuityEpoch()] as const));
+  }
+  /** Invalidate every old seal before Main parks its actual original listeners.
+   * This is a private continuity checkpoint, never an absence/drain certificate. */
+  async beginObservation(): Promise<object> {
+    this.assertCurrent();
+    if (this.busy || this.observationUsed || this.ledger.state !== 'ENROLLING' || this.ciBinding ||
+        this.retirementPrepared) fail('OBSERVATION_STATE');
+    this.busy = true;
+    try {
+      await this.verifyActualSources();
+      const sources = this.originalSourceEpochs();
+      this.observationUsed = true;
+      this.observing = true;
+      this.phaseEpoch++;
+      this.ledger.state = 'OBSERVING';
+      await this.save(false, true);
+      const handle = Object.freeze(Object.create(null)) as object;
+      observations.set(handle, { registry: this, sources, consumed: false });
+      return handle;
+    } catch (error) { await this.revoke('UNKNOWN'); throw error; }
+    finally { this.busy = false; }
+  }
+  /** Only fresh receipts from the same original sources may replace the held
+   * peers. Process/start identity, pins, disposition and counters stay exact. */
+  async finishObservation(handle: object,
+    refreshed: ReadonlyMap<RestrictedPublicationResidentSource, ReadonlyMap<string, object>>): Promise<void> {
+    this.assertOwner();
+    const retained = observations.get(handle);
+    if (!retained || retained.registry !== this || retained.consumed || !this.observing ||
+        this.ledger.state !== 'OBSERVING' || this.busy) fail('PRIVATE_OBSERVATION_REQUIRED');
+    retained.consumed = true;
+    this.busy = true;
+    try {
+      for (const [source, epoch] of retained.sources) {
+        source.assertCurrent();
+        if (source.continuityEpoch() === epoch || !refreshed.has(source)) fail('ORIGINAL_SOURCE_NOT_RESUMED');
+      }
+      for (const held of [...this.peers.values(), ...this.namespacePeers.values(), ...this.nonPublisherPeers.values()]) {
+        const current = refreshed.get(held.source)?.get(held.value.instanceId);
+        if (!current) fail('ORIGINAL_SOURCE_REQUIRED');
+        const value = readOriginalPublicationPeerReceipt(current, held.source);
+        const old = held.value;
+        const withoutChallenge = (peer: OriginalPublicationPeerObservation) =>
+          ({ ...peer, observation: { ...peer.observation, loadedNonce: null, probe: null } });
+        if (canonical(withoutChallenge(value)) !== canonical(withoutChallenge(old)) ||
+            !hex(value.observation.loadedNonce) ||
+            (old.observation.state === 'RETIRED' ? value.observation.loadedNonce !== old.observation.loadedNonce :
+              value.observation.loadedNonce === old.observation.loadedNonce)) fail('ORIGINAL_SOURCE_CHANGED');
+        // A retired PID remains a rechecked termination fact. It is never
+        // represented as a new loaded process or granted any new effect.
+        held.handle = current; held.value = value;
+        const member = this.ledger.members.find(x => x.instanceId === value.instanceId);
+        if (member && member.evidenceKind === 'original-peer' && old.observation.state !== 'RETIRED') {
+          if (member.peerId !== value.peerId || member.processIdentity !== digest(value.process)) fail('ORIGINAL_SOURCE_CHANGED');
+          member.loadedNonce = value.observation.loadedNonce;
+          member.originalReceiptId = digest(['original-peer', held.source.operationId, value]);
+        }
+      }
+      await this.controller.verifyLifecycleReceipt(this.lifecycleHandle);
+      this.ledger.state = 'ENROLLING';
+      await this.save(false, true);
+      this.observing = false;
+      this.phaseEpoch++;
+      await this.verifyActualSources();
+      // History is reacquired from its actual SQL owner; no old seal or frozen
+      // census is promoted across the unauthorised observation interval.
+      await this.captureHistory();
+    } catch (error) { await this.revoke('UNKNOWN'); throw error; }
+    finally { this.busy = false; }
+  }
   /** Close only genuinely held original invocations. Main must first close its
    * business admission lease. No process is declared retired from OS absence,
    * a terminal GitHub status, or a requested profile disposition. */
@@ -593,7 +681,8 @@ export class RestrictedPublicationOwnerRegistry {
     if (await this.store.unresolvedConsumerGuardAdmissions(this.plugin, this.lifecycle.binding.accountId) !== 0 ||
         await this.store.unknownNativePublicationEffects(this.plugin) !== 0) fail('FENCE_UNRESOLVED');
     const seal = Object.freeze(Object.create(null)) as object;
-    seals.set(seal, { registry: this, revision: this.row!.revision, ci: !!this.ciBinding });
+    seals.set(seal, { registry: this, revision: this.row!.revision, epoch: this.phaseEpoch,
+      sources: this.originalSourceEpochs(), ci: !!this.ciBinding });
     return seal;
   }
   async seal() {
@@ -619,7 +708,8 @@ export class RestrictedPublicationOwnerRegistry {
           this.lifecycle.binding.generation, records, nonPublishers) });
     }
     const handle = Object.freeze(Object.create(null)) as object;
-    seals.set(handle, { registry: this, revision: this.row!.revision, ci: true });
+    seals.set(handle, { registry: this, revision: this.row!.revision, epoch: this.phaseEpoch,
+      sources: this.originalSourceEpochs(), ci: true });
     return handle;
   }
   private base(schema: string) {

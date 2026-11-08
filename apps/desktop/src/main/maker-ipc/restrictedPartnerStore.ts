@@ -68,8 +68,12 @@ export function createRestrictedPartnerStore(db: DbClient, assertOwner: () => vo
     eq(table.operation, 'target'),
     eq(table.pluginId, pluginId),
     sql`${table.targetId} LIKE ${`publication-coverage:${accountScopeRef}:%`}`,
-    sql`json_extract(${table.payload}, '$.schema') IN ('publication-coverage-admission/v1', 'publication-managed-job/v1', 'publication-ci-runner-effect/v1')`,
-    sql`coalesce(json_extract(${table.payload}, '$.state'), 'UNKNOWN') <> 'COMPLETE'`,
+    sql`((json_extract(${table.payload}, '$.schema') IN ('publication-coverage-admission/v1', 'publication-managed-job/v1', 'publication-ci-runner-effect/v1')
+      AND coalesce(json_extract(${table.payload}, '$.state'), 'UNKNOWN') <> 'COMPLETE')
+      OR (json_extract(${table.payload}, '$.schema') = 'publication-original-owner-listener/v1'
+        AND json_extract(${table.payload}, '$.state') IN ('PARKING_UNKNOWN', 'OBSERVING', 'RESUMING_UNKNOWN'))
+      OR (json_extract(${table.payload}, '$.schema') = 'publication-main-source-operation/v1'
+        AND json_extract(${table.payload}, '$.state') IN ('PARKING_UNKNOWN', 'PARKED', 'RESUMING_UNKNOWN')))`,
   );
   const ownerHistoryPredicate = (pluginId: string, accountScopeRef: string) => and(
     eq(table.pluginId, pluginId),

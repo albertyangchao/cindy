@@ -5,13 +5,14 @@
  * Real B/C/Python/gh-boundary integration is a separate exact-source gate, not
  * replaced by these preflight tests or a mock Python receipt factory.
  */
-import { afterEach, expect, it } from 'vitest';
+import { afterEach, expect, it, vi } from 'vitest';
 import Database from 'better-sqlite3';
 import { drizzle } from 'drizzle-orm/better-sqlite3';
 import { createHash } from 'node:crypto';
 import { mkdir, mkdtemp, realpath, rm, truncate, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { performance } from 'node:perf_hooks';
 import type { DbClient } from '../../localDb/client/DbClient.js';
 import { createRestrictedPartnerStore } from '../restrictedPartnerStore.js';
 import { digest } from '../restrictedPublicationProtocol.js';
@@ -23,7 +24,10 @@ import {
 } from '../restrictedPublicationCISourceBroker.js';
 
 const cleanup: Array<() => Promise<unknown>> = [];
-afterEach(async () => { for (const release of cleanup.splice(0).reverse()) await release(); });
+afterEach(async () => {
+  vi.restoreAllMocks();
+  for (const release of cleanup.splice(0).reverse()) await release();
+});
 async function fixture() {
   const dir = await realpath(await mkdtemp(path.join(tmpdir(), 'main-source-preflight-')));
   cleanup.push(() => rm(dir, { recursive: true, force: true }));
@@ -45,8 +49,68 @@ async function fixture() {
   const start = (op: string, value = expected) => RestrictedPublicationCISourceBroker.startOwned(
     store, 'plugin', op, profile, value, current,
   );
-  return { dir, db, store, expected, profile, start, revoke: () => { live = false; } };
+  return { dir, db, store, expected, profile, start, current, revoke: () => { live = false; } };
 }
+
+/** Pinned inert metadata only. None of these fixture bytes is executed or
+ * accepted as an original C/B source receipt. */
+async function preparedFixture() {
+  const f = await fixture();
+  const put = async (relative: string, data: string) => {
+    const target = path.join(f.dir, relative);
+    await mkdir(path.dirname(target), { recursive: true, mode: 0o700 });
+    await writeFile(target, data, { mode: 0o600 });
+    return createHash('sha256').update(data).digest('hex');
+  };
+  const files: Record<string, string> = {};
+  for (const name of ['scripts/publication_coverage_source_worker.py', 'scripts/__init__.py',
+    'bridge_core/__init__.py', 'bridge_core/worksheet_ci_guard_receipt.py'])
+    files[name] = await put(name, '# inert preparation fixture\n');
+  f.profile.files = files;
+  const executable = await put('not-executed', 'inert metadata executable\n');
+  f.profile.python.sha256 = executable; f.profile.gh.sha256 = executable;
+  const monitorSha256 = await put('monitor/publication_definition_receipts.py', '# inert C expectation\n');
+  const definition = { sourceRoot: f.dir, monitorRoot: f.dir, sourceFiles: files };
+  const profileSha256 = await put('definition.json', JSON.stringify(definition));
+  f.profile.definition = { monitorRoot: f.dir, monitorSha256,
+    profilePath: path.join(f.dir, 'definition.json'), profileSha256 };
+  const broker = await RestrictedPublicationCISourceBroker.prepareOwned(f.store, 'plugin', 'prepared-operation',
+    f.profile, f.expected, f.current);
+  cleanup.push(() => broker.revoke());
+  return { ...f, broker, definition };
+}
+
+it('prepares only pinned expectations without aging a lease or claiming a worker operation', async () => {
+  const f = await preparedFixture();
+  const now = performance.now();
+  vi.spyOn(performance, 'now').mockReturnValue(now + 600000);
+  expect(f.broker.preparedDefinitionExpectations()).toEqual(f.definition);
+  expect(() => f.broker.assertCurrent()).toThrow('ACTIVE_PHASE_REQUIRED');
+  expect(() => f.broker.definitionExpectations()).toThrow('ACTIVE_PHASE_REQUIRED');
+  await expect(f.broker.dispatchOriginalCI('a'.repeat(40), 'b'.repeat(64), () => {
+    throw Error('must not reach approval');
+  })).rejects.toThrow('ACTIVE_PHASE_REQUIRED');
+  expect(f.db.prepare('SELECT count(*) AS n FROM plugin_task_requests').get()).toEqual({ n: 0 });
+  expect(f.broker.diagnostics()).toMatchObject({ phase: 'PREPARED', state: 'OPENING', runId: null });
+});
+
+it('revalidates prepared bytes at activation and permanently consumes a changed-source operation', async () => {
+  const f = await preparedFixture();
+  await writeFile(path.join(f.dir, 'bridge_core/worksheet_ci_guard_receipt.py'), '# changed before activation\n');
+  await expect(f.broker.activatePrepared()).rejects.toThrow('SOURCE_CHANGED');
+  const key = digest(['publication-main-source-operation/v1', 'prepared-operation']);
+  const row = await f.store.readConsumerGuardReceipt('plugin', f.expected.accountId, key);
+  expect(JSON.parse(row!.payload).state).toBe('UNKNOWN');
+  await expect(f.broker.activatePrepared()).rejects.toThrow('CLOSED');
+  expect(await f.store.readConsumerGuardReceipt('plugin', f.expected.accountId, key)).toEqual(row);
+});
+
+it('revokes unused prepared expectations without manufacturing an operation record', async () => {
+  const f = await preparedFixture();
+  await f.broker.revoke();
+  expect(() => f.broker.preparedDefinitionExpectations()).toThrow('CLOSED');
+  expect(f.db.prepare('SELECT count(*) AS n FROM plugin_task_requests').get()).toEqual({ n: 0 });
+});
 
 it('failed source startup consumes the exact operation without changing old UNKNOWN records', async () => {
   const f = await fixture();

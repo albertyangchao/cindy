@@ -124,6 +124,37 @@ async function fixture() {
     },
   };
 }
+
+// These are actual account-SQLite drain predicates, not original source facts.
+// A completed start-effect ACK does not make its still-observed runner drained.
+it.each([
+  ['publication-original-owner-listener/v1', 'PARKING_UNKNOWN'],
+  ['publication-original-owner-listener/v1', 'OBSERVING'],
+  ['publication-original-owner-listener/v1', 'RESUMING_UNKNOWN'],
+  ['publication-main-source-operation/v1', 'PARKING_UNKNOWN'],
+  ['publication-main-source-operation/v1', 'PARKED'],
+  ['publication-main-source-operation/v1', 'RESUMING_UNKNOWN'],
+])('retains %s %s as an unresolved owner in the actual atomic drain CAS', async (schema, state) => {
+  const f = await fixture();
+  const ownerKey = sha(['observing-owner', schema, state]);
+  const completedKey = sha(['completed-start', schema, state]);
+  const markerKey = sha(['drain-marker', schema, state]);
+  await f.store.compareAndSwapConsumerGuardReceipt('plugin', f.account, ownerKey, undefined,
+    JSON.stringify({ schema, state }));
+  await f.store.compareAndSwapConsumerGuardReceipt('plugin', f.account, completedKey, undefined,
+    JSON.stringify({ schema: 'publication-ci-runner-effect/v1', state: 'COMPLETE' }));
+  await f.store.compareAndSwapConsumerGuardReceipt('plugin', f.account, markerKey, undefined,
+    JSON.stringify({ schema: 'publication-drain-negative-fixture/v1', state: 'OPEN' }));
+  const previous = await f.store.readConsumerGuardReceipt('plugin', f.account, markerKey);
+  const owner = await f.store.readConsumerGuardReceipt('plugin', f.account, ownerKey);
+  expect(await f.store.unresolvedConsumerGuardAdmissions('plugin', f.account)).toBe(1);
+  expect(await f.store.unresolvedConsumerGuardAdmissions('other-plugin', f.account)).toBe(0);
+  expect(await f.store.unresolvedConsumerGuardAdmissions('plugin', sha('another-account'))).toBe(0);
+  expect(await f.store.compareAndSwapConsumerGuardReceipt('plugin', f.account, markerKey, previous,
+    JSON.stringify({ schema: 'publication-drain-negative-fixture/v1', state: 'DRAINED' }), true)).toBe(false);
+  expect(await f.store.readConsumerGuardReceipt('plugin', f.account, markerKey)).toEqual(previous);
+  expect(await f.store.readConsumerGuardReceipt('plugin', f.account, ownerKey)).toEqual(owner);
+});
 function planned(f: Awaited<ReturnType<typeof fixture>>) {
   // Expected deployment metadata only. These files/definitions are not source
   // receipts, are never executed, and cannot satisfy original-source preflight.

@@ -84,10 +84,12 @@ type Ledger = {
   operationId: string;
   binding: PublicationSourceBinding;
   profileSha256: string;
-  state: 'OPENING' | 'OPEN' | 'DISPATCHING_UNKNOWN' | 'BOUND' | 'CURRENT' | 'UNKNOWN' | 'REVOKED';
+  state: 'OPENING' | 'OPEN' | 'DISPATCHING_UNKNOWN' | 'BOUND' | 'PARKING_UNKNOWN' | 'PARKED' |
+    'RESUMING_UNKNOWN' | 'CURRENT' | 'UNKNOWN' | 'REVOKED';
   runId: number | null;
   attempt: number | null;
   dispatchBinding?: { head: string; workflowSha256: string; operationNonce: string };
+  observationPhase?: { dispatchAckSha256: string; phaseNonce?: string };
   verifiedCI?: Record<string, any>;
 };
 type Pin = { file: string; sha256: string; maximum: number; identity: string };
@@ -117,7 +119,10 @@ async function pinnedBytes(file: string, expected: string, maximum: number) {
     return { data, identity: identity(before) };
   } finally { await fd.close(); }
 }
-const receipts = new WeakMap<object, { broker: RestrictedPublicationCISourceBroker; kind: 'ci' | 'ci-inventory' | 'definition'; value: Record<string, any> }>();
+const receipts = new WeakMap<object, { broker: RestrictedPublicationCISourceBroker; epoch: number;
+  kind: 'ci' | 'ci-inventory' | 'definition'; value: Record<string, any> }>();
+const observations = new WeakMap<object, { broker: RestrictedPublicationCISourceBroker;
+  dispatchAckSha256: string; terminal: boolean; consumed: boolean }>();
 const brokers = new WeakSet<object>();
 export function isRestrictedPublicationCISourceBroker(value: unknown): value is RestrictedPublicationCISourceBroker {
   return !!value && typeof value === 'object' && brokers.has(value);
@@ -125,7 +130,7 @@ export function isRestrictedPublicationCISourceBroker(value: unknown): value is 
 export function readPublicationSourceReceipt(handle: object, broker: RestrictedPublicationCISourceBroker) {
   const r = receipts.get(handle);
   if (!r || r.broker !== broker) fail('PRIVATE_RECEIPT_REQUIRED');
-  broker.assertCurrent();
+  broker.assertReceiptEpoch(r.epoch);
   return structuredClone(r.value);
 }
 
@@ -133,7 +138,12 @@ export class RestrictedPublicationCISourceBroker {
   private readonly profile: PinnedPublicationSourceWorker;
   private readonly expected: PublicationSourceBinding;
   private readonly nonce = randomBytes(32).toString('hex');
-  private readonly started = performance.now();
+  private phase: 'PREPARED' | 'ACTIVE' | 'PARKED' = 'PREPARED';
+  private lease?: Readonly<{ started: number; expires: number; nonce: string }>;
+  private receiptEpoch = 0;
+  private activated = false;
+  private captured = false;
+  private observationUsed = false;
   private readonly key: string;
   private row: Row;
   private ledger: Ledger;
@@ -171,6 +181,7 @@ export class RestrictedPublicationCISourceBroker {
   private lifecycleObserved = false;
   private missingDefinitionFact?: string;
   private auxiliary = new Map<ChildProcess, Promise<void>>();
+  private observationWait?: { timer: ReturnType<typeof setTimeout>; reject: (error: Error) => void };
   private constructor(
     private readonly store: Store,
     private readonly plugin: string,
@@ -193,20 +204,44 @@ export class RestrictedPublicationCISourceBroker {
     profile: PinnedPublicationSourceWorker, expected: PublicationSourceBinding,
     currentBinding: () => PublicationSourceBinding) {
     const self = new RestrictedPublicationCISourceBroker(store, plugin, operationId, profile, expected, currentBinding);
-    self.assertCurrent();
-    if (await store.readConsumerGuardReceipt(plugin, expected.accountId, self.key)) fail('OPERATION_ALREADY_CLAIMED');
-    if (!await store.compareAndSwapConsumerGuardReceipt(plugin, expected.accountId, self.key, undefined, JSON.stringify(self.ledger))) fail('OPERATION_ALREADY_CLAIMED');
+    await self.activatePrepared();
+    return self;
+  }
+  /** Pinned expectations only: no worker, operation claim, pending CI factory or lease.
+   * This lets Main enroll its real original sources before starting B's first short phase. */
+  static async prepareOwned(store: Store, plugin: string, operationId: string,
+    profile: PinnedPublicationSourceWorker, expected: PublicationSourceBinding,
+    currentBinding: () => PublicationSourceBinding) {
+    const self = new RestrictedPublicationCISourceBroker(store, plugin, operationId, profile, expected, currentBinding);
+    self.assertContinuity();
     try {
-      self.row = await store.readConsumerGuardReceipt(plugin, expected.accountId, self.key);
-      if (!self.row || self.row.revision !== 1 || self.row.payload !== JSON.stringify(self.ledger)) fail('LEDGER_CHANGED');
       await self.capturePins();
-      self.assertCurrent();
-      self.launch();
-      await self.request('init', {}, 10000);
-      await self.save('OPEN');
+      self.assertContinuity();
       return self;
+    } catch (error) { await self.revoke(); throw error; }
+  }
+  async activatePrepared(): Promise<void> {
+    this.assertContinuity();
+    if (this.activated || this.phase !== 'PREPARED') fail('OPERATION_ALREADY_CLAIMED');
+    this.activated = true;
+    const started = performance.now();
+    this.lease = Object.freeze({ started, expires: started + 60000, nonce: this.nonce });
+    this.phase = 'ACTIVE';
+    this.assertCurrent();
+    try {
+      if (await this.store.readConsumerGuardReceipt(this.plugin, this.expected.accountId, this.key)) fail('OPERATION_ALREADY_CLAIMED');
+      if (!await this.store.compareAndSwapConsumerGuardReceipt(this.plugin, this.expected.accountId, this.key,
+        undefined, JSON.stringify(this.ledger))) fail('OPERATION_ALREADY_CLAIMED');
+      this.row = await this.store.readConsumerGuardReceipt(this.plugin, this.expected.accountId, this.key);
+      if (!this.row || this.row.revision !== 1 || this.row.payload !== JSON.stringify(this.ledger)) fail('LEDGER_CHANGED');
+      if (this.captured) await this.verifyPins();
+      else await this.capturePins();
+      this.assertCurrent();
+      this.launch();
+      await this.request('init', {}, 10000);
+      await this.save('OPEN');
     } catch (error) {
-      await self.terminate('UNKNOWN');
+      await this.terminate('UNKNOWN');
       throw error;
     }
   }
@@ -256,9 +291,10 @@ export class RestrictedPublicationCISourceBroker {
       this.definitionHash = digest(profile);
       this.definitionProfile = structuredClone(profile) as unknown as OriginalPublicationRegistryProfile;
     }
+    this.captured = true;
   }
-  private async verifyPins() {
-    this.assertCurrent();
+  private async verifyPins(continuity = false) {
+    this.assertAvailable(continuity);
     for (const [p, expected] of this.directoryPins) {
       const d = await lstat(p);
       if (!d.isDirectory() || d.isSymbolicLink() || [d.dev, d.ino, d.mode].join(':') !== expected) fail('SOURCE_CHANGED');
@@ -267,16 +303,32 @@ export class RestrictedPublicationCISourceBroker {
       const read = await pinnedBytes(p.file, p.sha256, p.maximum);
       if (read.identity !== p.identity) fail('SOURCE_CHANGED');
     }
-    this.assertCurrent();
+    this.assertAvailable(continuity);
   }
-  assertCurrent() {
-    if (this.closed || performance.now() - this.started >= 60000) {
+  private assertContinuity() {
+    if (this.closed || (this.phase === 'ACTIVE' && (!this.lease || performance.now() >= this.lease.expires))) {
       this.failClosed(); fail('CLOSED');
     }
     try {
       if (canonical(binding(this.currentBinding())) !== canonical(this.expected)) fail('OWNER_CHANGED');
       if (this.childClosed) fail('CHILD_EXITED');
     } catch (error) { this.failClosed(); throw error; }
+  }
+  assertCurrent() {
+    this.assertContinuity();
+    if (this.phase !== 'ACTIVE') fail('ACTIVE_PHASE_REQUIRED');
+  }
+  assertReceiptEpoch(epoch: number) {
+    if (epoch !== this.receiptEpoch) fail('STALE_RECEIPT');
+    this.assertCurrent();
+  }
+  private assertAvailable(continuity: boolean) {
+    if (continuity) this.assertContinuity(); else this.assertCurrent();
+  }
+  private armDeadline() {
+    if (this.deadline) clearTimeout(this.deadline);
+    this.assertCurrent();
+    this.deadline = setTimeout(() => this.failClosed(), Math.max(1, this.lease!.expires - performance.now()));
   }
   matchesOwner(store: object, plugin: string, account: string, generation: string) {
     this.assertCurrent();
@@ -287,6 +339,11 @@ export class RestrictedPublicationCISourceBroker {
     this.closed = true;
     this.unsubscribeLifecycle?.(); this.unsubscribeLifecycle = undefined;
     if (this.deadline) clearTimeout(this.deadline);
+    if (this.observationWait) {
+      clearTimeout(this.observationWait.timer);
+      this.observationWait.reject(Error('PUBLICATION_SOURCE_CLOSED'));
+      this.observationWait = undefined;
+    }
     if (this.pending) {
       clearTimeout(this.pending.timer);
       this.pending.reject(Error('PUBLICATION_SOURCE_CLOSED'));
@@ -326,15 +383,17 @@ export class RestrictedPublicationCISourceBroker {
       (child.stdio[i] as Writable).on('error', () => this.failClosed());
     for (const i of [8, ...(p.definition ? [10] : [])])
       (child.stdio[i] as Readable).on('end', () => { if (!this.closed) this.failClosed(); });
-    this.deadline = setTimeout(() => this.failClosed(), Math.max(1, 60000 - (performance.now() - this.started)));
+    this.armDeadline();
   }
   private receive(fd: number, data: Buffer) {
     if (this.closed) return;
     try {
-      this.assertCurrent();
+      this.assertContinuity();
       this.totalInput += data.length;
       if (this.totalInput > TOTAL || (fd < 3 && data.length > 0)) fail('OUTPUT_LIMIT');
       if (fd < 3) return;
+      if (data.length && ((fd === 8 && !this.pending) || (fd === 10 && this.phase !== 'ACTIVE')))
+        fail('UNSOLICITED_FRAME');
       const old = this.buffers.get(fd) ?? Buffer.alloc(0);
       if (old.length + data.length > FRAME) fail('FRAME_LIMIT');
       const buffer = Buffer.concat([old, data]);
@@ -358,6 +417,7 @@ export class RestrictedPublicationCISourceBroker {
           typeof frame.ok !== 'boolean') fail('RESPONSE_BINDING');
       if (!frame.ok || frame.code !== null) fail('WORKER_DENIED');
       const states: Record<string, string[]> = { init: ['OPEN'], 'ci.begin': ['PENDING'], 'ci.bind': ['BOUND'],
+        'ci.park': ['PARKED'], 'ci.observe': ['PARKED', 'TERMINAL'], 'ci.resume': ['BOUND'],
         'ci.verify': ['VERIFYING'], 'ci.current': ['VERIFYING', 'CURRENT'], 'definition.begin': ['PENDING'],
         'definition.verify': ['VERIFYING'], 'definition.current': ['VERIFYING', 'CURRENT'],
         'ci.inventory.begin': ['PENDING'], 'ci.inventory.verify': ['VERIFYING'],
@@ -369,48 +429,52 @@ export class RestrictedPublicationCISourceBroker {
     } catch { this.failClosed(); }
   }
   private async request(command: string, payload: Record<string, unknown>, timeout = 30000) {
-    this.assertCurrent();
+    const continuity = command === 'ci.observe' || command === 'ci.resume';
+    this.assertAvailable(continuity);
+    if (continuity && this.phase !== 'PARKED') fail('OBSERVATION_PHASE_REQUIRED');
     if (this.pending || this.sequence >= 512) fail('REQUEST_STATE');
-    await this.verifyPins();
-    await this.verifyLedger();
-    this.assertCurrent();
+    await this.verifyPins(continuity);
+    await this.verifyLedger(continuity);
+    this.assertAvailable(continuity);
     if (this.pending) fail('REQUEST_STATE');
     const sequence = ++this.sequence;
     const raw = Buffer.from(canonical({ schema: SCHEMA, session_nonce: this.nonce, worker_nonce: this.workerNonce,
       sequence, owner_binding: this.expected, operation_id: this.operationId, command, payload }) + '\n');
     if (raw.length > FRAME || (this.totalOutput += raw.length) > TOTAL) fail('FRAME_LIMIT');
     const response = await new Promise<Record<string, any>>((resolve, reject) => {
-      const timer = setTimeout(() => this.failClosed(), Math.min(timeout, Math.max(1, 60000 - (performance.now() - this.started))));
+      const timer = setTimeout(() => this.failClosed(), continuity ? timeout :
+        Math.min(timeout, Math.max(1, this.lease!.expires - performance.now())));
       this.pending = { sequence, command, timer, resolve, reject };
       this.output(7).write(raw, error => { if (error) this.failClosed(); });
     });
     // Deferred reads can straddle a durable revoke or same-byte source replacement.
-    await this.verifyPins();
-    await this.verifyLedger();
+    await this.verifyPins(continuity);
+    await this.verifyLedger(continuity);
     return response;
   }
-  private async verifyLedger() {
-    this.assertCurrent();
+  private async verifyLedger(continuity = false) {
+    this.assertAvailable(continuity);
     const current = await this.store.readConsumerGuardReceipt(this.plugin, this.expected.accountId, this.key);
-    this.assertCurrent();
+    this.assertAvailable(continuity);
     if (!current || !this.row || current.revision !== this.row.revision || current.payload !== this.row.payload ||
         current.payload !== JSON.stringify(this.ledger)) fail('LEDGER_CHANGED');
   }
-  private async save(state: Ledger['state'], runId = this.ledger.runId, attempt = this.ledger.attempt, terminalWrite = false) {
-    if (!terminalWrite) this.assertCurrent();
+  private async save(state: Ledger['state'], runId = this.ledger.runId, attempt = this.ledger.attempt,
+    terminalWrite = false, continuity = false) {
+    if (!terminalWrite) this.assertAvailable(continuity);
     const next: Ledger = { ...this.ledger, state, runId, attempt };
     const current = await this.store.readConsumerGuardReceipt(this.plugin, this.expected.accountId, this.key);
-    if (!terminalWrite) this.assertCurrent();
+    if (!terminalWrite) this.assertAvailable(continuity);
     if (!current || !this.row || current.revision !== this.row.revision || current.payload !== this.row.payload ||
         !await this.store.compareAndSwapConsumerGuardReceipt(this.plugin, this.expected.accountId, this.key, this.row, JSON.stringify(next))) fail('LEDGER_CHANGED');
     const written = await this.store.readConsumerGuardReceipt(this.plugin, this.expected.accountId, this.key);
     if (!written || written.revision !== this.row.revision + 1 || written.payload !== JSON.stringify(next)) fail('LEDGER_CHANGED');
     this.row = written;
     this.ledger = next;
-    if (!terminalWrite) this.assertCurrent();
+    if (!terminalWrite) this.assertAvailable(continuity);
   }
-  private async exclusive<T>(use: () => Promise<T>) {
-    this.assertCurrent();
+  private async exclusive<T>(use: () => Promise<T>, continuity = false) {
+    this.assertAvailable(continuity);
     if (this.running) fail('BUSY');
     this.running = true;
     try { return await use(); }
@@ -464,6 +528,99 @@ export class RestrictedPublicationCISourceBroker {
       return Object.freeze({ runId: id, attempt: 1 });
     });
   }
+  /** Close the original dispatch phase only after the exact returned run is
+   * durably BOUND. The retained handle carries no dispatch/verification authority. */
+  async parkOriginalCI(): Promise<object> {
+    return this.exclusive(async () => {
+      if (this.observationUsed || this.ledger.state !== 'BOUND' || !this.ledger.dispatchBinding ||
+          this.ciReceipt || this.inventoryReceipt || this.definitionReceipt || this.definitionBusy ||
+          this.ownerRegistry || this.buffers.size || !this.row) fail('PARK_STATE');
+      this.observationUsed = true;
+      const dispatchAckSha256 = digest(['publication-ci-dispatch-ack/v1', this.operationId,
+        this.expected, this.ledger.profileSha256, this.row, this.ledger.dispatchBinding]);
+      this.ledger.observationPhase = { dispatchAckSha256 };
+      await this.save('PARKING_UNKNOWN');
+      const reply = await this.request('ci.park', { dispatch_ack_sha256: dispatchAckSha256 }, 10000);
+      keys(reply.result, 'run_id,attempt,dispatch_ack_sha256');
+      if (reply.result.run_id !== this.ledger.runId || reply.result.attempt !== this.ledger.attempt ||
+          reply.result.dispatch_ack_sha256 !== dispatchAckSha256) fail('PARK_BINDING');
+      // Never change the old lease's deadline. Its successful close permanently
+      // invalidates receipts and removes every active operation from this phase.
+      this.phase = 'PARKED';
+      this.receiptEpoch++;
+      if (this.deadline) { clearTimeout(this.deadline); this.deadline = undefined; }
+      await this.save('PARKED', this.ledger.runId, this.ledger.attempt, false, true);
+      const handle = Object.freeze(Object.create(null)) as object;
+      observations.set(handle, { broker: this, dispatchAckSha256, terminal: false, consumed: false });
+      return handle;
+    });
+  }
+  private observation(handle: object) {
+    this.assertContinuity();
+    const retained = observations.get(handle);
+    if (!retained || retained.broker !== this || retained.consumed || this.phase !== 'PARKED' ||
+        this.ledger.state !== 'PARKED' ||
+        this.ledger.observationPhase?.dispatchAckSha256 !== retained.dispatchAckSha256)
+      fail('PRIVATE_OBSERVATION_REQUIRED');
+    return retained;
+  }
+  /** One fixed official GET observation per request. Waiting grants no effect
+   * lease; the original sequence and byte limits bound all later observations. */
+  async waitForOriginalCI(handle: object): Promise<void> {
+    return this.exclusive(async () => {
+      const retained = this.observation(handle);
+      if (retained.terminal) fail('OBSERVATION_ALREADY_COMPLETE');
+      while (true) {
+        const reply = await this.request('ci.observe', {}, 35000);
+        keys(reply.result, 'run_id,attempt,status');
+        if (reply.result.run_id !== this.ledger.runId || reply.result.attempt !== this.ledger.attempt ||
+            !['queued', 'in_progress', 'waiting', 'pending', 'requested', 'completed'].includes(reply.result.status) ||
+            (reply.state === 'TERMINAL') !== (reply.result.status === 'completed')) fail('OBSERVATION_BINDING');
+        this.observation(handle);
+        if (reply.state === 'TERMINAL') { retained.terminal = true; return; }
+        // No automatic source renewal, job replay or remote heartbeat. Even the
+        // terminal resume consumes the same finite operation's message budget.
+        if (this.sequence >= 510) fail('OBSERVATION_LIMIT');
+        await new Promise<void>((resolve, reject) => {
+          const timer = setTimeout(() => { this.observationWait = undefined; resolve(); }, 5000);
+          this.observationWait = { timer, reject };
+        });
+        this.observation(handle);
+      }
+    }, true);
+  }
+  /** A single fresh <=60s verification phase, authorized only by the retained
+   * original factory's terminal observation. JSON/run IDs cannot resume it. */
+  async resumeOriginalCI(handle: object, assertVerificationApproved: () => void): Promise<void> {
+    return this.exclusive(async () => {
+      const retained = this.observation(handle);
+      if (!retained.terminal) fail('ORIGINAL_RUN_NOT_TERMINAL');
+      if (typeof assertVerificationApproved !== 'function') fail('RESUME_APPROVAL_REQUIRED');
+      assertVerificationApproved();
+      await this.verifyPins(true); await this.verifyLedger(true);
+      assertVerificationApproved();
+      retained.consumed = true;
+      const phaseNonce = randomBytes(32).toString('hex');
+      this.ledger.observationPhase = { dispatchAckSha256: retained.dispatchAckSha256, phaseNonce };
+      await this.save('RESUMING_UNKNOWN', this.ledger.runId, this.ledger.attempt, false, true);
+      assertVerificationApproved();
+      const started = performance.now();
+      const nextLease = Object.freeze({ started, expires: started + 60000, nonce: phaseNonce });
+      const reply = await this.request('ci.resume', { ttl_seconds: 60,
+        dispatch_ack_sha256: retained.dispatchAckSha256, phase_nonce: phaseNonce }, 10000);
+      keys(reply.result, 'run_id,attempt,dispatch_ack_sha256,phase_nonce');
+      if (reply.result.run_id !== this.ledger.runId || reply.result.attempt !== this.ledger.attempt ||
+          reply.result.dispatch_ack_sha256 !== retained.dispatchAckSha256 || reply.result.phase_nonce !== phaseNonce)
+        fail('RESUME_BINDING');
+      assertVerificationApproved();
+      this.lease = nextLease;
+      this.phase = 'ACTIVE';
+      this.receiptEpoch++;
+      this.armDeadline();
+      await this.save('BOUND');
+      assertVerificationApproved();
+    }, true);
+  }
   private async official(method: 'GET' | 'POST', endpoint: string, body: unknown, approved: () => void) {
     await this.verifyPins(); await this.verifyLedger(); approved(); this.assertCurrent();
     const args = ['api', '--hostname', 'github.com', '--method', method, endpoint,
@@ -516,7 +673,8 @@ export class RestrictedPublicationCISourceBroker {
     });
   }
   private async pollCurrent(command: 'ci.current' | 'ci.inventory.current' | 'definition.current') {
-    const until = Math.min(this.started + 60000, performance.now() + 30000);
+    this.assertCurrent();
+    const until = Math.min(this.lease!.expires, performance.now() + 30000);
     while (true) {
       const reply = await this.request(command, {}, Math.max(1, until - performance.now()));
       if (reply.state === 'CURRENT') return reply;
@@ -538,6 +696,11 @@ export class RestrictedPublicationCISourceBroker {
   definitionExpectations() {
     this.assertCurrent();
     if (!this.definitionProfile) fail('DEFINITION_UNAVAILABLE');
+    return structuredClone(this.definitionProfile);
+  }
+  preparedDefinitionExpectations() {
+    this.assertContinuity();
+    if (this.phase !== 'PREPARED' || !this.captured || !this.definitionProfile) fail('DEFINITION_UNAVAILABLE');
     return structuredClone(this.definitionProfile);
   }
   attachOwnerRegistry(registry: RestrictedPublicationOwnerRegistry, handle: object) {
@@ -657,13 +820,14 @@ export class RestrictedPublicationCISourceBroker {
   }
   private receipt(kind: 'ci' | 'ci-inventory' | 'definition', value: Record<string, any>): object {
     const handle = Object.freeze(Object.create(null)) as object;
-    receipts.set(handle, { broker: this, kind, value: structuredClone(value) });
+    receipts.set(handle, { broker: this, epoch: this.receiptEpoch, kind, value: structuredClone(value) });
     return handle;
   }
   /** Async freshness must complete before effect approval; sync reads never renew a lease. */
   async current(handle: object) {
     const r = receipts.get(handle);
     if (!r || r.broker !== this) fail('PRIVATE_RECEIPT_REQUIRED');
+    this.assertReceiptEpoch(r.epoch);
     return this.exclusive(async () => {
       if (r.kind === 'definition') await this.verifyCIHandlesWithinRead();
       const reply = await this.pollCurrent(r.kind === 'ci' ? 'ci.current' :
@@ -680,6 +844,7 @@ export class RestrictedPublicationCISourceBroker {
   revoke(): Promise<void> { return this.terminate('REVOKED'); }
   diagnostics() {
     return Object.freeze({ closed: this.closed, state: this.ledger.state,
+      phase: this.phase, phaseEpoch: this.receiptEpoch,
       ownedLifecycleObserved: this.lifecycleObserved, missingDefinitionFact: this.missingDefinitionFact ?? null,
       runId: this.ledger.runId, attempt: this.ledger.attempt });
   }
@@ -713,8 +878,9 @@ export class RestrictedPublicationCISourceBroker {
         }
       }
       // A possible dispatch stays DISPATCHING_UNKNOWN; shutdown cannot turn it into retryable.
-      const terminal = this.ledger.state === 'DISPATCHING_UNKNOWN' ? 'DISPATCHING_UNKNOWN' : state;
-      try { await this.save(terminal, this.ledger.runId, this.ledger.attempt, true); }
+      const terminal = ['DISPATCHING_UNKNOWN', 'PARKING_UNKNOWN', 'RESUMING_UNKNOWN'].includes(this.ledger.state)
+        ? this.ledger.state : this.observationUsed && !this.ledger.verifiedCI ? 'PARKING_UNKNOWN' : state;
+      try { if (this.row) await this.save(terminal, this.ledger.runId, this.ledger.attempt, true); }
       catch { /* Preserve original row on owner change/CAS failure; original operation stays consumed. */ }
       if (cleanupUnknown) fail('CLEANUP_UNKNOWN');
     })();

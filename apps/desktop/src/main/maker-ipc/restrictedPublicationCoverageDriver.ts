@@ -27,7 +27,7 @@ import {
   RestrictedPublicationResidentSource, readOriginalPublicationPeerReceipt,
   type PinnedPublicationResidentSource,
 } from './restrictedPublicationResidentSource.js';
-import { RestrictedPublicationOwnerRegistry } from './restrictedPublicationOwnerRegistry.js';
+import { RestrictedPublicationOwnerRegistry, readOriginalPublicationRegistrySeal } from './restrictedPublicationOwnerRegistry.js';
 import { RestrictedPublicationCIProducer, originalCIEffectPlanIdentity, originalCIEffectTarget,
   type OriginalCIRunnerPlan, type OriginalCIEffectDescriptor } from './restrictedPublicationCIProducer.js';
 import { assertNoUncertainPublicationCutover, clonePublicationGenerationPlan, publicationGenerationPlanIdentity,
@@ -417,11 +417,11 @@ export class ManagedCoverageDriver implements ControlledCoverageDriver {
     let preparedBroker: RestrictedPublicationCISourceBroker | undefined;
     const managedMembers = new Map<string, object>();
     if (plan.originalSources) {
-      preparedBroker = await RestrictedPublicationCISourceBroker.startOwned(
+      preparedBroker = await RestrictedPublicationCISourceBroker.prepareOwned(
         this.store, this.plugin, plan.operationId, plan.worker, currentBinding(), currentBinding);
       if (epoch !== this.epoch) { await preparedBroker.revoke(); fail('REVOKED'); }
       this.sourceBroker = preparedBroker;
-      const expectations = preparedBroker.definitionExpectations();
+      const expectations = preparedBroker.preparedDefinitionExpectations();
       // All canonical probes precede the retained LOADED lifecycle handle.
       // A later probe must never invalidate the source sequence underneath C.
       for (const member of expectations.instances) {
@@ -436,23 +436,7 @@ export class ManagedCoverageDriver implements ControlledCoverageDriver {
         fact.binding.generation !== generation || fact.binding.accountId !== this.accountScopeRef ||
         fact.binding.deviceId !== this.registration.deviceScopeRef || fact.ownedJobs !== 0 ||
         fact.unresolvedAdmissions !== 0 || fact.unknownNativeEffects !== 0) fail('SOURCE_LIFECYCLE');
-    if (plan.ownerSource) {
-      const owner = await RestrictedPublicationOwnerSource.startOwned(this.store, this.plugin, plan.operationId, {
-        root, files: plan.worker.files, python: plan.worker.python, sourceDigest: fact.sourceDigest,
-        ...plan.ownerSource,
-      }, fact.binding, currentBinding);
-      try {
-        if (epoch !== this.epoch) fail('REVOKED');
-        this.heldOwner = { owner, handle: owner.loadedReceipt() };
-        // This private observation deliberately never fills C census/member/namespace fields.
-        readHeldPublicationOwnerReceipt(this.heldOwner.handle, owner);
-      } catch (error) {
-        // The returned child is ours even if ownership changes before the handle transfer.
-        await owner.revoke();
-        throw error;
-      }
-    }
-    const broker = preparedBroker ?? await RestrictedPublicationCISourceBroker.startOwned(
+    const broker = preparedBroker ?? await RestrictedPublicationCISourceBroker.prepareOwned(
       this.store, this.plugin, plan.operationId, plan.worker, fact.binding, currentBinding,
     );
     if (epoch !== this.epoch) {
@@ -461,7 +445,14 @@ export class ManagedCoverageDriver implements ControlledCoverageDriver {
       fail('REVOKED');
     }
     this.sourceBroker = broker;
-    broker.attachOwnedLifecycle(lifecycle, this.controller);
+    let brokerActive = false;
+    const activateBroker = async () => {
+      if (brokerActive) return;
+      await broker.activatePrepared();
+      if (epoch !== this.epoch) fail('REVOKED');
+      broker.attachOwnedLifecycle(lifecycle!, this.controller);
+      brokerActive = true;
+    };
     let ciHandle: object | undefined;
     if (plan.originalSources) {
       if (!this.store.capturePublicationOwnerHistory || !this.store.assertPublicationOwnerHistoryCurrent)
@@ -469,7 +460,7 @@ export class ManagedCoverageDriver implements ControlledCoverageDriver {
       const sourceStore = this.store as Parameters<typeof RestrictedPublicationOwnerRegistry.startOwned>[0];
       const runnerPeers: Array<{ source: RestrictedPublicationResidentSource; handle: object;
         plan: Pick<OriginalCIRunnerPlan, 'instanceId' | 'effects'> }> = [];
-      const profile = broker.definitionExpectations();
+      const profile = broker.preparedDefinitionExpectations();
       const registry = await RestrictedPublicationOwnerRegistry.startOwned(sourceStore, this.plugin,
         plan.operationId, profile, this.controller, lifecycle);
       if (epoch !== this.epoch) { await registry.revoke(); fail('REVOKED'); }
@@ -521,30 +512,100 @@ export class ManagedCoverageDriver implements ControlledCoverageDriver {
       }
       // This real preflight precedes the only dispatch approval callback.
       // Missing census/history/namespace producers leave approval count zero.
-      await registry.preflightNonCI();
+      let sourcePreflight = await registry.preflightNonCI();
+      const assertPreflight = () => {
+        this.ownerCurrent(); if (epoch !== this.epoch) fail('REVOKED');
+        readOriginalPublicationRegistrySeal(sourcePreflight, registry);
+      };
       // No original runner preparation, registration token, configuration or launch
       // precedes the real source preflight. Workflow history remains a separate
       // mandatory owner source; these runner receipts cannot satisfy it.
+      const advanced: Array<{ source: RestrictedPublicationResidentSource; instanceId: string;
+        producer: RestrictedPublicationCIProducer;
+        result: Awaited<ReturnType<RestrictedPublicationCIProducer['advanceUntilPark']>> }> = [];
       for (const runner of runnerPeers) {
         const approval = this.runnerApprovals.get(runner.plan.instanceId)!;
         const producer = RestrictedPublicationCIProducer.fromOriginal(sourceStore, this.plugin,
           runner.source, runner.handle, { ...runner.plan, assertEffectApproved: async effect => {
-            this.ownerCurrent(); if (epoch !== this.epoch) fail('REVOKED');
+            assertPreflight();
             await approval(effect);
-            this.ownerCurrent(); if (epoch !== this.epoch) fail('REVOKED');
+            assertPreflight();
           } });
-        let peer = await producer.run();
+        advanced.push({ source: runner.source, instanceId: runner.plan.instanceId,
+          producer, result: await producer.advanceUntilPark() });
+      }
+      // Dispatch B while the original runner is at its acknowledged start
+      // boundary. Both long observations then share one finite park/resume;
+      // no early B pending object or non-CI lease ages through the whole job.
+      let ciObservation: object | undefined;
+      if (plan.ci) {
+        await activateBroker();
+        await broker.dispatchOriginalCI(plan.ci.head, plan.ci.workflowSha256, () => {
+          assertPreflight(); this.sourceApproval!(); assertPreflight();
+        });
+        ciObservation = await broker.parkOriginalCI();
+      }
+      let refreshed: ReadonlyMap<RestrictedPublicationResidentSource, ReadonlyMap<string, object>> | undefined;
+      if (ciObservation || advanced.some(x => x.result.state === 'PARK_READY')) {
+        const registryObservation = await registry.beginObservation();
+        const parked: Array<{ source: RestrictedPublicationResidentSource; handle: object }> = [];
+        for (const source of this.originalSources) {
+          const checkpoints = advanced.filter(x => x.source === source).flatMap(x =>
+            x.result.state === 'PARK_READY' ? [x.result.checkpoint] : []);
+          parked.push({ source, handle: await source.parkForObservation(checkpoints) });
+        }
+        await Promise.all([
+          ...parked.map(x => x.source.waitForObservation(x.handle)),
+          ...(ciObservation ? [broker.waitForOriginalCI(ciObservation)] : []),
+        ]);
+        this.ownerCurrent(); if (epoch !== this.epoch) fail('REVOKED');
+        // Every original owner has finished its passive observation. Resume
+        // all actual sources before any cleanup/drain claim is allowed.
+        const next = new Map<RestrictedPublicationResidentSource, ReadonlyMap<string, object>>();
+        for (const held of parked) next.set(held.source, await held.source.resumeAfterObservation(held.handle));
+        refreshed = next;
+        await registry.finishObservation(registryObservation, refreshed);
+        if (ciObservation) await broker.resumeOriginalCI(ciObservation, () => {
+          this.ownerCurrent(); if (epoch !== this.epoch) fail('REVOKED');
+          this.sourceApproval!();
+          this.ownerCurrent(); if (epoch !== this.epoch) fail('REVOKED');
+        });
+        sourcePreflight = await registry.preflightNonCI();
+      }
+      for (const runner of advanced) {
+        let peer = refreshed?.get(runner.source)?.get(runner.instanceId) ?? runner.result.handle;
+        if (runner.result.state === 'PARK_READY') {
+          if (!refreshed) fail('CI_OBSERVATION_REQUIRED');
+          peer = await runner.producer.finishAfterObservation(runner.result.checkpoint, peer);
+        }
         peer = await runner.source.transition(peer, 'fence');
         peer = await runner.source.transition(peer, 'drain');
         await runner.source.transition(peer, 'retire');
       }
+      await activateBroker();
       if (plan.ci) {
-        await broker.dispatchOriginalCI(plan.ci.head, plan.ci.workflowSha256, this.sourceApproval!);
         ciHandle = await broker.inspectCI();
         const inventory = await broker.inspectCIInventory();
         await registry.bindCIFromBroker(plan.ci.instanceId, broker, ciHandle, inventory);
       }
       broker.attachOwnerRegistry(registry, await registry.seal());
+    }
+    await activateBroker();
+    // This additional diagnostic owner supplies no census authority. Start its
+    // own short lease only when C is ready to read, after all long observations.
+    if (plan.ownerSource) {
+      const owner = await RestrictedPublicationOwnerSource.startOwned(this.store, this.plugin, plan.operationId, {
+        root, files: plan.worker.files, python: plan.worker.python, sourceDigest: fact.sourceDigest,
+        ...plan.ownerSource,
+      }, fact.binding, currentBinding);
+      try {
+        if (epoch !== this.epoch) fail('REVOKED');
+        this.heldOwner = { owner, handle: owner.loadedReceipt() };
+        readHeldPublicationOwnerReceipt(this.heldOwner.handle, owner);
+      } catch (error) {
+        await owner.revoke();
+        throw error;
+      }
     }
     // Missing original census/member/namespace owners closes before any dispatch.
     const handle = await broker.inspectDefinition();
@@ -602,11 +663,8 @@ export class ManagedCoverageDriver implements ControlledCoverageDriver {
     const member = definition.members.find((x: any) => x.instanceId === plan.ci!.instanceId);
     if (!member || member.entryId !== 'worksheet-ci' || member.state !== 'NATIVE_NAMESPACE_DENIED')
       fail('CI_MEMBER_PROJECTION_UNSUPPORTED');
-    let handle = this.sourceReceipts?.ci;
-    if (!handle) {
-      await broker.dispatchOriginalCI(plan.ci.head, plan.ci.workflowSha256, this.sourceApproval!);
-      handle = await broker.inspectCI();
-    }
+    const handle = this.sourceReceipts?.ci;
+    if (!handle) fail('CI_SOURCE_NOT_ACQUIRED');
     const value = readPublicationSourceReceipt(handle, broker);
     if (value.consumer !== 'worksheet-ci' || value.head_sha !== plan.ci.head ||
         value.workflow_sha256 !== plan.ci.workflowSha256) fail('CI_SOURCE_BINDING');

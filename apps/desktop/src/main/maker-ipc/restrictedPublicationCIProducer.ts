@@ -168,6 +168,33 @@ type Permit = { producer: RestrictedPublicationCIProducer; source: RestrictedPub
   kind: 'admit' | 'ack'; row: Row; observation: OriginalPublicationPeerObservation; used: boolean };
 const permits = new WeakMap<object, Permit>();
 const producers = new WeakSet<object>();
+type ObservationCheckpoint = { producer: RestrictedPublicationCIProducer; source: RestrictedPublicationResidentSource;
+  key: string; row: Row; value: EffectRecord; observation: OriginalPublicationPeerObservation;
+  epoch: number; parked: boolean; consumed: boolean };
+const observationCheckpoints = new WeakMap<object, ObservationCheckpoint>();
+export type OriginalCIProducerAdvance = { state: 'FINISHED'; handle: object } |
+  { state: 'PARK_READY'; handle: object; checkpoint: object };
+/** This is a Main-held continuation of an already completed start effect, not
+ * an effect permit. JSON, a durable row, or a replacement producer cannot mint
+ * it. The original source consumes it before ending its first short session. */
+export async function consumeOriginalCIObservationCheckpoint(handle: object,
+  source: RestrictedPublicationResidentSource) {
+  const checkpoint = observationCheckpoints.get(handle);
+  if (!checkpoint || checkpoint.source !== source || checkpoint.parked || checkpoint.consumed ||
+      !producers.has(checkpoint.producer)) fail('PRIVATE_OBSERVATION_CHECKPOINT_REQUIRED');
+  checkpoint.parked = true;
+  await checkpoint.producer.verifyObservationCheckpoint(checkpoint, true);
+  return structuredClone(checkpoint.observation);
+}
+/** Recheck the exact durable winner while no live effect session exists. This
+ * never reads an old peer receipt as current or recreates a continuation. */
+export async function verifyOriginalCIObservationCheckpoint(handle: object,
+  source: RestrictedPublicationResidentSource) {
+  const checkpoint = observationCheckpoints.get(handle);
+  if (!checkpoint || checkpoint.source !== source || !checkpoint.parked || checkpoint.consumed ||
+      !producers.has(checkpoint.producer)) fail('PRIVATE_OBSERVATION_CHECKPOINT_REQUIRED');
+  await checkpoint.producer.verifyObservationCheckpoint(checkpoint, false);
+}
 /** Called only by the original listener adapter, immediately before its wire
  * write. Durable state is rechecked and the capability is consumed once. */
 export async function consumeOriginalCIEffectPermit(handle: object, source: RestrictedPublicationResidentSource,
@@ -192,6 +219,7 @@ export class RestrictedPublicationCIProducer {
   private readonly completed = new Set<string>();
   private running = false;
   private used = false;
+  private checkpoint?: object;
   private constructor(private readonly store: Store, private readonly plugin: string,
     private readonly source: RestrictedPublicationResidentSource, handle: object, plan: OriginalCIRunnerPlan) {
     if (!isOriginalPublicationSource(source)) fail('ORIGINAL_SOURCE_REQUIRED');
@@ -276,54 +304,112 @@ export class RestrictedPublicationCIProducer {
       fail('LEDGER_CHANGED');
     this.current = { key, row, value };
   }
-  /** One original invocation, bounded by the listener's original 60s/128-frame
-   * budget. A timeout consumes the target claim; it never creates a retry key. */
-  async run() {
+  async verifyObservationCheckpoint(checkpoint: ObservationCheckpoint, requireCurrent: boolean) {
+    if (!this.checkpoint || observationCheckpoints.get(this.checkpoint) !== checkpoint ||
+        checkpoint.producer !== this || checkpoint.source !== this.source || this.running || this.current ||
+        checkpoint.value.state !== 'COMPLETE' || checkpoint.value.descriptor.kind !== 'jit-register-start' ||
+        canonical(await this.store.readConsumerGuardReceipt(this.plugin, checkpoint.value.binding.accountId,
+          checkpoint.key)) !== canonical(checkpoint.row)) fail('OBSERVATION_DISPOSITION_CHANGED');
+    if (requireCurrent && (this.source.continuityEpoch() !== checkpoint.epoch ||
+        canonical(this.observation()) !== canonical(checkpoint.observation))) fail('SOURCE_CHANGED');
+  }
+  private async advance(stopAtObservation: boolean): Promise<OriginalCIProducerAdvance> {
+    for (;;) {
+      const observed = this.observation();
+      const effect = observed.observation.ciEffect;
+      if (observed.observation.unknownOperations !== 0 || observed.observation.state === 'UNKNOWN' ||
+          effect?.state === 'UNKNOWN') fail('OUTCOME_UNKNOWN');
+      if (observed.observation.state === 'FINISHED') {
+        if (observed.observation.activeOperations !== 0 ||
+            (effect !== null && effect?.state !== 'ACKNOWLEDGED') || this.current) fail('OUTCOME_UNKNOWN');
+        return { state: 'FINISHED', handle: this.handle };
+      }
+      if (observed.observation.state !== 'RUNNING') fail('PHASE');
+      if (!effect || effect.state === 'ACKNOWLEDGED') {
+        this.handle = await this.source.pollCI(this.handle); continue;
+      }
+      await this.claim(observed, effect);
+      this.handle = await this.source.admitCIEffect(this.handle, this.permit('admit'));
+      let outcome = this.observation().observation.ciEffect;
+      while (outcome?.state === 'ADMITTED' || outcome?.state === 'RUNNING') {
+        this.handle = await this.source.pollCI(this.handle);
+        outcome = this.observation().observation.ciEffect;
+      }
+      if (!outcome || outcome.state !== 'SUCCEEDED' || !outcome.outcome || !this.current ||
+          outcome.effectId !== this.current.value.effectId || outcome.admissionId !== this.current.value.admissionId)
+        fail('OUTCOME_UNKNOWN');
+      await this.save({ ...this.current.value, state: 'APPLIED_UNACKNOWLEDGED',
+        outcome: structuredClone(outcome.outcome), outcomeSha256: outcome.outcomeSha256 });
+      this.handle = await this.source.acknowledgeCIEffect(this.handle, this.permit('ack'));
+      const ack = this.observation().observation.ciEffect;
+      if (!ack || ack.state !== 'ACKNOWLEDGED' || ack.outcomeSha256 !== this.current!.value.outcomeSha256)
+        fail('ACK_UNKNOWN');
+      await this.save({ ...this.current!.value, state: 'COMPLETE' });
+      this.completed.add(effect.effectId);
+      const completed = this.current!;
+      this.current = undefined;
+      if (stopAtObservation && effect.descriptor.kind === 'jit-register-start') {
+        const observation = this.observation();
+        if (this.checkpoint || observation.ownerId !== 'core-jit.bridge-jit-controller' ||
+            observation.observation.state !== 'RUNNING' || observation.observation.activeOperations !== 1 ||
+            observation.observation.unknownOperations !== 0 || observation.observation.ciEffect?.state !== 'ACKNOWLEDGED')
+          fail('OBSERVATION_PHASE');
+        const checkpoint = this.checkpoint = Object.freeze(Object.create(null)) as object;
+        observationCheckpoints.set(checkpoint, { producer: this, source: this.source, ...structuredClone(completed),
+          observation, epoch: this.source.continuityEpoch(), parked: false, consumed: false });
+        return { state: 'PARK_READY', handle: this.handle, checkpoint };
+      }
+    }
+  }
+  private async failed(error: unknown): Promise<never> {
+    // Preserve an already observed success if its ACK is uncertain. Both
+    // APPLIED_UNACKNOWLEDGED and UNKNOWN remain unresolved in the original DB.
+    if (this.current?.value.state === 'DISPATCHING_UNKNOWN') {
+      try { await this.save({ ...this.current.value, state: 'UNKNOWN' }); } catch { /* keep original durable claim */ }
+    }
+    await this.source.revoke().catch(() => undefined);
+    throw error;
+  }
+  private async start(stopAtObservation: boolean) {
     if (this.used || this.running) fail('OPERATION_CONSUMED');
     this.used = true; this.running = true;
     try {
       this.handle = await this.source.prepareCI(this.handle);
-      for (;;) {
-        const observed = this.observation();
-        const effect = observed.observation.ciEffect;
-        if (observed.observation.unknownOperations !== 0 || observed.observation.state === 'UNKNOWN' ||
-            effect?.state === 'UNKNOWN') fail('OUTCOME_UNKNOWN');
-        if (observed.observation.state === 'FINISHED') {
-          if (observed.observation.activeOperations !== 0 ||
-              (effect !== null && effect?.state !== 'ACKNOWLEDGED') || this.current) fail('OUTCOME_UNKNOWN');
-          return this.handle;
-        }
-        if (observed.observation.state !== 'RUNNING') fail('PHASE');
-        if (!effect || effect.state === 'ACKNOWLEDGED') {
-          this.handle = await this.source.pollCI(this.handle); continue;
-        }
-        await this.claim(observed, effect);
-        this.handle = await this.source.admitCIEffect(this.handle, this.permit('admit'));
-        let outcome = this.observation().observation.ciEffect;
-        while (outcome?.state === 'ADMITTED' || outcome?.state === 'RUNNING') {
-          this.handle = await this.source.pollCI(this.handle);
-          outcome = this.observation().observation.ciEffect;
-        }
-        if (!outcome || outcome.state !== 'SUCCEEDED' || !outcome.outcome || !this.current ||
-            outcome.effectId !== this.current.value.effectId || outcome.admissionId !== this.current.value.admissionId)
-          fail('OUTCOME_UNKNOWN');
-        await this.save({ ...this.current.value, state: 'APPLIED_UNACKNOWLEDGED',
-          outcome: structuredClone(outcome.outcome), outcomeSha256: outcome.outcomeSha256 });
-        this.handle = await this.source.acknowledgeCIEffect(this.handle, this.permit('ack'));
-        const ack = this.observation().observation.ciEffect;
-        if (!ack || ack.state !== 'ACKNOWLEDGED' || ack.outcomeSha256 !== this.current!.value.outcomeSha256)
-          fail('ACK_UNKNOWN');
-        await this.save({ ...this.current!.value, state: 'COMPLETE' });
-        this.completed.add(effect.effectId); this.current = undefined;
-      }
-    } catch (error) {
-      // Preserve an already observed success if its ACK is uncertain. Both
-      // APPLIED_UNACKNOWLEDGED and UNKNOWN remain unresolved in the original DB.
-      if (this.current?.value.state === 'DISPATCHING_UNKNOWN') {
-        try { await this.save({ ...this.current.value, state: 'UNKNOWN' }); } catch { /* keep original durable claim */ }
-      }
-      await this.source.revoke().catch(() => undefined);
-      throw error;
-    } finally { this.running = false; }
+      return await this.advance(stopAtObservation);
+    } catch (error) { return await this.failed(error); }
+    finally { this.running = false; }
+  }
+  /** Existing single-session entry. Its deadline and total budgets remain
+   * unchanged; only the explicit Main coordinator may select the phase plan. */
+  async run() { return (await this.start(false)).handle; }
+  /** Stop immediately after the exact start effect's durable ACK. Main can
+   * dispatch B and park every already authenticated source before any wait. */
+  async advanceUntilPark(): Promise<OriginalCIProducerAdvance> { return this.start(true); }
+  async finishAfterObservation(handle: object, resumedPeer: object) {
+    const checkpoint = observationCheckpoints.get(handle);
+    if (!checkpoint || this.checkpoint !== handle || checkpoint.producer !== this ||
+        checkpoint.source !== this.source || !checkpoint.parked || checkpoint.consumed || this.running ||
+        !this.used || this.source.continuityEpoch() !== checkpoint.epoch + 1) fail('PRIVATE_OBSERVATION_CHECKPOINT_REQUIRED');
+    checkpoint.consumed = true;
+    try {
+      await this.verifyObservationCheckpoint(checkpoint, false);
+      const observed = readOriginalPublicationPeerReceipt(resumedPeer, this.source);
+      const previous = checkpoint.observation;
+      const before = previous.observation.ciEffect!, after = observed.observation.ciEffect;
+      const nextCleanup = after?.state === 'REQUESTED' && after.sequence === before.sequence + 1 &&
+        after.descriptor.kind === 'jit-cleanup' && canonical(after.descriptor.identity) === canonical(before.descriptor.identity);
+      if (observed.peerId !== previous.peerId || observed.instanceId !== previous.instanceId ||
+          digest(observed.process) !== digest(previous.process) || observed.sourceDigest !== previous.sourceDigest ||
+          observed.definitionDigest !== previous.definitionDigest || observed.observation.state !== 'RUNNING' ||
+          observed.observation.activeOperations !== 1 || observed.observation.unknownOperations !== 0 ||
+          observed.observation.loadedNonce === previous.observation.loadedNonce ||
+          observed.observation.fenceRevision !== previous.observation.fenceRevision ||
+          (!nextCleanup && canonical(after) !== canonical(before))) fail('OBSERVATION_SOURCE_CHANGED');
+      this.handle = resumedPeer; this.running = true;
+      const result = await this.advance(false);
+      if (result.state !== 'FINISHED') fail('OBSERVATION_PHASE');
+      return result.handle;
+    } catch (error) { return await this.failed(error); }
+    finally { this.running = false; }
   }
 }
