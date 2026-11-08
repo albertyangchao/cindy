@@ -20,6 +20,10 @@ import {
   type PinnedPublicationSourceWorker,
 } from './restrictedPublicationCISourceBroker.js';
 import {
+  RestrictedPublicationOwnerSource,
+  readHeldPublicationOwnerReceipt,
+} from './restrictedPublicationOwnerSource.js';
+import {
   coverageEntries,
   adjacentCoverageEntries,
   type CoverageRegistration,
@@ -98,6 +102,8 @@ export interface FixedCoverageProfile {
 export interface MainPublicationSourcePlan {
   operationId: string;
   worker: PinnedPublicationSourceWorker;
+  /** An additional held source process; never a substitute for C's original owners. */
+  ownerSource?: { instanceId: string; profileId: 'canonical-producer' | 'core.monitor.publish'; definitionDigest: string };
   ci?: {
     instanceId: string;
     head: string;
@@ -108,6 +114,7 @@ export interface MainPublicationSourcePlan {
 type SourcePlanMetadata = {
   operationId: string;
   worker: PinnedPublicationSourceWorker;
+  ownerSource?: MainPublicationSourcePlan['ownerSource'];
   ci?: { instanceId: string; head: string; workflowSha256: string };
 };
 type DriverState = {
@@ -141,6 +148,8 @@ export class ManagedCoverageDriver implements ControlledCoverageDriver {
   private readonly sourcePlan?: SourcePlanMetadata;
   private readonly sourceApproval?: () => void;
   private sourceBroker?: RestrictedPublicationCISourceBroker;
+  private heldOwner?: { owner: RestrictedPublicationOwnerSource; handle: object };
+  private lastHeldDiagnostics?: ReturnType<RestrictedPublicationOwnerSource['diagnostics']>;
   private sourceReceipts?: { definition: object; ci?: object };
   private sourceCleanup?: Promise<void>;
   private lastSourceDiagnostics?: ReturnType<RestrictedPublicationCISourceBroker['diagnostics']>;
@@ -166,10 +175,15 @@ export class ManagedCoverageDriver implements ControlledCoverageDriver {
       if (!/^[A-Za-z0-9_-]{1,100}$/.test(sourcePlan.operationId) || !sourcePlan.worker?.definition)
         fail('SOURCE_PLAN');
       const ci = sourcePlan.ci;
+      const held = sourcePlan.ownerSource;
+      if (held && (Object.keys(held).sort().join(',') !== 'definitionDigest,instanceId,profileId' ||
+          !opaque(held.instanceId) || !validHash(held.definitionDigest) ||
+          !['canonical-producer', 'core.monitor.publish'].includes(held.profileId))) fail('SOURCE_PLAN');
       if (ci && (!opaque(ci.instanceId) || !/^[a-f0-9]{40}$/.test(ci.head) ||
           !validHash(ci.workflowSha256) || typeof ci.assertDispatchApproved !== 'function'))
         fail('SOURCE_PLAN');
       this.sourcePlan = structuredClone({ operationId: sourcePlan.operationId, worker: sourcePlan.worker,
+        ...(held ? { ownerSource: held } : {}),
         ...(ci ? { ci: { instanceId: ci.instanceId, head: ci.head, workflowSha256: ci.workflowSha256 } } : {}) });
       this.sourceApproval = ci?.assertDispatchApproved;
     }
@@ -241,11 +255,19 @@ export class ManagedCoverageDriver implements ControlledCoverageDriver {
   }
   private stopSource() {
     const broker = this.sourceBroker;
+    const held = this.heldOwner;
     this.sourceBroker = undefined;
+    this.heldOwner = undefined;
     this.sourceReceipts = undefined;
-    if (!broker) return;
+    if (!broker && !held) return;
     const previous = this.sourceCleanup;
-    const closing = broker.revoke().finally(() => { this.lastSourceDiagnostics = broker.diagnostics(); });
+    const tasks: Promise<void>[] = [];
+    if (broker) tasks.push(broker.revoke().finally(() => { this.lastSourceDiagnostics = broker.diagnostics(); }));
+    if (held) tasks.push(held.owner.revoke().finally(() => { this.lastHeldDiagnostics = held.owner.diagnostics(); }));
+    const closing = Promise.allSettled(tasks).then(results => {
+      const failure = results.find(x => x.status === 'rejected');
+      if (failure?.status === 'rejected') throw failure.reason;
+    });
     this.sourceCleanup = previous ? Promise.all([previous, closing]).then(() => {}) : closing;
     void this.sourceCleanup.catch(() => {});
   }
@@ -257,6 +279,9 @@ export class ManagedCoverageDriver implements ControlledCoverageDriver {
   }
   sourceDiagnostics() {
     return this.sourceBroker?.diagnostics() ?? this.lastSourceDiagnostics ?? null;
+  }
+  heldSourceDiagnostics() {
+    return this.heldOwner?.owner.diagnostics() ?? this.lastHeldDiagnostics ?? null;
   }
   private async acquireSources(root: string, generation: string, epoch: number) {
     const plan = this.sourcePlan!;
@@ -272,13 +297,29 @@ export class ManagedCoverageDriver implements ControlledCoverageDriver {
         fact.binding.generation !== generation || fact.binding.accountId !== this.accountScopeRef ||
         fact.binding.deviceId !== this.registration.deviceScopeRef || fact.ownedJobs !== 0 ||
         fact.unresolvedAdmissions !== 0 || fact.unknownNativeEffects !== 0) fail('SOURCE_LIFECYCLE');
-    const broker = await RestrictedPublicationCISourceBroker.startOwned(
-      this.store, this.plugin, plan.operationId, plan.worker, fact.binding,
-      () => {
+    const currentBinding = () => {
         this.ownerCurrent();
         if (epoch !== this.epoch) fail('REVOKED');
         return readManagedLifecycleReceipt(lifecycle, this.controller).binding;
-      },
+    };
+    if (plan.ownerSource) {
+      const owner = await RestrictedPublicationOwnerSource.startOwned(this.store, this.plugin, plan.operationId, {
+        root, files: plan.worker.files, python: plan.worker.python, sourceDigest: fact.sourceDigest,
+        ...plan.ownerSource,
+      }, fact.binding, currentBinding);
+      try {
+        if (epoch !== this.epoch) fail('REVOKED');
+        this.heldOwner = { owner, handle: owner.loadedReceipt() };
+        // This private observation deliberately never fills C census/member/namespace fields.
+        readHeldPublicationOwnerReceipt(this.heldOwner.handle, owner);
+      } catch (error) {
+        // The returned child is ours even if ownership changes before the handle transfer.
+        await owner.revoke();
+        throw error;
+      }
+    }
+    const broker = await RestrictedPublicationCISourceBroker.startOwned(
+      this.store, this.plugin, plan.operationId, plan.worker, fact.binding, currentBinding,
     );
     if (epoch !== this.epoch) {
       await broker.revoke();
@@ -378,6 +419,10 @@ export class ManagedCoverageDriver implements ControlledCoverageDriver {
       if (!this.closed && this.accepted) {
         this.controller.assertCurrent(this.accepted.members.length ? this.activeRoot! : '');
         if (this.sourcePlan && (!this.sourceBroker || !this.sourceReceipts)) fail('SOURCE_CLOSED');
+        if (this.sourcePlan?.ownerSource) {
+          if (!this.heldOwner) fail('SOURCE_CLOSED');
+          readHeldPublicationOwnerReceipt(this.heldOwner.handle, this.heldOwner.owner);
+        }
         this.sourceBroker?.assertCurrent();
       }
     } catch (error) { this.close(); throw error; }
@@ -705,10 +750,16 @@ export class ManagedCoverageDriver implements ControlledCoverageDriver {
       this.requireReady();
       const broker = this.sourceBroker;
       const receipts = this.sourceReceipts;
+      const held = this.heldOwner;
       await this.controller.verifyCurrent(this.activeRoot!);
       if (epoch !== this.epoch) fail('REVOKED');
       if (this.sourcePlan) {
         if (!broker || !receipts) fail('SOURCE_CLOSED');
+        if (this.sourcePlan.ownerSource) {
+          if (!held) fail('SOURCE_CLOSED');
+          await held.owner.current(held.handle);
+          if (epoch !== this.epoch) fail('REVOKED');
+        }
         // B owns a single sequenced channel. Each original private handle must
         // remain current; copied summary JSON cannot renew either source lease.
         await broker.current(receipts.definition);

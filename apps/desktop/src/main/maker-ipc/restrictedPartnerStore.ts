@@ -26,108 +26,113 @@ export function createRestrictedPartnerStore(db: DbClient, assertOwner: () => vo
     assertOwner();
     return row ? (JSON.parse(row.payload) as T) : undefined;
   };
+  const nativePublicationPredicate = (pluginId: string) => and(
+    eq(table.pluginId, pluginId),
+    sql`(${table.id} LIKE 'native-publication:%' OR ${table.targetId} LIKE 'restricted:publication:%' OR (CASE WHEN json_valid(${table.payload}) THEN json_extract(${table.payload}, '$.schema') ELSE NULL END) = 'native-publication-action/v1')`,
+  );
+  const unresolvedAdmissionPredicate = (pluginId: string, accountScopeRef: string) => and(
+    eq(table.operation, 'target'),
+    eq(table.pluginId, pluginId),
+    sql`${table.targetId} LIKE ${`publication-coverage:${accountScopeRef}:%`}`,
+    sql`json_extract(${table.payload}, '$.schema') IN ('publication-coverage-admission/v1', 'publication-managed-job/v1')`,
+    sql`coalesce(json_extract(${table.payload}, '$.state'), 'UNKNOWN') <> 'COMPLETE'`,
+  );
+  const nativePublicationFacts = async (pluginId: string) => {
+    assertOwner();
+    const rows = await db.drizzle
+      .select()
+      .from(table)
+      .where(nativePublicationPredicate(pluginId))
+      .orderBy(table.id);
+    assertOwner();
+    let unknown = 0;
+    const deny = (): never => {
+      throw Error('PUBLICATION_NATIVE_EFFECT_FACTS_UNKNOWN');
+    };
+    const states = [
+      'PREPARED_NO_REMOTE_EFFECT',
+      'DISPATCHING_UNKNOWN',
+      'APPLIED_VERIFIED',
+      'REJECTED_NO_DISPATCH',
+      'UNKNOWN',
+    ];
+    const phases = ['remote-staging-prepare', 'remote-staging-upload', 'remote-transaction'];
+    for (const row of rows) {
+      let a: any;
+      try {
+        a = JSON.parse(row.payload);
+      } catch {
+        deny();
+      }
+      if (
+        !a ||
+        a.schema !== 'native-publication-action/v1' ||
+        a.pluginId !== pluginId ||
+        row.operation !== 'target' ||
+        typeof a.nativeActionId !== 'string' ||
+        !/^[a-f0-9-]{36}$/.test(a.nativeActionId) ||
+        row.id !== 'native-publication:' + a.nativeActionId ||
+        !states.includes(a.state) ||
+        a.actionRevision !== 1 ||
+        !Number.isSafeInteger(a.stateRevision) ||
+        a.stateRevision < 1 ||
+        a.stateRevision !== row.revision ||
+        row.fingerprint !== publicationDigest(a)
+      )
+        deny();
+      const bindings = [
+        a.principalId,
+        a.partnerId,
+        a.runId,
+        a.sourceOutputMessageId,
+        a.completedOutputSha256,
+      ];
+      if (
+        bindings.some((v) => typeof v !== 'string' || !v || Buffer.byteLength(v) > 512) ||
+        !/^[a-f0-9]{64}$/.test(a.completedOutputSha256)
+      )
+        deny();
+      const target =
+        'restricted:publication:' + publicationDigest([pluginId, ...bindings, 'PUBLIC_RELEASE']);
+      if (
+        row.targetId !== target ||
+        row.requestKey !== target ||
+        !Array.isArray(a.effects) ||
+        a.effects.length > 3 ||
+        a.effects.some((v: any, i: number) => v !== phases[i])
+      )
+        deny();
+      if (
+        ['PREPARED_NO_REMOTE_EFFECT', 'REJECTED_NO_DISPATCH'].includes(a.state) &&
+        a.effects.length !== 0
+      )
+        deny();
+      if (
+        a.state === 'APPLIED_VERIFIED' &&
+        (a.effects.length !== 3 || !/^[a-f0-9]{64}$/.test(a.receiptSha256))
+      )
+        deny();
+      if (a.state === 'UNKNOWN' || a.state === 'DISPATCHING_UNKNOWN') unknown++;
+    }
+    assertOwner();
+    return { unknown, snapshot: JSON.stringify(rows.map(row => [
+      row.id, row.pluginId, row.operation, row.targetId, row.requestKey,
+      row.fingerprint, row.payload, row.revision, row.createdAt,
+    ])) };
+  };
   return {
     /** Main-private coverage receipts share this account's existing table. No public SQL port. */
     consumerGuardReceiptIdentity: db,
     /** Read only actual native publication action records in this owner's account DB. */
     async unknownNativePublicationEffects(pluginId: string): Promise<number> {
-      assertOwner();
-      const rows = await db.drizzle
-        .select()
-        .from(table)
-        .where(
-          and(
-            eq(table.pluginId, pluginId),
-            sql`(${table.id} LIKE 'native-publication:%' OR ${table.targetId} LIKE 'restricted:publication:%' OR (CASE WHEN json_valid(${table.payload}) THEN json_extract(${table.payload}, '$.schema') ELSE NULL END) = 'native-publication-action/v1')`,
-          ),
-        );
-      assertOwner();
-      let unknown = 0;
-      const deny = (): never => {
-        throw Error('PUBLICATION_NATIVE_EFFECT_FACTS_UNKNOWN');
-      };
-      const states = [
-        'PREPARED_NO_REMOTE_EFFECT',
-        'DISPATCHING_UNKNOWN',
-        'APPLIED_VERIFIED',
-        'REJECTED_NO_DISPATCH',
-        'UNKNOWN',
-      ];
-      const phases = ['remote-staging-prepare', 'remote-staging-upload', 'remote-transaction'];
-      for (const row of rows) {
-        let a: any;
-        try {
-          a = JSON.parse(row.payload);
-        } catch {
-          deny();
-        }
-        if (
-          !a ||
-          a.schema !== 'native-publication-action/v1' ||
-          a.pluginId !== pluginId ||
-          row.operation !== 'target' ||
-          typeof a.nativeActionId !== 'string' ||
-          !/^[a-f0-9-]{36}$/.test(a.nativeActionId) ||
-          row.id !== 'native-publication:' + a.nativeActionId ||
-          !states.includes(a.state) ||
-          a.actionRevision !== 1 ||
-          !Number.isSafeInteger(a.stateRevision) ||
-          a.stateRevision < 1 ||
-          a.stateRevision !== row.revision ||
-          row.fingerprint !== publicationDigest(a)
-        )
-          deny();
-        const bindings = [
-          a.principalId,
-          a.partnerId,
-          a.runId,
-          a.sourceOutputMessageId,
-          a.completedOutputSha256,
-        ];
-        if (
-          bindings.some((v) => typeof v !== 'string' || !v || Buffer.byteLength(v) > 512) ||
-          !/^[a-f0-9]{64}$/.test(a.completedOutputSha256)
-        )
-          deny();
-        const target =
-          'restricted:publication:' + publicationDigest([pluginId, ...bindings, 'PUBLIC_RELEASE']);
-        if (
-          row.targetId !== target ||
-          row.requestKey !== target ||
-          !Array.isArray(a.effects) ||
-          a.effects.length > 3 ||
-          a.effects.some((v: any, i: number) => v !== phases[i])
-        )
-          deny();
-        if (
-          ['PREPARED_NO_REMOTE_EFFECT', 'REJECTED_NO_DISPATCH'].includes(a.state) &&
-          a.effects.length !== 0
-        )
-          deny();
-        if (
-          a.state === 'APPLIED_VERIFIED' &&
-          (a.effects.length !== 3 || !/^[a-f0-9]{64}$/.test(a.receiptSha256))
-        )
-          deny();
-        if (a.state === 'UNKNOWN' || a.state === 'DISPATCHING_UNKNOWN') unknown++;
-      }
-      assertOwner();
-      return unknown;
+      return (await nativePublicationFacts(pluginId)).unknown;
     },
     async unresolvedConsumerGuardAdmissions(pluginId: string, accountScopeRef: string) {
       assertOwner();
       const [row] = await db.drizzle
         .select({ count: sql<number>`count(*)` })
         .from(table)
-        .where(
-          and(
-            eq(table.operation, 'target'),
-            eq(table.pluginId, pluginId),
-            sql`${table.targetId} LIKE ${`publication-coverage:${accountScopeRef}:%`}`,
-            sql`json_extract(${table.payload}, '$.schema') IN ('publication-coverage-admission/v1', 'publication-managed-job/v1')`,
-            sql`coalesce(json_extract(${table.payload}, '$.state'), 'UNKNOWN') <> 'COMPLETE'`,
-          ),
-        );
+        .where(unresolvedAdmissionPredicate(pluginId, accountScopeRef));
       assertOwner();
       const count = Number(row?.count);
       if (!Number.isSafeInteger(count) || count < 0)
@@ -157,18 +162,38 @@ export function createRestrictedPartnerStore(db: DbClient, assertOwner: () => vo
       key: string,
       previous: { revision: number; payload: string } | undefined,
       payload: string,
+      requirePublicationDrained = false,
     ) {
       assertOwner();
       if (
         !/^[a-f0-9]{64}$/.test(accountScopeRef) ||
         !/^[a-f0-9]{64}$/.test(key) ||
         Buffer.byteLength(payload) > 65536 ||
+        typeof requirePublicationDrained !== 'boolean' ||
+        (requirePublicationDrained && !previous) ||
         (previous && (!Number.isSafeInteger(previous.revision) || previous.revision < 1))
       )
         throw Error('PUBLICATION_COVERAGE_RECEIPT_INVALID');
       const target = `publication-coverage:${accountScopeRef}:${key}`;
       const nextRevision = (previous?.revision ?? 0) + 1;
       if (!Number.isSafeInteger(nextRevision)) throw Error('PUBLICATION_COVERAGE_RECEIPT_INVALID');
+      let drained: ReturnType<typeof and>;
+      if (requirePublicationDrained) {
+        const facts = await nativePublicationFacts(pluginId);
+        if (facts.unknown !== 0) return false;
+        // The UPDATE must observe the same complete native rows that passed
+        // validation, not just a zero count or a caller-supplied state label.
+        // An inserted, deleted or changed row (including malformed/APPLIED
+        // records) makes this predicate false before the receipt can advance.
+        drained = and(
+          sql`NOT EXISTS (SELECT 1 FROM ${table} WHERE ${unresolvedAdmissionPredicate(pluginId, accountScopeRef)})`,
+          sql`(SELECT coalesce(json_group_array(json(native_record)), '[]') FROM
+            (SELECT json_array(${table.id}, ${table.pluginId}, ${table.operation}, ${table.targetId},
+              ${table.requestKey}, ${table.fingerprint}, ${table.payload}, ${table.revision}, ${table.createdAt}) AS native_record
+              FROM ${table} WHERE ${nativePublicationPredicate(pluginId)} ORDER BY ${table.id})) = ${facts.snapshot}`,
+        );
+      }
+      assertOwner();
       const result = previous
         ? await db.drizzle
             .update(table)
@@ -180,6 +205,7 @@ export function createRestrictedPartnerStore(db: DbClient, assertOwner: () => vo
                 eq(table.targetId, target),
                 eq(table.revision, previous.revision),
                 eq(table.payload, previous.payload),
+                drained,
               ),
             )
             .returning({ id: table.id })
