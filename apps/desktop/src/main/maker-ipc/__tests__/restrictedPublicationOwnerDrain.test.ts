@@ -3,8 +3,9 @@ import { afterEach, expect, it } from 'vitest';
 import Database from 'better-sqlite3';
 import { drizzle } from 'drizzle-orm/sqlite-proxy';
 import type { DbClient } from '../../localDb/client/DbClient.js';
-import { createRestrictedPartnerStore } from '../restrictedPartnerStore.js';
+import { createRestrictedPartnerStore, readPublicationHistoryReceipt } from '../restrictedPartnerStore.js';
 import { digest } from '../restrictedPublicationProtocol.js';
+import { assertNoUncertainPublicationCutover } from '../restrictedPublicationPolicyCutover.js';
 
 const plugin = 'synthetic.owner-drain';
 const account = 'a'.repeat(64);
@@ -150,6 +151,68 @@ it('preserves a competing winner of the original receipt CAS', async () => {
   });
 });
 
+/** Source-closure regression: a census cannot omit terminal/old rows or race
+ * a new original registration between a complete read and its committing CAS.
+ * These exercise the production Store and actual SQLite; no source facts are
+ * fabricated. The existing drain tests do not cover full owner-row snapshots.
+ * Minimal input: one old terminal row and a concurrent original-table insert.
+ * Tier: existing SQLite Store integration fixture in this file.
+ */
+it('captures the complete original owner history, including old terminal rows', async () => {
+  const f = await fixture();
+  const oldKey = 'c'.repeat(64);
+  await f.store.compareAndSwapConsumerGuardReceipt(plugin, account, oldKey, undefined,
+    JSON.stringify({ schema: 'publication-original-owner-listener/v1', state: 'REVOKED', generation: 'old' }));
+  f.db.prepare('UPDATE plugin_task_requests SET created_at=1 WHERE request_key=?').run(oldKey);
+  const handle = await f.store.capturePublicationOwnerHistory(plugin, account);
+  const actual = readPublicationHistoryReceipt(handle, f.store.consumerGuardReceiptIdentity, plugin, account);
+  expect(actual.rows.map(x => x.requestKey).sort()).toEqual([key, oldKey].sort());
+  expect(actual.rows.find(x => x.requestKey === oldKey)?.createdAt).toBe(1);
+  await expect(f.store.assertPublicationOwnerHistoryCurrent(handle, plugin, account)).resolves.toBeUndefined();
+  expect(() => readPublicationHistoryReceipt(structuredClone(handle), f.store.consumerGuardReceiptIdentity, plugin, account))
+    .toThrow('PUBLICATION_OWNER_HISTORY_HANDLE_REQUIRED');
+  expect(() => readPublicationHistoryReceipt(handle, f.store.consumerGuardReceiptIdentity, plugin, 'd'.repeat(64)))
+    .toThrow('PUBLICATION_OWNER_HISTORY_HANDLE_REQUIRED');
+});
+
+it.each(['insert', 'delete', 'change'])(
+  'binds the complete owner history to the final drain CAS against %s', async mutation => {
+    const f = await fixture();
+    const oldKey = 'c'.repeat(64);
+    await f.store.compareAndSwapConsumerGuardReceipt(plugin, account, oldKey, undefined,
+      JSON.stringify({ state: 'OLD_RETIRED' }));
+    const handle = await f.store.capturePublicationOwnerHistory(plugin, account);
+    f.afterNativeRead(() => {
+      if (mutation === 'insert') {
+        const lateKey = 'd'.repeat(64);
+        f.db.prepare('INSERT INTO plugin_task_requests VALUES(?,?,?,?,?,?,?,?,?)').run(
+          `publication-coverage:${plugin}:${account}:${lateKey}`, plugin, 'target',
+          `publication-coverage:${account}:${lateKey}`, lateKey, account,
+          '{"state":"STARTING"}', 1, 1,
+        );
+      } else if (mutation === 'delete') {
+        f.db.prepare('DELETE FROM plugin_task_requests WHERE request_key=?').run(oldKey);
+      } else {
+        f.db.prepare('UPDATE plugin_task_requests SET payload=?,revision=revision+1 WHERE request_key=?')
+          .run('{"state":"UNKNOWN"}', oldKey);
+      }
+    });
+    expect(await f.store.compareAndSwapConsumerGuardReceipt(plugin, account, key, f.previous,
+      '{"state":"RETIRED"}', true, handle)).toBe(false);
+    expect(await f.store.readConsumerGuardReceipt(plugin, account, key)).toEqual(f.previous);
+    await expect(f.store.assertPublicationOwnerHistoryCurrent(handle, plugin, account))
+      .rejects.toThrow('PUBLICATION_OWNER_HISTORY_CHANGED');
+  },
+);
+
+it('rejects malformed original history rather than removing it from the census', async () => {
+  const f = await fixture();
+  f.db.prepare('UPDATE plugin_task_requests SET operation=?,payload=? WHERE request_key=?')
+    .run('foreign-operation', '{malformed', key);
+  await expect(f.store.capturePublicationOwnerHistory(plugin, account))
+    .rejects.toThrow('PUBLICATION_OWNER_HISTORY_UNKNOWN');
+});
+
 it('keeps native history scoped to the original plugin', async () => {
   const f = await fixture();
   f.afterNativeRead(() => f.native('UNKNOWN', 'synthetic.other-plugin'));
@@ -162,6 +225,21 @@ it('requires an existing receipt when requesting the atomic drain gate', async (
     plugin, account, 'e'.repeat(64), undefined, '{}', true,
   )).rejects.toThrow('PUBLICATION_COVERAGE_RECEIPT_INVALID');
   expect(await f.store.readConsumerGuardReceipt(plugin, account, 'e'.repeat(64))).toBeUndefined();
+});
+
+it('a cutover preflight cannot adopt a competing row after its real history capture', async () => {
+  const f = await fixture();
+  const racingStore = { ...f.store, capturePublicationOwnerHistory: async (p: string, a: string) => {
+    const actual = await f.store.capturePublicationOwnerHistory(p, a);
+    // Inject a competing SQLite write after the real private snapshot. The
+    // original handle and Store verification are never replaced by JSON.
+    f.db.prepare('UPDATE plugin_task_requests SET payload=?,revision=revision+1 WHERE request_key=?')
+      .run('{"state":"UNKNOWN"}', key);
+    return actual;
+  } };
+  await expect(assertNoUncertainPublicationCutover(racingStore, plugin, account))
+    .rejects.toThrow('PUBLICATION_OWNER_HISTORY_CHANGED');
+  expect((await f.store.readConsumerGuardReceipt(plugin, account, key))?.payload).toBe('{"state":"UNKNOWN"}');
 });
 
 it('preserves existing CAS behavior when no drain gate is requested', async () => {

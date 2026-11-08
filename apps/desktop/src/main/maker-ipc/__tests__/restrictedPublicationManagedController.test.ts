@@ -11,6 +11,7 @@ import { createRestrictedPartnerStore } from '../restrictedPartnerStore.js';
 import {
   ManagedPublicationController,
   readManagedLifecycleReceipt,
+  readPreparedInstallReceipt,
   type PublisherReleaseSource,
 } from '../restrictedPublicationManagedController.js';
 import { supportedPublicationRoot } from '../restrictedPublicationCaller.js';
@@ -80,6 +81,140 @@ async function fixture() {
       ).toEqual({ payload: '{"state":"UNKNOWN"}', revision: 2 }),
   };
 }
+
+/** Real SQLite, real immutable file writes and the original Controller's private
+ * DRAINED handles. Fixture source bytes are deliberately synthetic and are never
+ * executed; these tests do not claim an original resident or global census. */
+async function preparedFixture() {
+  const f = await fixture();
+  await f.controller.install(f.source, 'old-generation', 'old-operation');
+  await f.controller.switchEntry('old-generation');
+  await f.controller.revoke();
+  await f.controller.drain(20);
+  const drained = await f.controller.produceLifecycle('DRAINED');
+  return { ...f, drained };
+}
+
+it('stages exact owned bytes without invalidating the real old DRAINED handle, then commits once', async () => {
+  const f = await preparedFixture();
+  const before = await f.controller.verifyLifecycleReceipt(f.drained);
+  const prepared = await f.controller.prepareInstall(f.source, 'next-generation', 'next-operation', f.drained);
+  const observed = readPreparedInstallReceipt(prepared, f.controller);
+  expect(observed).toMatchObject({ scope: 'OWNED_RELEASE_PREPARED_ONLY', generation: 'next-generation',
+    operationId: 'next-operation', files: f.source.files });
+  expect(observed.root).not.toBe(before.root);
+  expect(await readFile(path.join(observed.root, 'scripts/publish_generic_html_direct.py'), 'utf8'))
+    .toBe('# synthetic fixture source, not production-ready');
+  expect(await f.controller.verifyLifecycleReceipt(f.drained)).toEqual(before);
+  expect((await f.controller.inspect()).release?.generation).toBe('old-generation');
+  expect(await f.controller.verifyPreparedInstall(prepared)).toEqual(observed);
+  expect(() => readPreparedInstallReceipt(structuredClone(observed), f.controller)).toThrow('PREPARED_INSTALL_HANDLE');
+  const committing = f.controller.commitPreparedInstall(prepared);
+  const duplicate = expect(f.controller.commitPreparedInstall(prepared)).rejects.toThrow('PREPARED_INSTALL_HANDLE');
+  expect(await committing).toMatchObject({ root: observed.root, generation: 'next-generation' });
+  await duplicate;
+  expect(() => readManagedLifecycleReceipt(f.drained, f.controller)).toThrow('LIFECYCLE_RECEIPT');
+  const installed = readManagedLifecycleReceipt(await f.controller.produceLifecycle('INSTALLED'), f.controller);
+  expect(installed).toMatchObject({ phase: 'INSTALLED', operationId: 'next-operation', root: observed.root,
+    releaseSequence: before.releaseSequence + 1, lifecycleSequence: before.lifecycleSequence + 1 });
+  expect(installed.binding.ownerEpoch).toBeGreaterThan(before.binding.ownerEpoch);
+  expect(() => f.controller.assertCurrent(observed.root)).toThrow('REVOKED');
+  expect(f.sqlite.prepare("SELECT json_extract(payload,'$.state') AS state FROM plugin_task_requests WHERE json_extract(payload,'$.schema')='publication-managed-prepared-install/v1'").get())
+    .toEqual({ state: 'COMMITTED' });
+  f.preserved();
+});
+
+it('rejects copied or foreign original drain authority before claiming a prepared generation', async () => {
+  const f = await preparedFixture();
+  const copy = structuredClone(await f.controller.verifyLifecycleReceipt(f.drained));
+  await expect(f.controller.prepareInstall(f.source, 'next-generation', 'next-operation', copy))
+    .rejects.toThrow('LIFECYCLE_RECEIPT');
+  const other = new ManagedPublicationController(f.store, 'plugin', f.account, sha('synthetic-device'), f.owner);
+  await expect(other.prepareInstall(f.source, 'next-generation', 'next-operation', f.drained))
+    .rejects.toThrow('LIFECYCLE_RECEIPT');
+  expect(f.sqlite.prepare("SELECT COUNT(*) AS count FROM plugin_task_requests WHERE json_extract(payload,'$.schema')='publication-managed-prepared-install/v1'").get()).toEqual({ count: 0 });
+  f.preserved();
+});
+
+it('retains an uncertain preparation and rejects ordinary install or a new operation for the same generation', async () => {
+  const f = await preparedFixture();
+  await writeFile(path.join(f.source.sourceRoot, 'scripts/publish_generic_html_direct.py'), 'changed source');
+  await expect(f.controller.prepareInstall(f.source, 'next-generation', 'next-operation', f.drained))
+    .rejects.toThrow('SOURCE_DRIFT');
+  expect(f.sqlite.prepare("SELECT json_extract(payload,'$.state') AS state FROM plugin_task_requests WHERE json_extract(payload,'$.schema')='publication-managed-prepared-install/v1'").get())
+    .toEqual({ state: 'UNKNOWN' });
+  expect((await f.controller.verifyLifecycleReceipt(f.drained)).phase).toBe('DRAINED');
+  await expect(f.controller.prepareInstall(f.source, 'next-generation', 'replacement-operation', f.drained))
+    .rejects.toThrow('GENERATION_PREPARED');
+  await expect(f.controller.install(f.source, 'next-generation', 'replacement-operation'))
+    .rejects.toThrow('GENERATION_PREPARED');
+  f.preserved();
+});
+
+it('permanently consumes a prepared handle when staged immutable bytes drift', async () => {
+  const f = await preparedFixture();
+  const prepared = await f.controller.prepareInstall(f.source, 'next-generation', 'next-operation', f.drained);
+  const observed = readPreparedInstallReceipt(prepared, f.controller);
+  await writeFile(path.join(observed.root, 'scripts/publish_generic_html_direct.py'), 'drift');
+  await expect(f.controller.verifyPreparedInstall(prepared)).rejects.toThrow('SOURCE_DRIFT');
+  await expect(f.controller.commitPreparedInstall(prepared)).rejects.toThrow('PREPARED_INSTALL_HANDLE');
+  expect(() => readPreparedInstallReceipt(prepared, f.controller)).toThrow('PREPARED_INSTALL_HANDLE');
+  expect(f.sqlite.prepare("SELECT json_extract(payload,'$.state') AS state FROM plugin_task_requests WHERE json_extract(payload,'$.schema')='publication-managed-prepared-install/v1'").get())
+    .toEqual({ state: 'UNKNOWN' });
+  f.preserved();
+});
+
+it('the real history/native-drain CAS rejects a newly inserted UNKNOWN before prepared commit', async () => {
+  const f = await preparedFixture();
+  const prepared = await f.controller.prepareInstall(f.source, 'next-generation', 'next-operation', f.drained);
+  const compare = f.store.compareAndSwapConsumerGuardReceipt;
+  let inserted = false;
+  f.store.compareAndSwapConsumerGuardReceipt = async (...args) => {
+    if (!inserted && JSON.parse(args[4]).state === 'COMMITTING_UNKNOWN') {
+      inserted = true;
+      await compare('plugin', f.account, sha('prepared-commit-race'), undefined,
+        JSON.stringify({ schema: 'publication-managed-job/v1', state: 'UNKNOWN' }));
+    }
+    return compare(...args);
+  };
+  await expect(f.controller.commitPreparedInstall(prepared)).rejects.toThrow('PREPARED_INSTALL_CLAIM');
+  expect(inserted).toBe(true);
+  expect((await f.controller.inspect()).state).toBe('UNKNOWN');
+  expect(await f.store.unresolvedConsumerGuardAdmissions('plugin', f.account)).toBe(1);
+  expect(f.sqlite.prepare("SELECT json_extract(payload,'$.state') AS state FROM plugin_task_requests WHERE json_extract(payload,'$.schema')='publication-managed-prepared-install/v1'").get())
+    .toEqual({ state: 'UNKNOWN' });
+  await expect(f.controller.commitPreparedInstall(prepared)).rejects.toThrow('PREPARED_INSTALL_HANDLE');
+  f.preserved();
+});
+
+it('a late prepared commit and its UNKNOWN cleanup preserve an independently written lifecycle winner', async () => {
+  const f = await preparedFixture();
+  const prepared = await f.controller.prepareInstall(f.source, 'next-generation', 'next-operation', f.drained);
+  const original = f.sqlite.prepare("SELECT id,payload,revision FROM plugin_task_requests WHERE json_extract(payload,'$.schema')='publication-managed-lifecycle/v1'").get() as
+    { id: string; payload: string; revision: number };
+  const old = JSON.parse(original.payload);
+  const winner = { payload: JSON.stringify({ ...old, boot: 'independent-controller-winner',
+    sequence: old.sequence + 100, state: 'REVOKED', sourcePhase: 'DRAINED' }), revision: original.revision + 1 };
+  const compare = f.store.compareAndSwapConsumerGuardReceipt;
+  let replaced = false;
+  f.store.compareAndSwapConsumerGuardReceipt = async (...args) => {
+    const accepted = await compare(...args);
+    if (!replaced && accepted && JSON.parse(args[4]).state === 'COMMITTING_UNKNOWN') {
+      replaced = true;
+      f.sqlite.prepare('UPDATE plugin_task_requests SET payload=?,revision=? WHERE id=?')
+        .run(winner.payload, winner.revision, original.id);
+    }
+    return accepted;
+  };
+  await expect(f.controller.commitPreparedInstall(prepared)).rejects.toThrow('CAS');
+  expect(replaced).toBe(true);
+  expect(f.sqlite.prepare('SELECT payload,revision FROM plugin_task_requests WHERE id=?').get(original.id))
+    .toEqual(winner);
+  expect(f.sqlite.prepare("SELECT json_extract(payload,'$.state') AS state FROM plugin_task_requests WHERE json_extract(payload,'$.schema')='publication-managed-prepared-install/v1'").get())
+    .toEqual({ state: 'COMMITTING_UNKNOWN' });
+  await expect(f.controller.commitPreparedInstall(prepared)).rejects.toThrow('PREPARED_INSTALL_HANDLE');
+  f.preserved();
+});
 it('installs exact immutable release, switches its owned entry, revokes before subsequent use, never asserts external coverage', async () => {
   const f = await fixture();
   const r = await f.controller.install(f.source, 'g1');

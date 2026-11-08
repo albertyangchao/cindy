@@ -82,7 +82,7 @@ export interface ControlledCoverageDriver {
   readonly accountScopeRef: string;
   readonly registration: CoverageRegistration;
   assertCurrent(fenceRef?: string): void;
-  quiesce(): Promise<void>;
+  quiesce(nextGeneration?: string): Promise<void>;
   switchRelease(generation: string, previousSequence: number): Promise<ControlledCoverageReport>;
 }
 const controllerHandles = new WeakMap<object, ControlledCoverageDriver>();
@@ -389,7 +389,7 @@ export class ConsumerGuardCoverageAuthority {
       await this.save(this.stateKey, row, next);
       let q = await this.read(this.stateKey);
       try {
-        await this.driver!.quiesce();
+        await this.driver!.quiesce(generation);
         this.current();
         if (
           (await this.store.unresolvedConsumerGuardAdmissions(

@@ -7,6 +7,40 @@ import type {
   RestrictedPartnerGrant,
 } from './restrictedPartnerExecution.js';
 
+type PublicationHistoryRow = {
+  id: string;
+  pluginId: string;
+  operation: string;
+  targetId: string;
+  requestKey: string;
+  fingerprint: string;
+  payload: string;
+  revision: number;
+  createdAt: number;
+};
+type PublicationHistory = {
+  identity: object;
+  pluginId: string;
+  accountScopeRef: string;
+  rows: PublicationHistoryRow[];
+  snapshot: string;
+};
+const publicationHistories = new WeakMap<object, PublicationHistory>();
+
+/** A complete original-table read, held by Main. JSON cannot restore this handle. */
+export function readPublicationHistoryReceipt(
+  handle: object,
+  identity: object,
+  pluginId: string,
+  accountScopeRef: string,
+) {
+  const value = publicationHistories.get(handle);
+  if (!value || value.identity !== identity || value.pluginId !== pluginId ||
+      value.accountScopeRef !== accountScopeRef)
+    throw Error('PUBLICATION_OWNER_HISTORY_HANDLE_REQUIRED');
+  return { rows: structuredClone(value.rows), sha256: publicationDigest(value.snapshot) };
+}
+
 /** Account-bound adapter over the existing receipt table. No new DB/schema migration. */
 export function createRestrictedPartnerStore(db: DbClient, assertOwner: () => void) {
   const table = pluginTaskRequests;
@@ -37,6 +71,46 @@ export function createRestrictedPartnerStore(db: DbClient, assertOwner: () => vo
     sql`json_extract(${table.payload}, '$.schema') IN ('publication-coverage-admission/v1', 'publication-managed-job/v1')`,
     sql`coalesce(json_extract(${table.payload}, '$.state'), 'UNKNOWN') <> 'COMPLETE'`,
   );
+  const ownerHistoryPredicate = (pluginId: string, accountScopeRef: string) => and(
+    eq(table.pluginId, pluginId),
+    // Include malformed and wrong-operation rows in the original namespace:
+    // they must fail the source read, rather than disappear from a census.
+    sql`(${table.targetId} LIKE ${`publication-coverage:${accountScopeRef}:%`} OR ${table.id} LIKE ${`publication-coverage:${pluginId}:${accountScopeRef}:%`})`,
+  );
+  const historyColumns = (rows: PublicationHistoryRow[]) => JSON.stringify(rows.map(row => [
+    row.id, row.pluginId, row.operation, row.targetId, row.requestKey,
+    row.fingerprint, row.payload, row.revision, row.createdAt,
+  ]));
+  const ownerHistoryFacts = async (pluginId: string, accountScopeRef: string) => {
+    assertOwner();
+    if (!/^[a-f0-9]{64}$/.test(accountScopeRef))
+      throw Error('PUBLICATION_OWNER_HISTORY_SCOPE');
+    const rows = await db.drizzle.select().from(table)
+      .where(ownerHistoryPredicate(pluginId, accountScopeRef)).orderBy(table.id);
+    assertOwner();
+    for (const row of rows) {
+      const prefix = `publication-coverage:${accountScopeRef}:`;
+      const key = row.targetId.startsWith(prefix) ? row.targetId.slice(prefix.length) : '';
+      if (!/^[a-f0-9]{64}$/.test(key) || row.operation !== 'target' ||
+          row.pluginId !== pluginId || row.requestKey !== key ||
+          row.id !== `publication-coverage:${pluginId}:${accountScopeRef}:${key}` ||
+          row.fingerprint !== accountScopeRef || !Number.isSafeInteger(row.revision) ||
+          row.revision < 1 || !Number.isSafeInteger(row.createdAt) || row.createdAt < 0 ||
+          Buffer.byteLength(row.payload) > 65536)
+        throw Error('PUBLICATION_OWNER_HISTORY_UNKNOWN');
+      try {
+        const value: unknown = JSON.parse(row.payload);
+        if (!value || typeof value !== 'object' || Array.isArray(value))
+          throw Error('schema');
+      } catch {
+        throw Error('PUBLICATION_OWNER_HISTORY_UNKNOWN');
+      }
+    }
+    const snapshot = historyColumns(rows);
+    if (Buffer.byteLength(snapshot) > 1048576)
+      throw Error('PUBLICATION_OWNER_HISTORY_LIMIT');
+    return { rows, snapshot };
+  };
   const nativePublicationFacts = async (pluginId: string) => {
     assertOwner();
     const rows = await db.drizzle
@@ -123,6 +197,20 @@ export function createRestrictedPartnerStore(db: DbClient, assertOwner: () => vo
   return {
     /** Main-private coverage receipts share this account's existing table. No public SQL port. */
     consumerGuardReceiptIdentity: db,
+    /** No time window, LIMIT, latest-only selection, or removal of terminal rows. */
+    async capturePublicationOwnerHistory(pluginId: string, accountScopeRef: string) {
+      const facts = await ownerHistoryFacts(pluginId, accountScopeRef);
+      const handle = Object.freeze(Object.create(null)) as object;
+      publicationHistories.set(handle, { identity: db, pluginId, accountScopeRef, ...facts });
+      return handle;
+    },
+    async assertPublicationOwnerHistoryCurrent(handle: object, pluginId: string, accountScopeRef: string) {
+      readPublicationHistoryReceipt(handle, db, pluginId, accountScopeRef);
+      const expected = publicationHistories.get(handle)!;
+      const actual = await ownerHistoryFacts(pluginId, accountScopeRef);
+      if (actual.snapshot !== expected.snapshot)
+        throw Error('PUBLICATION_OWNER_HISTORY_CHANGED');
+    },
     /** Read only actual native publication action records in this owner's account DB. */
     async unknownNativePublicationEffects(pluginId: string): Promise<number> {
       return (await nativePublicationFacts(pluginId)).unknown;
@@ -163,6 +251,7 @@ export function createRestrictedPartnerStore(db: DbClient, assertOwner: () => vo
       previous: { revision: number; payload: string } | undefined,
       payload: string,
       requirePublicationDrained = false,
+      requiredOwnerHistory?: object,
     ) {
       assertOwner();
       if (
@@ -171,6 +260,7 @@ export function createRestrictedPartnerStore(db: DbClient, assertOwner: () => vo
         Buffer.byteLength(payload) > 65536 ||
         typeof requirePublicationDrained !== 'boolean' ||
         (requirePublicationDrained && !previous) ||
+        (requiredOwnerHistory !== undefined && !previous) ||
         (previous && (!Number.isSafeInteger(previous.revision) || previous.revision < 1))
       )
         throw Error('PUBLICATION_COVERAGE_RECEIPT_INVALID');
@@ -178,6 +268,15 @@ export function createRestrictedPartnerStore(db: DbClient, assertOwner: () => vo
       const nextRevision = (previous?.revision ?? 0) + 1;
       if (!Number.isSafeInteger(nextRevision)) throw Error('PUBLICATION_COVERAGE_RECEIPT_INVALID');
       let drained: ReturnType<typeof and>;
+      let historyUnchanged: ReturnType<typeof and>;
+      if (requiredOwnerHistory !== undefined) {
+        readPublicationHistoryReceipt(requiredOwnerHistory, db, pluginId, accountScopeRef);
+        const facts = publicationHistories.get(requiredOwnerHistory)!;
+        historyUnchanged = sql`(SELECT coalesce(json_group_array(json(owner_record)), '[]') FROM
+          (SELECT json_array(${table.id}, ${table.pluginId}, ${table.operation}, ${table.targetId},
+            ${table.requestKey}, ${table.fingerprint}, ${table.payload}, ${table.revision}, ${table.createdAt}) AS owner_record
+            FROM ${table} WHERE ${ownerHistoryPredicate(pluginId, accountScopeRef)} ORDER BY ${table.id})) = ${facts.snapshot}`;
+      }
       if (requirePublicationDrained) {
         const facts = await nativePublicationFacts(pluginId);
         if (facts.unknown !== 0) return false;
@@ -206,6 +305,7 @@ export function createRestrictedPartnerStore(db: DbClient, assertOwner: () => vo
                 eq(table.revision, previous.revision),
                 eq(table.payload, previous.payload),
                 drained,
+                historyUnchanged,
               ),
             )
             .returning({ id: table.id })

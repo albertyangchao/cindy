@@ -33,7 +33,8 @@ type Store = Pick<
   | 'unresolvedConsumerGuardAdmissions'
   | 'unknownNativePublicationEffects'
   | 'consumerGuardReceiptIdentity'
->;
+> & Partial<Pick<ReturnType<typeof createRestrictedPartnerStore>,
+  'capturePublicationOwnerHistory' | 'assertPublicationOwnerHistoryCurrent'>>;
 export interface PublisherReleaseSource {
   /** Main owner-approved source/interpreter/install roots, never renderer/child parameters. */
   sourceRoot: string;
@@ -128,6 +129,33 @@ type LifecycleReceipt = {
   value: ManagedLifecycleObservation;
 };
 const managedLifecycleReceipts = new WeakMap<object, LifecycleReceipt>();
+export interface PreparedInstallObservation {
+  scope: 'OWNED_RELEASE_PREPARED_ONLY';
+  generation: string;
+  operationId: string;
+  root: string;
+  sourceDigest: string;
+  files: Record<string, string>;
+}
+type PreparedInstall = {
+  owner: ManagedPublicationController;
+  epoch: number;
+  drainedHandle: object;
+  key: string;
+  row: { revision: number; payload: string };
+  lifecycleRow: { revision: number; payload: string };
+  source: PublisherReleaseSource;
+  value: PreparedInstallObservation;
+  consumed: boolean;
+};
+const preparedInstalls = new WeakMap<object, PreparedInstall>();
+/** A summary never restores this one-use, original-controller capability. */
+export function readPreparedInstallReceipt(handle: object, owner: ManagedPublicationController): Readonly<PreparedInstallObservation> {
+  const receipt = preparedInstalls.get(handle);
+  if (!receipt || receipt.owner !== owner || receipt.consumed) deny('PREPARED_INSTALL_HANDLE');
+  if (readManagedLifecycleReceipt(receipt.drainedHandle, owner).phase !== 'DRAINED') deny('PREPARED_INSTALL_DRAIN');
+  return structuredClone(receipt.value);
+}
 /** Summaries are transport data; only the original Main-private handle can name a source fact. */
 export function readManagedLifecycleReceipt(
   handle: object,
@@ -213,7 +241,8 @@ export class ManagedPublicationController {
     this.assertEpoch(epoch);
     this.completedLifecycle = { epoch, phase, stateDigest: sha(state), enrollment };
   }
-  private async write(state: Lifecycle, epoch: number) {
+  private async write(state: Lifecycle, epoch: number, requireDrained = false, history?: object,
+    expectedPrevious?: { revision: number; payload: string }) {
     this.assertEpoch(epoch);
     if (![state.sequence, state.releaseSequence, state.lifecycleSequence].every(
       (value) => Number.isSafeInteger(value) && value >= 0,
@@ -224,6 +253,8 @@ export class ManagedPublicationController {
       this.key,
     );
     this.assertEpoch(epoch);
+    if (expectedPrevious && (!old || old.revision !== expectedPrevious.revision ||
+        old.payload !== expectedPrevious.payload)) deny('CAS');
     if (old) {
       let existing: Lifecycle;
       try {
@@ -243,8 +274,10 @@ export class ManagedPublicationController {
       this.plugin,
       this.accountScopeRef,
       this.key,
-      old,
+      expectedPrevious ?? old,
       JSON.stringify(state),
+      requireDrained,
+      history,
     );
     this.assertEpoch(epoch);
     if (!ok) deny('CAS');
@@ -465,6 +498,188 @@ export class ManagedPublicationController {
       if (timer) clearTimeout(timer);
     }
   }
+  private preparedKey(generation: string) {
+    return sha(['publication-managed-prepared-install/v1', this.deviceScopeRef, generation]);
+  }
+  private async preparationHistory() {
+    if (!this.store.capturePublicationOwnerHistory || !this.store.assertPublicationOwnerHistoryCurrent)
+      deny('ORIGINAL_HISTORY_REQUIRED');
+    return this.store.capturePublicationOwnerHistory(this.plugin, this.accountScopeRef);
+  }
+  private async stageRelease(source: PublisherReleaseSource, generation: string, epoch: number): Promise<Release> {
+    const files = { ...source.files };
+    if (!Object.keys(files).length || Object.keys(files).length > 512 ||
+        !files['bridge_core/publication_consumer_controller.py'] ||
+        !files['scripts/publish_generic_html_direct.py']) deny('SOURCE');
+    await this.directory(source.sourceRoot);
+    await this.directory(source.releasesRoot);
+    const pythonRoot = path.dirname(source.python.path);
+    await this.directory(pythonRoot);
+    await this.bytes(pythonRoot, path.basename(source.python.path), source.python.sha256);
+    const target = path.join(source.releasesRoot, sha([this.accountScopeRef, this.deviceScopeRef, generation]));
+    this.assertEpoch(epoch);
+    await mkdir(target, { mode: 0o700 });
+    let totalBytes = 0;
+    for (const [relative, expected] of Object.entries(files)) {
+      const data = await this.bytes(source.sourceRoot, relative, expected);
+      totalBytes += data.byteLength;
+      if (totalBytes > 64 * 1024 * 1024) deny('SOURCE_BUDGET');
+      this.assertEpoch(epoch);
+      const destination = path.join(target, relative);
+      await mkdir(path.dirname(destination), { recursive: true, mode: 0o700 });
+      const temp = destination + '.install-' + randomUUID();
+      const fd = await open(temp, 'wx', 0o600);
+      try { await fd.writeFile(data); await fd.sync(); }
+      finally { await fd.close(); }
+      this.ownerCurrent();
+      if (epoch !== this.epoch) { await unlink(temp); deny('REVOKED'); }
+      await rename(temp, destination);
+      await this.bytes(target, relative, expected);
+    }
+    this.assertEpoch(epoch);
+    return { generation, root: target, sourceDigest: sha(files), files };
+  }
+  /** Stage only an owned immutable tree while the exact old DRAINED receipt
+   * remains current. The irreversible claim precedes the first filesystem write;
+   * failure retains UNKNOWN and the partial directory, with no replay path. */
+  async prepareInstall(source: PublisherReleaseSource, generation: string, operationId: string,
+    drainedHandle: object): Promise<object> {
+    source = structuredClone(source);
+    const epoch = this.epoch;
+    return this.exclusive(async () => {
+      this.assertEpoch(epoch);
+      const drained = await this.verifyLifecycleReceipt(drainedHandle);
+      if (drained.phase !== 'DRAINED' || !this.closed || drained.ownedJobs !== 0 ||
+          drained.unresolvedAdmissions !== 0 || drained.unknownNativeEffects !== 0) deny('PREPARED_INSTALL_DRAIN');
+      const state = await this.state(epoch);
+      if (!opaque(generation) || !opaque(operationId) || generation === drained.binding.generation ||
+          operationId === drained.operationId || state.usedGenerations.includes(generation) ||
+          state.usedGenerations.length >= 1024) deny('GENERATION');
+      const lifecycleRow = await this.store.readConsumerGuardReceipt(this.plugin, this.accountScopeRef, this.key);
+      if (!lifecycleRow || sha(JSON.parse(lifecycleRow.payload)) !== sha(state)) deny('PREPARED_INSTALL_DRAIN');
+      const key = this.preparedKey(generation);
+      if (await this.store.readConsumerGuardReceipt(this.plugin, this.accountScopeRef, key)) deny('GENERATION_PREPARED');
+      this.assertEpoch(epoch);
+      const claim = { schema: 'publication-managed-prepared-install/v1', state: 'UNKNOWN',
+        preparationPhase: 'CLAIMED_ONLY',
+        accountScopeRef: this.accountScopeRef, deviceScopeRef: this.deviceScopeRef,
+        boot: this.boot, generation, operationId, originalDrain: canonicalDigest(drained),
+        sourceDigest: canonicalDigest(source) };
+      let row = { revision: 1, payload: JSON.stringify(claim) };
+      // The first INSERT is only an irreversible reservation, never admission.
+      // The Store's atomic history/native-drain predicate applies to UPDATE.
+      if (!await this.store.compareAndSwapConsumerGuardReceipt(this.plugin, this.accountScopeRef,
+          key, undefined, row.payload)) deny('GENERATION_PREPARED');
+      const history = await this.preparationHistory();
+      this.assertEpoch(epoch);
+      const staging = JSON.stringify({ ...claim, preparationPhase: 'STAGING' });
+      if (!await this.store.compareAndSwapConsumerGuardReceipt(this.plugin, this.accountScopeRef,
+          key, row, staging, true, history)) deny('GENERATION_PREPARED');
+      row = { revision: row.revision + 1, payload: staging };
+      // Nothing below changes the original lifecycle row or its epoch.
+      const release = await this.stageRelease(source, generation, epoch);
+      await this.verifyLifecycleReceipt(drainedHandle);
+      const handle = Object.freeze(Object.create(null)) as object;
+      const receipt: PreparedInstall = { owner: this, epoch, drainedHandle, key, row, lifecycleRow, source,
+        value: { scope: 'OWNED_RELEASE_PREPARED_ONLY', operationId, ...release }, consumed: false };
+      await this.verifyPreparedRecord(receipt);
+      preparedInstalls.set(handle, receipt);
+      return handle;
+    });
+  }
+  private async verifyPreparedRecord(receipt: PreparedInstall) {
+    this.assertEpoch(receipt.epoch);
+    const verifyOriginalRow = async () => {
+      const original = await this.store.readConsumerGuardReceipt(this.plugin, this.accountScopeRef, this.key);
+      if (!original || original.revision !== receipt.lifecycleRow.revision ||
+          original.payload !== receipt.lifecycleRow.payload) deny('PREPARED_INSTALL_DRAIN');
+    };
+    await verifyOriginalRow();
+    const drained = await this.verifyLifecycleReceipt(receipt.drainedHandle);
+    if (drained.phase !== 'DRAINED' || !this.closed || this.jobs.size ||
+        await this.store.unresolvedConsumerGuardAdmissions(this.plugin, this.accountScopeRef) !== 0 ||
+        await this.store.unknownNativePublicationEffects(this.plugin) !== 0) deny('PREPARED_INSTALL_DRAIN');
+    const row = await this.store.readConsumerGuardReceipt(this.plugin, this.accountScopeRef, receipt.key);
+    if (!row || row.revision !== receipt.row.revision || row.payload !== receipt.row.payload) deny('PREPARED_INSTALL_CLAIM');
+    await this.directory(receipt.value.root);
+    const pythonRoot = path.dirname(receipt.source.python.path);
+    await this.directory(pythonRoot);
+    await this.bytes(pythonRoot, path.basename(receipt.source.python.path), receipt.source.python.sha256);
+    for (const [relative, expected] of Object.entries(receipt.value.files))
+      await this.bytes(receipt.value.root, relative, expected);
+    await verifyOriginalRow();
+    await this.verifyLifecycleReceipt(receipt.drainedHandle);
+    this.assertEpoch(receipt.epoch);
+    return structuredClone(receipt.value);
+  }
+  async verifyPreparedInstall(handle: object): Promise<Readonly<PreparedInstallObservation>> {
+    const receipt = preparedInstalls.get(handle);
+    if (!receipt || receipt.owner !== this || receipt.consumed) deny('PREPARED_INSTALL_HANDLE');
+    try { return await this.verifyPreparedRecord(receipt); }
+    catch (error) { receipt.consumed = true; throw error; }
+  }
+  /** Called only after the original policy/entry cutover succeeds. This commits
+   * the owned tree, never supplies foreign-owner coverage or a production root. */
+  async commitPreparedInstall(handle: object): Promise<Release> {
+    const receipt = preparedInstalls.get(handle);
+    if (!receipt || receipt.owner !== this || receipt.consumed) deny('PREPARED_INSTALL_HANDLE');
+    receipt.consumed = true; // before any await, including another commit call
+    return this.exclusive(async () => {
+      let epoch = receipt.epoch;
+      let proposed: Lifecycle | undefined;
+      try {
+        await this.verifyPreparedRecord(receipt);
+        const old = await this.state(epoch);
+        const committing = JSON.stringify({ ...JSON.parse(receipt.row.payload), state: 'COMMITTING_UNKNOWN' });
+        const before = await this.preparationHistory();
+        this.assertEpoch(epoch);
+        if (!await this.store.compareAndSwapConsumerGuardReceipt(this.plugin, this.accountScopeRef,
+            receipt.key, receipt.row, committing, true, before)) deny('PREPARED_INSTALL_CLAIM');
+        receipt.row = { revision: receipt.row.revision + 1, payload: committing };
+        this.assertEpoch(epoch);
+        epoch = this.invalidate();
+        const { scope: _scope, operationId, ...release } = receipt.value;
+        const installed: Lifecycle = { ...old, boot: this.boot, state: 'INSTALLED', release,
+          operationId, usedGenerations: [...old.usedGenerations, release.generation],
+          sequence: old.sequence + 1, releaseSequence: old.releaseSequence + 1,
+          lifecycleSequence: old.lifecycleSequence + 1, sourcePhase: 'INSTALLED' };
+        proposed = installed;
+        const history = await this.preparationHistory();
+        await this.write(installed, epoch, true, history, receipt.lifecycleRow);
+        const committed = JSON.stringify({ ...JSON.parse(receipt.row.payload), state: 'COMMITTED' });
+        const after = await this.preparationHistory();
+        this.assertEpoch(epoch);
+        if (!await this.store.compareAndSwapConsumerGuardReceipt(this.plugin, this.accountScopeRef,
+            receipt.key, receipt.row, committed, true, after)) deny('PREPARED_INSTALL_CLAIM');
+        this.assertEpoch(epoch);
+        this.release = structuredClone(release);
+        this.completeLifecycle('INSTALLED', installed, epoch);
+        return structuredClone(release);
+      } catch (error) {
+        // Do not overwrite a newer controller epoch or another durable winner.
+        if (epoch === this.epoch) {
+          this.closed = true;
+          this.completedLifecycle = undefined;
+          // Only our exact old row, or the exact row this commit could have
+          // written, may be closed. Never read a DB winner and overwrite it.
+          const original = JSON.parse(receipt.lifecycleRow.payload) as Lifecycle;
+          const candidates = [
+            ...(proposed ? [{ state: proposed, row: { revision: receipt.lifecycleRow.revision + 1,
+              payload: JSON.stringify(proposed) } }] : []),
+            { state: original, row: receipt.lifecycleRow },
+          ];
+          for (const candidate of candidates) {
+            try {
+              await this.write({ ...candidate.state, state: 'UNKNOWN', sequence: candidate.state.sequence + 1 },
+                epoch, false, undefined, candidate.row);
+              break;
+            } catch { /* Preserve the original uncertain claim and any new DB/epoch winner. */ }
+          }
+        }
+        throw error;
+      }
+    });
+  }
   /** Copy a pinned import closure to an immutable generation directory; never mutate old release.
    * A failure keeps the partial directory and UNKNOWN receipt, not an apparently complete install.
    */
@@ -486,6 +701,9 @@ export class ManagedPublicationController {
         s.usedGenerations.length >= 1024
       )
         deny('GENERATION');
+      if (await this.store.readConsumerGuardReceipt(this.plugin, this.accountScopeRef, this.preparedKey(generation)))
+        deny('GENERATION_PREPARED');
+      this.assertEpoch(epoch);
       await this.write({
         ...s,
         boot: this.boot,
@@ -502,50 +720,7 @@ export class ManagedPublicationController {
           )) !== 0
         )
           deny('DRAIN_UNKNOWN');
-        const files = { ...source.files };
-        if (
-          !Object.keys(files).length ||
-          Object.keys(files).length > 512 ||
-          !files['bridge_core/publication_consumer_controller.py'] ||
-          !files['scripts/publish_generic_html_direct.py']
-        )
-          deny('SOURCE');
-        await this.directory(source.sourceRoot);
-        await this.directory(source.releasesRoot);
-        const pythonRoot = path.dirname(source.python.path);
-        await this.directory(pythonRoot);
-        await this.bytes(pythonRoot, path.basename(source.python.path), source.python.sha256);
-        const target = path.join(
-          source.releasesRoot,
-          sha([this.accountScopeRef, this.deviceScopeRef, generation]),
-        );
-        await mkdir(target, { mode: 0o700 });
-        let totalBytes = 0;
-        for (const [relative, expected] of Object.entries(files)) {
-          const data = await this.bytes(source.sourceRoot, relative, expected);
-          totalBytes += data.byteLength;
-          if (totalBytes > 64 * 1024 * 1024) deny('SOURCE_BUDGET');
-          this.ownerCurrent();
-          if (this.epoch !== epoch) deny('REVOKED');
-          const destination = path.join(target, relative);
-          await mkdir(path.dirname(destination), { recursive: true, mode: 0o700 });
-          const temp = destination + '.install-' + randomUUID();
-          const fd = await open(temp, 'wx', 0o600);
-          try {
-            await fd.writeFile(data);
-            await fd.sync();
-          } finally {
-            await fd.close();
-          }
-          this.ownerCurrent();
-          if (this.epoch !== epoch) {
-            await unlink(temp);
-            deny('REVOKED');
-          }
-          await rename(temp, destination);
-          await this.bytes(target, relative, expected);
-        }
-        const release = { generation, root: target, sourceDigest: sha(files), files };
+        const release = await this.stageRelease(source, generation, epoch);
         this.assertEpoch(epoch);
         const current = await this.state();
         this.assertEpoch(epoch);

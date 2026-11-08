@@ -24,6 +24,14 @@ import {
   readHeldPublicationOwnerReceipt,
 } from './restrictedPublicationOwnerSource.js';
 import {
+  RestrictedPublicationResidentSource, readOriginalPublicationPeerReceipt,
+  type PinnedPublicationResidentSource,
+} from './restrictedPublicationResidentSource.js';
+import { RestrictedPublicationOwnerRegistry } from './restrictedPublicationOwnerRegistry.js';
+import { assertNoUncertainPublicationCutover, clonePublicationGenerationPlan, publicationGenerationPlanIdentity,
+  preparePublicationGenerationCutover, commitPublicationGenerationCutover,
+  type MainPublicationGenerationPlan } from './restrictedPublicationPolicyCutover.js';
+import {
   coverageEntries,
   adjacentCoverageEntries,
   type CoverageRegistration,
@@ -74,7 +82,8 @@ type Store = Pick<
   | 'compareAndSwapConsumerGuardReceipt'
   | 'unresolvedConsumerGuardAdmissions'
   | 'unknownNativePublicationEffects'
->;
+> & Partial<Pick<ReturnType<typeof createRestrictedPartnerStore>,
+  'capturePublicationOwnerHistory' | 'assertPublicationOwnerHistoryCurrent'>>;
 export interface FixedCoverageProfile {
   source: PublisherReleaseSource;
   publisher: {
@@ -102,8 +111,13 @@ export interface FixedCoverageProfile {
 export interface MainPublicationSourcePlan {
   operationId: string;
   worker: PinnedPublicationSourceWorker;
+  /** Main-approved future expectations; every generation still needs actual original peers. */
+  generations?: ReadonlyArray<MainPublicationGenerationPlan>;
   /** An additional held source process; never a substitute for C's original owners. */
   ownerSource?: { instanceId: string; profileId: 'canonical-producer' | 'core.monitor.publish'; definitionDigest: string };
+  /** Fixed original-entry listeners. Descriptors remain expectations until the
+   * kernel-authenticated original processes connect; this never starts a service. */
+  originalSources?: ReadonlyArray<PinnedPublicationResidentSource>;
   ci?: {
     instanceId: string;
     head: string;
@@ -115,6 +129,7 @@ type SourcePlanMetadata = {
   operationId: string;
   worker: PinnedPublicationSourceWorker;
   ownerSource?: MainPublicationSourcePlan['ownerSource'];
+  originalSources?: MainPublicationSourcePlan['originalSources'];
   ci?: { instanceId: string; head: string; workflowSha256: string };
 };
 type DriverState = {
@@ -126,70 +141,39 @@ type DriverState = {
   lifecycleSequence: number;
   usedGenerations: string[];
   lastVerified: ControlledCoverageReport | null;
+  selectedPlan?: { generation: string; approvalSha256: string; profileSha256: string; operationId: string } | null;
+  registrationSha256?: string | null;
   state: 'QUIESCING' | 'READY' | 'UNKNOWN';
 };
-const drivers = new WeakSet<object>();
-export function isManagedCoverageDriver(x: unknown): x is ManagedCoverageDriver {
-  return !!x && typeof x === 'object' && drivers.has(x);
-}
-export class ManagedCoverageDriver implements ControlledCoverageDriver {
-  readonly issuerId = randomUUID();
-  readonly registration: CoverageRegistration;
-  private readonly boot = randomUUID();
-  private readonly profile: FixedCoverageProfile;
-  private readonly profileHash: string;
-  private readonly key = sha('publication-coverage-driver/v1');
-  private closed = true;
-  private fence?: string;
-  private leaseUntil = 0;
-  private epoch = 0;
-  private lastClock = 0;
-  private accepted?: ControlledCoverageReport;
-  private readonly sourcePlan?: SourcePlanMetadata;
-  private readonly sourceApproval?: () => void;
-  private sourceBroker?: RestrictedPublicationCISourceBroker;
-  private heldOwner?: { owner: RestrictedPublicationOwnerSource; handle: object };
-  private lastHeldDiagnostics?: ReturnType<RestrictedPublicationOwnerSource['diagnostics']>;
-  private sourceReceipts?: { definition: object; ci?: object };
-  private sourceCleanup?: Promise<void>;
-  private lastSourceDiagnostics?: ReturnType<RestrictedPublicationCISourceBroker['diagnostics']>;
-  constructor(
-    private readonly store: Store,
-    private readonly plugin: string,
-    readonly accountScopeRef: string,
-    readonly controller: ManagedPublicationController,
-    profile: FixedCoverageProfile,
-    private readonly ownerCurrent: () => void,
-    private readonly now: () => number = Date.now,
-    sourcePlan?: MainPublicationSourcePlan,
-  ) {
-    if (
-      !validHash(accountScopeRef) ||
-      controller.accountScopeRef !== accountScopeRef ||
-      !opaque(plugin) ||
-      !(controller instanceof ManagedPublicationController)
-    )
-      fail('SCOPE');
-    this.profile = structuredClone(profile);
-    if (sourcePlan) {
+function normalizeSourcePlan(sourcePlan?: MainPublicationSourcePlan): { metadata?: SourcePlanMetadata; approval?: () => void } {
+  if (sourcePlan) {
       if (!/^[A-Za-z0-9_-]{1,100}$/.test(sourcePlan.operationId) || !sourcePlan.worker?.definition)
         fail('SOURCE_PLAN');
       const ci = sourcePlan.ci;
       const held = sourcePlan.ownerSource;
+      const original = sourcePlan.originalSources;
+      if (original && (!Array.isArray(original) || original.length < 1 || original.length > 16 ||
+          new Set(original.map(x => x.runtimeDirectory)).size !== original.length ||
+          original.some(x => !Array.isArray(x.owners)) ||
+          original.reduce((count, x) => count + x.owners.length, 0) > 64 ||
+          new Set(original.flatMap((x: PinnedPublicationResidentSource) => x.owners.map(y => y.instanceId))).size !==
+            original.reduce((count, x) => count + x.owners.length, 0))) fail('SOURCE_PLAN');
       if (held && (Object.keys(held).sort().join(',') !== 'definitionDigest,instanceId,profileId' ||
           !opaque(held.instanceId) || !validHash(held.definitionDigest) ||
           !['canonical-producer', 'core.monitor.publish'].includes(held.profileId))) fail('SOURCE_PLAN');
       if (ci && (!opaque(ci.instanceId) || !/^[a-f0-9]{40}$/.test(ci.head) ||
           !validHash(ci.workflowSha256) || typeof ci.assertDispatchApproved !== 'function'))
         fail('SOURCE_PLAN');
-      this.sourcePlan = structuredClone({ operationId: sourcePlan.operationId, worker: sourcePlan.worker,
+      const metadata: SourcePlanMetadata = structuredClone({ operationId: sourcePlan.operationId, worker: sourcePlan.worker,
         ...(held ? { ownerSource: held } : {}),
+        ...(original ? { originalSources: original } : {}),
         ...(ci ? { ci: { instanceId: ci.instanceId, head: ci.head, workflowSha256: ci.workflowSha256 } } : {}) });
-      this.sourceApproval = ci?.assertDispatchApproved;
+      return { metadata, approval: ci?.assertDispatchApproved };
     }
-    this.registration = structuredClone(this.profile.registration);
-    this.profileHash = this.expectedProfileHash();
-    const r = this.registration;
+  return {};
+}
+function validateCoverageConfiguration(profile: FixedCoverageProfile, sourcePlan?: SourcePlanMetadata) {
+  const r = profile.registration;
     if (
       !validHash(r.rootIdentity) ||
       !validHash(r.rootDefinitionDigest) ||
@@ -218,7 +202,7 @@ export class ManagedCoverageDriver implements ControlledCoverageDriver {
     }
     if (coverageEntries.some((id) => !r.instances.some((x) => x.entryId === id)))
       fail('MEMBERSHIP');
-    for (const x of this.profile.instances) {
+    for (const x of profile.instances) {
       if (
         !['owned-release', 'foreign-controller'].includes(x.origin) ||
         !['GUARDED', 'NATIVE_NAMESPACE_DENIED', 'RETIRED_FENCED'].includes(x.state)
@@ -238,32 +222,138 @@ export class ManagedCoverageDriver implements ControlledCoverageDriver {
         fail('RETIREMENT_SOURCE_REQUIRED');
       if (
         x.origin === 'owned-release' &&
-        this.registration.instances.find((i) => i.instanceId === x.instanceId)!
-          .entryDefinitionDigest !== coverageEntryDefinition(x.entryId, this.profile.source.files)
+        profile.registration.instances.find((i) => i.instanceId === x.instanceId)!
+          .entryDefinitionDigest !== coverageEntryDefinition(x.entryId, profile.source.files)
       )
         fail('ENTRY_DEFINITION');
     }
-    if (this.sourcePlan?.ci) {
-      const expected = this.profile.instances.find(x => x.instanceId === this.sourcePlan!.ci!.instanceId);
+    if (sourcePlan?.ci) {
+      const expected = profile.instances.find(x => x.instanceId === sourcePlan!.ci!.instanceId);
       if (!expected || expected.origin !== 'foreign-controller' || expected.entryId !== 'worksheet-ci' ||
           expected.state !== 'NATIVE_NAMESPACE_DENIED') fail('CI_SOURCE_PLAN');
     }
+}
+const drivers = new WeakSet<object>();
+export function isManagedCoverageDriver(x: unknown): x is ManagedCoverageDriver {
+  return !!x && typeof x === 'object' && drivers.has(x);
+}
+export class ManagedCoverageDriver implements ControlledCoverageDriver {
+  readonly issuerId = randomUUID();
+  readonly registration: CoverageRegistration;
+  private readonly boot = randomUUID();
+  private profile: FixedCoverageProfile;
+  private readonly profileHash: string;
+  private readonly key = sha('publication-coverage-driver/v1');
+  private closed = true;
+  private fence?: string;
+  private leaseUntil = 0;
+  private epoch = 0;
+  private lastClock = 0;
+  private accepted?: ControlledCoverageReport;
+  private sourcePlan?: SourcePlanMetadata;
+  private sourceApproval?: () => void;
+  private sourceBroker?: RestrictedPublicationCISourceBroker;
+  private originalSources: RestrictedPublicationResidentSource[] = [];
+  private ownerRegistry?: RestrictedPublicationOwnerRegistry;
+  private heldOwner?: { owner: RestrictedPublicationOwnerSource; handle: object };
+  private lastHeldDiagnostics?: ReturnType<RestrictedPublicationOwnerSource['diagnostics']>;
+  private sourceReceipts?: { definition: object; ci?: object };
+  private sourceCleanup?: Promise<void>;
+  private readonly generationPlans = new Map<string, MainPublicationGenerationPlan>();
+  private readonly generationPlanHashes = new Map<string, string>();
+  private initialPlanHash = '';
+  private initialOperationId?: string;
+  private activePlanHash = '';
+  private pendingCutover?: { generation: string; handle: object; plan: MainPublicationGenerationPlan; epoch: number };
+  private lastSourceDiagnostics?: ReturnType<RestrictedPublicationCISourceBroker['diagnostics']>;
+  constructor(
+    private readonly store: Store,
+    private readonly plugin: string,
+    readonly accountScopeRef: string,
+    readonly controller: ManagedPublicationController,
+    profile: FixedCoverageProfile,
+    private readonly ownerCurrent: () => void,
+    private readonly now: () => number = Date.now,
+    sourcePlan?: MainPublicationSourcePlan,
+  ) {
+    if (
+      !validHash(accountScopeRef) ||
+      controller.accountScopeRef !== accountScopeRef ||
+      !opaque(plugin) ||
+      !(controller instanceof ManagedPublicationController)
+    )
+      fail('SCOPE');
+    this.profile = structuredClone(profile);
+    const configured = normalizeSourcePlan(sourcePlan);
+    this.sourcePlan = configured.metadata;
+    this.sourceApproval = configured.approval;
+    this.registration = structuredClone(this.profile.registration);
+    validateCoverageConfiguration(this.profile, this.sourcePlan);
+    this.activePlanHash = this.sourcePlan ? sha({ profile: this.profile, sourcePlan: this.sourcePlan }) : sha(this.profile);
+    this.initialPlanHash = this.activePlanHash;
+    this.initialOperationId = this.sourcePlan?.operationId;
+    const claimed = new Set(this.sourcePlan?.originalSources?.flatMap(x => x.owners.map(y => y.instanceId)) ?? []);
+    const currentMembers = new Set(this.profile.instances.map(x => x.instanceId));
+    const operations = new Set(this.sourcePlan ? [this.sourcePlan.operationId] : []);
+    if (sourcePlan?.generations && (!Array.isArray(sourcePlan.generations) || sourcePlan.generations.length > 16 ||
+        !this.sourcePlan?.originalSources)) fail('GENERATION_PLANS');
+    for (const candidate of sourcePlan?.generations ?? []) {
+      if (!opaque(candidate.generation) || this.generationPlans.has(candidate.generation) ||
+          (candidate.sourcePlan as MainPublicationSourcePlan).generations !== undefined) fail('GENERATION_PLANS');
+      const plan = clonePublicationGenerationPlan(candidate);
+      const next = normalizeSourcePlan(plan.sourcePlan);
+      validateCoverageConfiguration(plan.profile, next.metadata);
+      if (!next.metadata?.originalSources || operations.has(next.metadata.operationId) ||
+          plan.profile.registration.deviceScopeRef !== this.profile.registration.deviceScopeRef) fail('GENERATION_PLANS');
+      operations.add(next.metadata.operationId);
+      for (const member of plan.profile.instances) {
+        if (currentMembers.has(member.instanceId)) fail('INSTANCE_PLAN_REUSED');
+        currentMembers.add(member.instanceId);
+      }
+      for (const source of next.metadata.originalSources) for (const owner of source.owners) {
+        if (claimed.has(owner.instanceId)) fail('INSTANCE_PLAN_REUSED');
+        claimed.add(owner.instanceId);
+      }
+      this.generationPlans.set(plan.generation, plan);
+      this.generationPlanHashes.set(plan.generation, publicationGenerationPlanIdentity(plan));
+    }
+    this.profileHash = this.expectedProfileHash();
     drivers.add(this);
   }
   private expectedProfileHash() {
-    return this.sourcePlan ? sha({ profile: this.profile, sourcePlan: this.sourcePlan }) : sha(this.profile);
+    const actual = this.sourcePlan ? sha({ profile: this.profile, sourcePlan: this.sourcePlan }) : sha(this.profile);
+    if (actual !== this.activePlanHash || [...this.generationPlans].some(([generation, plan]) =>
+        publicationGenerationPlanIdentity(plan) !== this.generationPlanHashes.get(generation))) fail('PROFILE_CHANGED');
+    return this.generationPlans.size ? sha({ initial: this.initialPlanHash,
+      generations: [...this.generationPlanHashes].sort(([a], [b]) => a.localeCompare(b)) }) : this.initialPlanHash;
   }
-  private stopSource() {
+  private generationBinding(generation: string) {
+    const candidate = this.generationPlans.get(generation);
+    if (candidate) {
+      const metadata = normalizeSourcePlan(candidate.sourcePlan).metadata!;
+      return { generation, approvalSha256: this.generationPlanHashes.get(generation)!,
+        profileSha256: sha({ profile: candidate.profile, sourcePlan: metadata }), operationId: metadata.operationId };
+    }
+    return { generation, approvalSha256: this.initialPlanHash, profileSha256: this.initialPlanHash,
+      operationId: this.initialOperationId! };
+  }
+  private stopSource(retainOriginals = false) {
     const broker = this.sourceBroker;
     const held = this.heldOwner;
+    const originals = retainOriginals ? [] : this.originalSources;
+    const registry = this.ownerRegistry;
     this.sourceBroker = undefined;
     this.heldOwner = undefined;
+    if (!retainOriginals) this.originalSources = [];
+    this.ownerRegistry = undefined;
     this.sourceReceipts = undefined;
-    if (!broker && !held) return;
+    if (!broker && !held && !registry && originals.length === 0) return;
     const previous = this.sourceCleanup;
     const tasks: Promise<void>[] = [];
     if (broker) tasks.push(broker.revoke().finally(() => { this.lastSourceDiagnostics = broker.diagnostics(); }));
     if (held) tasks.push(held.owner.revoke().finally(() => { this.lastHeldDiagnostics = held.owner.diagnostics(); }));
+    if (registry) tasks.push(registry.revoke());
+    for (const original of originals) tasks.push(original.revoke());
     const closing = Promise.allSettled(tasks).then(results => {
       const failure = results.find(x => x.status === 'rejected');
       if (failure?.status === 'rejected') throw failure.reason;
@@ -291,17 +381,35 @@ export class ManagedCoverageDriver implements ControlledCoverageDriver {
         canonicalDigest(plan.worker.files) !== canonicalDigest(this.profile.source.files) ||
         canonicalDigest(plan.worker.python) !== canonicalDigest(this.profile.source.python))
       fail('SOURCE_RELEASE_BINDING');
-    const lifecycle = await this.controller.produceLifecycle('LOADED');
+    let lifecycle: object | undefined;
+    const currentBinding = () => {
+      this.ownerCurrent();
+      if (epoch !== this.epoch) fail('REVOKED');
+      return lifecycle ? readManagedLifecycleReceipt(lifecycle, this.controller).binding :
+        this.controller.currentSourceBinding();
+    };
+    let preparedBroker: RestrictedPublicationCISourceBroker | undefined;
+    const managedMembers = new Map<string, object>();
+    if (plan.originalSources) {
+      preparedBroker = await RestrictedPublicationCISourceBroker.startOwned(
+        this.store, this.plugin, plan.operationId, plan.worker, currentBinding(), currentBinding);
+      if (epoch !== this.epoch) { await preparedBroker.revoke(); fail('REVOKED'); }
+      this.sourceBroker = preparedBroker;
+      const expectations = preparedBroker.definitionExpectations();
+      // All canonical probes precede the retained LOADED lifecycle handle.
+      // A later probe must never invalidate the source sequence underneath C.
+      for (const member of expectations.instances) {
+        if (expectations.censusSources.find(x => x.sourceId === member.censusSourceId)?.kind === 'managed' &&
+            member.entryId !== 'worksheet-ci' && member.state !== 'RETIRED_FENCED')
+          managedMembers.set(member.instanceId, await this.controller.probeEnrollment(this.profile.source, member.entryId));
+      }
+    }
+    lifecycle = await this.controller.produceLifecycle('LOADED');
     const fact = readManagedLifecycleReceipt(lifecycle, this.controller);
     if (fact.operationId !== plan.operationId || fact.root !== root ||
         fact.binding.generation !== generation || fact.binding.accountId !== this.accountScopeRef ||
         fact.binding.deviceId !== this.registration.deviceScopeRef || fact.ownedJobs !== 0 ||
         fact.unresolvedAdmissions !== 0 || fact.unknownNativeEffects !== 0) fail('SOURCE_LIFECYCLE');
-    const currentBinding = () => {
-        this.ownerCurrent();
-        if (epoch !== this.epoch) fail('REVOKED');
-        return readManagedLifecycleReceipt(lifecycle, this.controller).binding;
-    };
     if (plan.ownerSource) {
       const owner = await RestrictedPublicationOwnerSource.startOwned(this.store, this.plugin, plan.operationId, {
         root, files: plan.worker.files, python: plan.worker.python, sourceDigest: fact.sourceDigest,
@@ -318,7 +426,7 @@ export class ManagedCoverageDriver implements ControlledCoverageDriver {
         throw error;
       }
     }
-    const broker = await RestrictedPublicationCISourceBroker.startOwned(
+    const broker = preparedBroker ?? await RestrictedPublicationCISourceBroker.startOwned(
       this.store, this.plugin, plan.operationId, plan.worker, fact.binding, currentBinding,
     );
     if (epoch !== this.epoch) {
@@ -328,11 +436,73 @@ export class ManagedCoverageDriver implements ControlledCoverageDriver {
     }
     this.sourceBroker = broker;
     broker.attachOwnedLifecycle(lifecycle, this.controller);
+    let ciHandle: object | undefined;
+    if (plan.originalSources) {
+      if (!this.store.capturePublicationOwnerHistory || !this.store.assertPublicationOwnerHistoryCurrent)
+        fail('ORIGINAL_HISTORY_SOURCE_REQUIRED');
+      const sourceStore = this.store as Parameters<typeof RestrictedPublicationOwnerRegistry.startOwned>[0];
+      const profile = broker.definitionExpectations();
+      const registry = await RestrictedPublicationOwnerRegistry.startOwned(sourceStore, this.plugin,
+        plan.operationId, profile, this.controller, lifecycle);
+      if (epoch !== this.epoch) { await registry.revoke(); fail('REVOKED'); }
+      this.ownerRegistry = registry;
+      // Only actual Main-owned enrollment handles can cover managed members.
+      // A role/profile or an original listener child is never substituted.
+      for (const member of profile.instances) {
+        const kind = profile.censusSources.find(x => x.sourceId === member.censusSourceId)?.kind;
+        if (kind === 'managed' && member.entryId !== 'worksheet-ci' && member.state !== 'RETIRED_FENCED') {
+          const enrolled = managedMembers.get(member.instanceId);
+          if (!enrolled) fail('MANAGED_SOURCE_REQUIRED');
+          await registry.bindManaged(member.instanceId, enrolled);
+        }
+      }
+      for (const source of plan.originalSources) {
+        const owner = await RestrictedPublicationResidentSource.startOwned(sourceStore, this.plugin,
+          plan.operationId, source, fact.binding, currentBinding);
+        if (epoch !== this.epoch) { await owner.revoke(); fail('REVOKED'); }
+        this.originalSources.push(owner);
+      }
+      for (const owner of this.originalSources) {
+        const expected = plan.originalSources[this.originalSources.indexOf(owner)];
+        for (let index = 0; index < expected.owners.length; index++) {
+          let peer = await owner.acceptOriginal();
+          const actual = readOriginalPublicationPeerReceipt(peer, owner);
+          if (actual.sourceScope === 'RESIDENT_ORIGINAL_ENTRY') {
+            const member = profile.instances.find(x => x.instanceId === actual.instanceId);
+            if (!member) fail('ORIGINAL_MEMBER_UNREGISTERED');
+            if (member.state === 'RETIRED_FENCED') {
+              peer = await owner.transition(peer, 'fence');
+              peer = await owner.transition(peer, 'drain');
+              peer = await owner.transition(peer, 'retire');
+            }
+            await registry.bindOriginal(actual.instanceId, owner, peer);
+          } else {
+            peer = await owner.transition(peer, 'fence');
+            peer = await owner.transition(peer, 'drain');
+            if (actual.sourceScope === 'REGISTERED_NAMESPACE_OWNER')
+              await registry.bindNamespace(actual.ownerId, owner, peer);
+            else if (actual.sourceScope === 'REGISTERED_RESIDENT_NONPUBLISHER')
+              await registry.bindNonPublisher(actual.ownerId, owner, peer);
+            else fail('ORIGINAL_SCOPE');
+          }
+        }
+      }
+      // This real preflight precedes the only dispatch approval callback.
+      // Missing census/history/namespace producers leave approval count zero.
+      await registry.preflightNonCI();
+      if (plan.ci) {
+        await broker.dispatchOriginalCI(plan.ci.head, plan.ci.workflowSha256, this.sourceApproval!);
+        ciHandle = await broker.inspectCI();
+        const inventory = await broker.inspectCIInventory();
+        await registry.bindCIFromBroker(plan.ci.instanceId, broker, ciHandle, inventory);
+      }
+      broker.attachOwnerRegistry(registry, await registry.seal());
+    }
     // Missing original census/member/namespace owners closes before any dispatch.
     const handle = await broker.inspectDefinition();
     const definition = readPublicationSourceReceipt(handle, broker);
     this.validateDefinition(definition, fact, generation);
-    this.sourceReceipts = { definition: handle };
+    this.sourceReceipts = { definition: handle, ...(ciHandle ? { ci: ciHandle } : {}) };
     return { broker, definition, fact };
   }
   private validateDefinition(value: Record<string, any>, fact: Readonly<ManagedLifecycleObservation>, generation: string) {
@@ -384,8 +554,11 @@ export class ManagedCoverageDriver implements ControlledCoverageDriver {
     const member = definition.members.find((x: any) => x.instanceId === plan.ci!.instanceId);
     if (!member || member.entryId !== 'worksheet-ci' || member.state !== 'NATIVE_NAMESPACE_DENIED')
       fail('CI_MEMBER_PROJECTION_UNSUPPORTED');
-    await broker.dispatchOriginalCI(plan.ci.head, plan.ci.workflowSha256, this.sourceApproval!);
-    const handle = await broker.inspectCI();
+    let handle = this.sourceReceipts?.ci;
+    if (!handle) {
+      await broker.dispatchOriginalCI(plan.ci.head, plan.ci.workflowSha256, this.sourceApproval!);
+      handle = await broker.inspectCI();
+    }
     const value = readPublicationSourceReceipt(handle, broker);
     if (value.consumer !== 'worksheet-ci' || value.head_sha !== plan.ci.head ||
         value.workflow_sha256 !== plan.ci.workflowSha256) fail('CI_SOURCE_BINDING');
@@ -447,6 +620,7 @@ export class ManagedCoverageDriver implements ControlledCoverageDriver {
           lifecycleSequence: 0,
           usedGenerations: [],
           lastVerified: null,
+          ...(this.generationPlans.size ? { selectedPlan: null, registrationSha256: null } : {}),
           state: 'QUIESCING',
         } as DriverState,
       };
@@ -467,6 +641,17 @@ export class ManagedCoverageDriver implements ControlledCoverageDriver {
       !Array.isArray(v!.usedGenerations)
     )
       fail('LEDGER');
+    if (this.generationPlans.size) {
+      if (v!.selectedPlan === null) {
+        if (v!.usedGenerations.length || v!.state === 'READY') fail('GENERATION_LEDGER');
+      } else {
+        const selected = v!.selectedPlan;
+        if (!selected || !opaque(selected.generation) || !v!.usedGenerations.includes(selected.generation) ||
+            canonicalDigest(selected) !== canonicalDigest(this.generationBinding(selected.generation)) ||
+            (v!.state === 'READY' && (!validHash(v!.registrationSha256) ||
+              v!.lastVerified?.releaseGeneration !== selected.generation))) fail('GENERATION_LEDGER');
+      }
+    }
     return { row, value: v! };
   }
   private async save(old: Awaited<ReturnType<ManagedCoverageDriver['read']>>, value: DriverState) {
@@ -484,13 +669,69 @@ export class ManagedCoverageDriver implements ControlledCoverageDriver {
     }
     this.ownerCurrent();
   }
-  async quiesce() {
+  async quiesce(nextGeneration?: string) {
+    const registry = this.ownerRegistry;
+    const nextPlan = nextGeneration === undefined ? undefined : this.generationPlans.get(nextGeneration);
+    if (this.pendingCutover) {
+      this.pendingCutover = undefined;
+      this.close();
+      await this.drainSource();
+      fail('CUTOVER_ALREADY_PREPARED');
+    }
+    let retirement: object | undefined;
+    // Synchronously close effect admission, while retaining the original source
+    // generation long enough to collect actual peer retirement acknowledgments.
+    this.closed = true;
+    this.leaseUntil = 0;
+    if (nextPlan) {
+      try {
+        if (!registry || !this.originalSources.length || !this.store.capturePublicationOwnerHistory ||
+            !this.store.assertPublicationOwnerHistoryCurrent) fail('ORIGINAL_CUTOVER_SOURCE_REQUIRED');
+        const sourceStore = this.store as Parameters<typeof preparePublicationGenerationCutover>[1];
+        await assertNoUncertainPublicationCutover(sourceStore, this.plugin, this.accountScopeRef);
+        retirement = await registry.prepareRetirement();
+        const retained = await registry.retainPolicyCutovers(retirement);
+        if (retained.length !== this.originalSources.length ||
+            this.originalSources.some(source => !retained.some(x => x.source === source))) fail('CUTOVER_OWNER_SET');
+        // The old source binding has now been converted into terminal-only
+        // private capabilities. Revoking ordinary authority cannot retain work.
+        const epoch = ++this.epoch;
+        this.stopSource(true);
+        const results = await Promise.allSettled([this.drainSource(), this.controller.revoke()]);
+        const failure = results.find(x => x.status === 'rejected');
+        if (failure?.status === 'rejected') throw failure.reason;
+        await this.controller.drain();
+        const drained = await this.controller.produceLifecycle('DRAINED');
+        const completed = await registry.completeRetirement(retirement, drained);
+        const current = () => {
+          this.ownerCurrent();
+          if (epoch !== this.epoch || !this.closed || this.pendingCutover) fail('CUTOVER_REVOKED');
+        };
+        current();
+        const handle = await preparePublicationGenerationCutover(this, sourceStore, this.plugin,
+          this.controller, registry, completed, drained, retained, nextPlan, current);
+        current();
+        this.pendingCutover = { generation: nextGeneration!, handle, plan: nextPlan, epoch };
+        this.stopSource();
+        await this.drainSource();
+        return;
+      } catch (error) { this.close(); await this.drainSource(); throw error; }
+    }
+    if (nextGeneration !== undefined && registry && this.originalSources.length) {
+      this.close(); await this.drainSource(); fail('GENERATION_PLAN_REQUIRED');
+    }
+    if (registry) {
+      try { retirement = await registry.prepareRetirement(); }
+      catch (error) { this.close(); await this.drainSource(); throw error; }
+    }
     this.close();
     // Both local owners revoke synchronously before either durable cleanup waits.
     const results = await Promise.allSettled([this.drainSource(), this.controller.revoke()]);
     const failure = results.find(x => x.status === 'rejected');
     if (failure?.status === 'rejected') throw failure.reason;
     await this.controller.drain();
+    if (registry && retirement)
+      await registry.completeRetirement(retirement, await this.controller.produceLifecycle('DRAINED'));
     const observed = await this.controller.coverageSourceState();
     if (observed.ownedJobs !== 0 || observed.unresolved !== 0) fail('UNRESOLVED');
     if ((await this.store.unknownNativePublicationEffects(this.plugin)) !== 0)
@@ -500,6 +741,11 @@ export class ManagedCoverageDriver implements ControlledCoverageDriver {
     generation: string,
     previousSequence: number,
   ): Promise<ControlledCoverageReport> {
+    const cutover = this.pendingCutover;
+    if (cutover && (cutover.generation !== generation || cutover.epoch !== this.epoch)) {
+      this.pendingCutover = undefined; this.close(); await this.drainSource(); fail('CUTOVER_GENERATION');
+    }
+    this.pendingCutover = undefined;
     this.close();
     const epoch = this.epoch;
     await this.drainSource();
@@ -513,6 +759,9 @@ export class ManagedCoverageDriver implements ControlledCoverageDriver {
     )
       fail('GENERATION');
     if (old.value.lifecycleSequence !== previousSequence) fail('SEQUENCE_GAP');
+    if (this.sourcePlan?.originalSources && (old.value.state === 'UNKNOWN' ||
+        (old.value.state === 'QUIESCING' && old.value.usedGenerations.length))) fail('PRIOR_GENERATION_UNKNOWN');
+    if (this.generationPlans.size && !cutover && old.value.usedGenerations.length) fail('PRIVATE_CUTOVER_REQUIRED');
     if ((await this.store.unknownNativePublicationEffects(this.plugin)) !== 0)
       fail('NATIVE_EFFECT_UNKNOWN');
     const pending: DriverState = {
@@ -520,10 +769,37 @@ export class ManagedCoverageDriver implements ControlledCoverageDriver {
       boot: this.boot,
       state: 'QUIESCING',
       usedGenerations: [...old.value.usedGenerations, generation],
+      ...(this.generationPlans.size ? { selectedPlan: this.generationBinding(generation), registrationSha256: null } : {}),
     };
     await this.save(old, pending);
+    let transition = { row: { revision: (old.row?.revision ?? 0) + 1, payload: JSON.stringify(pending) }, value: pending };
     try {
-      const release = await this.controller.install(this.profile.source, generation, this.sourcePlan?.operationId);
+      let release;
+      if (cutover) {
+        const committed = await commitPublicationGenerationCutover(cutover.handle, this, this.controller, generation, () => {
+          this.ownerCurrent();
+          if (epoch !== this.epoch || !this.closed) fail('CUTOVER_REVOKED');
+        });
+        if (epoch !== this.epoch) fail('REVOKED');
+        const approved = this.generationPlans.get(generation);
+        if (!approved || publicationGenerationPlanIdentity(committed.plan) !== this.generationPlanHashes.get(generation) ||
+            publicationGenerationPlanIdentity(approved) !== publicationGenerationPlanIdentity(committed.plan)) fail('GENERATION_PLAN_CHANGED');
+        this.profile = structuredClone(committed.plan.profile);
+        const configured = normalizeSourcePlan(committed.plan.sourcePlan);
+        this.sourcePlan = configured.metadata;
+        this.sourceApproval = configured.approval;
+        validateCoverageConfiguration(this.profile, this.sourcePlan);
+        for (const key of Object.keys(this.registration)) delete (this.registration as unknown as Record<string, unknown>)[key];
+        Object.assign(this.registration, structuredClone(this.profile.registration));
+        this.activePlanHash = this.sourcePlan ? sha({ profile: this.profile, sourcePlan: this.sourcePlan }) : sha(this.profile);
+        if (pending.selectedPlan?.profileSha256 !== this.activePlanHash ||
+            pending.selectedPlan?.operationId !== this.sourcePlan?.operationId) fail('GENERATION_LEDGER');
+        this.expectedProfileHash();
+        release = committed.release;
+      } else {
+        if (this.generationPlans.has(generation)) fail('PRIVATE_CUTOVER_REQUIRED');
+        release = await this.controller.install(this.profile.source, generation, this.sourcePlan?.operationId);
+      }
       const loaded = new Map<string, object>();
       // Reject unsupported foreign authority before changing the actual owned entry.
       if (!this.sourcePlan && this.profile.instances.some(x => x.origin !== 'owned-release')) fail('FOREIGN_SOURCE_UNSUPPORTED');
@@ -717,14 +993,16 @@ export class ManagedCoverageDriver implements ControlledCoverageDriver {
         exclusions,
       };
       if (epoch !== this.epoch) fail('REVOKED');
-      const current = await this.read();
-      await this.save(current, {
+      const ready: DriverState = {
         ...pending,
         state: 'READY',
         releaseSequence: report.releaseSequence,
         lifecycleSequence: report.lifecycleSequence,
         lastVerified: report,
-      });
+        ...(this.generationPlans.size ? { registrationSha256: sha(this.registration) } : {}),
+      };
+      await this.save(transition, ready);
+      transition = { row: { revision: transition.row.revision + 1, payload: JSON.stringify(ready) }, value: ready };
       this.accepted = structuredClone(report);
       this.fence = report.fenceRef;
       this.closed = false;
@@ -737,8 +1015,8 @@ export class ManagedCoverageDriver implements ControlledCoverageDriver {
         const closedEpoch = this.epoch;
         try {
           const current = await this.read();
-          if (closedEpoch === this.epoch)
-            await this.save(current, { ...current.value, state: 'UNKNOWN' });
+          if (closedEpoch === this.epoch && canonicalDigest(current.row) === canonicalDigest(transition.row))
+            await this.save(transition, { ...transition.value, state: 'UNKNOWN' });
         } finally { await this.drainSource(); }
       }
       throw error;
@@ -769,6 +1047,10 @@ export class ManagedCoverageDriver implements ControlledCoverageDriver {
       const persisted = await this.read();
       if (epoch !== this.epoch || persisted.value.state !== 'READY' ||
           sha(persisted.value.lastVerified) !== sha(this.accepted)) fail('FACTS_CHANGED');
+      if (this.generationPlans.size && (persisted.value.selectedPlan?.profileSha256 !== this.activePlanHash ||
+          persisted.value.selectedPlan?.operationId !== this.sourcePlan?.operationId ||
+          persisted.value.selectedPlan?.generation !== this.accepted?.releaseGeneration ||
+          persisted.value.registrationSha256 !== sha(this.registration))) fail('GENERATION_LEDGER');
       // Release drain/UNKNOWN counts are measured before switching generations.
       // An admitted current operation deliberately persists UNKNOWN before remote IO;
       // its original Main action/job authority guards every effect and no-resubmit.

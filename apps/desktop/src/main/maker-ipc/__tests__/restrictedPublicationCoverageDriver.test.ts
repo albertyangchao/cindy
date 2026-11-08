@@ -16,7 +16,10 @@ import {
 import {
   ManagedCoverageDriver,
   type FixedCoverageProfile,
+  type MainPublicationSourcePlan,
 } from '../restrictedPublicationCoverageDriver.js';
+import { clonePublicationGenerationPlan, publicationGenerationPlanIdentity,
+  type MainPublicationGenerationPlan } from '../restrictedPublicationPolicyCutover.js';
 import { coverageEntries } from '../restrictedPublicationConsumerGuardAuthority.js';
 import { resolveControlledPublicationRoot } from '../restrictedPublicationCaller.js';
 const sha = (x: unknown) => createHash('sha256').update(JSON.stringify(x)).digest('hex');
@@ -121,6 +124,88 @@ async function fixture() {
     },
   };
 }
+function planned(f: Awaited<ReturnType<typeof fixture>>) {
+  // Expected deployment metadata only. These files/definitions are not source
+  // receipts, are never executed, and cannot satisfy original-source preflight.
+  const source = f.profile.source;
+  const original = (instanceId: string) => ({ root: source.sourceRoot, files: source.files,
+    python: source.python, sourceDigest: sha(source.files), runtimeDirectory: path.join(source.sourceRoot, 'runtime'),
+    owners: [{ instanceId, ownerId: 'core.monitor.publish', sourceScope: 'RESIDENT_ORIGINAL_ENTRY' as const,
+      entryScript: 'scripts/publish_html_report.py', originalEntryScript: 'scripts/publish_html_report.py',
+      originalRoot: source.sourceRoot, originalArgv: [source.python.path, path.join(source.sourceRoot, 'scripts/publish_html_report.py')],
+      entryArgv: [source.python.path, '-I', '-B', path.join(source.sourceRoot, 'scripts/publish_html_report.py')],
+      originalBootstrapSha256: sha('bootstrap'), definitionDigest: sha('definition') }] });
+  const sourcePlan: MainPublicationSourcePlan = { operationId: 'initial-operation',
+    worker: { root: source.sourceRoot, files: source.files, python: source.python,
+      gh: { path: source.python.path, sha256: source.python.sha256, homeDirectory: source.sourceRoot, configDirectory: source.sourceRoot },
+      definition: { monitorRoot: source.sourceRoot, monitorSha256: sha('monitor'),
+        profilePath: path.join(source.sourceRoot, 'definition.json'), profileSha256: sha('definition') } },
+    originalSources: [original('initial-original-instance')] };
+  const next: MainPublicationGenerationPlan = { generation: 'next-generation', profile: structuredClone(f.profile),
+    sourcePlan: { ...structuredClone(sourcePlan), operationId: 'next-operation',
+      originalSources: [original('next-original-instance')] } };
+  for (const member of next.profile.instances) member.instanceId = 'next:' + member.instanceId;
+  for (const member of next.profile.registration.instances) member.instanceId = 'next:' + member.instanceId;
+  next.profile.registration.registrationSetDigest = sha(next.profile.instances.map(x => x.instanceId).sort());
+  return { sourcePlan, next, create: () => new ManagedCoverageDriver(f.store, 'plugin', f.account,
+    f.controller, f.profile, f.current, Date.now, { ...sourcePlan, generations: [next] }) };
+}
+
+it('planned generations reject reused permanent original instance IDs and operation IDs', async () => {
+  const f = await fixture(), p = planned(f);
+  p.next.sourcePlan.originalSources![0].owners[0].instanceId = 'initial-original-instance';
+  expect(p.create).toThrow('INSTANCE_PLAN_REUSED');
+  p.next.sourcePlan.originalSources![0].owners[0].instanceId = 'next-original-instance';
+  p.next.sourcePlan.operationId = 'initial-operation';
+  expect(p.create).toThrow('GENERATION_PLANS');
+});
+
+it('a future plan cannot change the account device binding', async () => {
+  const f = await fixture(), p = planned(f);
+  p.next.profile.registration.deviceScopeRef = sha('different-device');
+  expect(p.create).toThrow('GENERATION_PLANS');
+});
+
+it('a future plan remains only a cloned expectation and cannot bypass the private cutover', async () => {
+  const f = await fixture(), p = planned(f);
+  const driver = p.create();
+  const before = await driver.status();
+  p.next.sourcePlan.operationId = 'caller-mutated-operation';
+  p.next.sourcePlan.originalSources![0].owners[0].instanceId = 'caller-mutated-instance';
+  expect((await driver.status()).profile).toBe(before.profile);
+  await expect(driver.quiesce('next-generation')).rejects.toThrow('ORIGINAL_CUTOVER_SOURCE_REQUIRED');
+  expect((await driver.status()).usedGenerations).toEqual([]);
+  await expect(driver.switchRelease('next-generation', 0)).rejects.toThrow('PRIVATE_CUTOVER_REQUIRED');
+  const after = await driver.status();
+  expect(after.state).toBe('UNKNOWN');
+  expect(after.selectedPlan?.operationId).toBe('next-operation');
+  expect(after.selectedPlan?.generation).toBe('next-generation');
+  expect(after.registrationSha256).toBeNull();
+  await expect(driver.switchRelease('different-generation', 0)).rejects.toThrow('PRIOR_GENERATION_UNKNOWN');
+});
+
+it('changing durable generation expectations cannot reconstruct a private plan capability', async () => {
+  const f = await fixture(), p = planned(f), driver = p.create();
+  await expect(driver.switchRelease('next-generation', 0)).rejects.toThrow('PRIVATE_CUTOVER_REQUIRED');
+  const row = f.db.prepare("SELECT id,payload FROM plugin_task_requests WHERE json_extract(payload,'$.schema')='publication-coverage-driver/v1'")
+    .get() as { id: string; payload: string };
+  const value = JSON.parse(row.payload);
+  value.selectedPlan.operationId = 'replacement-operation';
+  f.db.prepare('UPDATE plugin_task_requests SET payload=?,revision=revision+1 WHERE id=?').run(JSON.stringify(value), row.id);
+  await expect(driver.status()).rejects.toThrow('GENERATION_LEDGER');
+});
+
+it('generation approval identity includes additional immutable source installations and C profile pins', async () => {
+  const f = await fixture(), p = planned(f);
+  const copy = clonePublicationGenerationPlan(p.next);
+  const first = publicationGenerationPlanIdentity(copy);
+  p.next.sourcePlan.worker.definition!.profileSha256 = sha('changed-definition');
+  expect(publicationGenerationPlanIdentity(copy)).toBe(first);
+  expect(publicationGenerationPlanIdentity(p.next)).not.toBe(first);
+  copy.additionalInstallations = [{ runtimeDirectory: '/registered/monitor', sourceRoot: '/reviewed/source', releasesRoot: '/owned/releases' }];
+  expect(publicationGenerationPlanIdentity(copy)).not.toBe(first);
+});
+
 it('missing role cannot create a trusted fixed registration', async () => {
   const f = await fixture();
   f.profile.registration.instances = f.profile.registration.instances.slice(0,-1);

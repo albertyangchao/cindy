@@ -11,11 +11,16 @@ import path from 'node:path';
 import { performance } from 'node:perf_hooks';
 import type { Readable, Writable } from 'node:stream';
 import type { createRestrictedPartnerStore } from './restrictedPartnerStore.js';
+import { readPublicationHistoryReceipt } from './restrictedPartnerStore.js';
 import { canonical, digest, parseNativeFrame } from './restrictedPublicationProtocol.js';
 import {
   ManagedPublicationController,
   readManagedLifecycleReceipt,
 } from './restrictedPublicationManagedController.js';
+import {
+  RestrictedPublicationOwnerRegistry, isOriginalPublicationRegistry,
+  readOriginalPublicationRegistrySeal, type OriginalPublicationRegistryProfile,
+} from './restrictedPublicationOwnerRegistry.js';
 
 const SCHEMA = 'publication-coverage-source/v1';
 const DEFINITION_SCHEMA = 'publication-definition-channel/v1';
@@ -70,7 +75,9 @@ export interface PinnedPublicationSourceWorker {
   };
 }
 type Store = Pick<ReturnType<typeof createRestrictedPartnerStore>,
-  'consumerGuardReceiptIdentity' | 'readConsumerGuardReceipt' | 'compareAndSwapConsumerGuardReceipt'>;
+  'consumerGuardReceiptIdentity' | 'readConsumerGuardReceipt' | 'compareAndSwapConsumerGuardReceipt'> &
+  Partial<Pick<ReturnType<typeof createRestrictedPartnerStore>,
+    'capturePublicationOwnerHistory' | 'assertPublicationOwnerHistoryCurrent'>>;
 type Row = Awaited<ReturnType<Store['readConsumerGuardReceipt']>>;
 type Ledger = {
   schema: 'publication-main-source-operation/v1';
@@ -80,6 +87,8 @@ type Ledger = {
   state: 'OPENING' | 'OPEN' | 'DISPATCHING_UNKNOWN' | 'BOUND' | 'CURRENT' | 'UNKNOWN' | 'REVOKED';
   runId: number | null;
   attempt: number | null;
+  dispatchBinding?: { head: string; workflowSha256: string; operationNonce: string };
+  verifiedCI?: Record<string, any>;
 };
 type Pin = { file: string; sha256: string; maximum: number; identity: string };
 const identity = (s: Awaited<ReturnType<typeof lstat>>) =>
@@ -108,7 +117,7 @@ async function pinnedBytes(file: string, expected: string, maximum: number) {
     return { data, identity: identity(before) };
   } finally { await fd.close(); }
 }
-const receipts = new WeakMap<object, { broker: RestrictedPublicationCISourceBroker; kind: 'ci' | 'definition'; value: Record<string, any> }>();
+const receipts = new WeakMap<object, { broker: RestrictedPublicationCISourceBroker; kind: 'ci' | 'ci-inventory' | 'definition'; value: Record<string, any> }>();
 const brokers = new WeakSet<object>();
 export function isRestrictedPublicationCISourceBroker(value: unknown): value is RestrictedPublicationCISourceBroker {
   return !!value && typeof value === 'object' && brokers.has(value);
@@ -138,6 +147,7 @@ export class RestrictedPublicationCISourceBroker {
   private sequence = 0;
   private definitionSequence = 0;
   private definitionHash?: string;
+  private definitionProfile?: OriginalPublicationRegistryProfile;
   private directoryPins = new Map<string, string>();
   private deadline?: ReturnType<typeof setTimeout>;
   private totalInput = 0;
@@ -153,7 +163,9 @@ export class RestrictedPublicationCISourceBroker {
   private running = false;
   private definitionBusy = false;
   private ciReceipt?: object;
+  private inventoryReceipt?: object;
   private definitionReceipt?: object;
+  private ownerRegistry?: { registry: RestrictedPublicationOwnerRegistry; handle: object };
   private lifecycle?: { controller: ManagedPublicationController; handle: object };
   private unsubscribeLifecycle?: () => void;
   private lifecycleObserved = false;
@@ -242,6 +254,7 @@ export class RestrictedPublicationCISourceBroker {
       if (!object(profile.sourceFiles) || Object.keys(profile.sourceFiles).length === 0 ||
           Object.entries(profile.sourceFiles).some(([file, expected]) => p.files[file] !== expected)) fail('DEFINITION_SOURCE_PINS');
       this.definitionHash = digest(profile);
+      this.definitionProfile = structuredClone(profile) as unknown as OriginalPublicationRegistryProfile;
     }
   }
   private async verifyPins() {
@@ -346,7 +359,9 @@ export class RestrictedPublicationCISourceBroker {
       if (!frame.ok || frame.code !== null) fail('WORKER_DENIED');
       const states: Record<string, string[]> = { init: ['OPEN'], 'ci.begin': ['PENDING'], 'ci.bind': ['BOUND'],
         'ci.verify': ['VERIFYING'], 'ci.current': ['VERIFYING', 'CURRENT'], 'definition.begin': ['PENDING'],
-        'definition.verify': ['VERIFYING'], 'definition.current': ['VERIFYING', 'CURRENT'] };
+        'definition.verify': ['VERIFYING'], 'definition.current': ['VERIFYING', 'CURRENT'],
+        'ci.inventory.begin': ['PENDING'], 'ci.inventory.verify': ['VERIFYING'],
+        'ci.inventory.current': ['VERIFYING', 'CURRENT'] };
       if (!states[pending.command]?.includes(frame.state)) fail('RESPONSE_STATE');
       this.workerNonce = frame.worker_nonce;
       clearTimeout(pending.timer); this.pending = undefined;
@@ -431,6 +446,7 @@ export class RestrictedPublicationCISourceBroker {
       if (bytes.length !== workflow.size || bytes.toString('base64') !== encoded || hash(bytes) !== workflowSha256)
         fail('DISPATCH_WORKFLOW');
       // Durable once claim precedes the sole external effect. Every error remains UNKNOWN.
+      this.ledger.dispatchBinding = { head, workflowSha256, operationNonce: inputs.probe_operation_id };
       await this.save('DISPATCHING_UNKNOWN');
       assertDispatchApproved();
       const dispatched = await this.official('POST', '/repos/' + REPOSITORY + '/actions/workflows/publish-worksheet-html.yml/dispatches',
@@ -493,12 +509,13 @@ export class RestrictedPublicationCISourceBroker {
           value.repository !== REPOSITORY || value.workflow !== WORKFLOW || value.state !== 'NATIVE_NAMESPACE_DENIED' ||
           !positive(value.job_id) || !positive(value.check_run_id) || value.check_run_url !==
             'https://api.github.com/repos/' + REPOSITORY + '/check-runs/' + value.check_run_id) fail('CI_BINDING');
+      this.ledger.verifiedCI = structuredClone(value);
       await this.save('CURRENT');
       this.assertCurrent();
       return this.ciReceipt = this.receipt('ci', value);
     });
   }
-  private async pollCurrent(command: 'ci.current' | 'definition.current') {
+  private async pollCurrent(command: 'ci.current' | 'ci.inventory.current' | 'definition.current') {
     const until = Math.min(this.started + 60000, performance.now() + 30000);
     while (true) {
       const reply = await this.request(command, {}, Math.max(1, until - performance.now()));
@@ -517,6 +534,20 @@ export class RestrictedPublicationCISourceBroker {
     this.lifecycle = { controller, handle };
     this.unsubscribeLifecycle = controller.onSourceInvalidated(() => this.failClosed());
   }
+  /** Pinned expectations only. This does not supply a source fact. */
+  definitionExpectations() {
+    this.assertCurrent();
+    if (!this.definitionProfile) fail('DEFINITION_UNAVAILABLE');
+    return structuredClone(this.definitionProfile);
+  }
+  attachOwnerRegistry(registry: RestrictedPublicationOwnerRegistry, handle: object) {
+    this.assertCurrent();
+    if (this.ownerRegistry || !isOriginalPublicationRegistry(registry) ||
+        registry.operationId !== this.operationId || canonical(registry.binding()) !== canonical(this.expected) ||
+        registry.profileSha256() !== this.definitionHash || !readOriginalPublicationRegistrySeal(handle, registry).ciComplete)
+      fail('OWNER_REGISTRY_BINDING');
+    this.ownerRegistry = { registry, handle };
+  }
   private async definitionQuery(frame: Record<string, any>) {
     keys(frame, 'schema,sessionId,seq,nonce,binding,operationId,profileSha256,method,args');
     this.assertCurrent();
@@ -531,6 +562,9 @@ export class RestrictedPublicationCISourceBroker {
       await this.lifecycle.controller.verifyLifecycleReceipt(this.lifecycle.handle);
       value = { ...readManagedLifecycleReceipt(this.lifecycle.handle, this.lifecycle.controller) };
       this.lifecycleObserved = true;
+    } else if (this.ownerRegistry && ['census', 'member', 'namespace', 'fence', 'current'].includes(frame.method)) {
+      readOriginalPublicationRegistrySeal(this.ownerRegistry.handle, this.ownerRegistry.registry);
+      value = await this.ownerRegistry.registry.query(frame.method, frame.args);
     } else {
       // Original resident/legacy/namespace owners have no enrolled producer in the frozen
       // source inputs. Explicit CODE refusal; never manufacture a census from profile roles.
@@ -552,6 +586,7 @@ export class RestrictedPublicationCISourceBroker {
   async inspectDefinition() {
     return this.exclusive(async () => {
       if (!this.profile.definition || !this.lifecycle) fail('DEFINITION_UNAVAILABLE');
+      await this.verifyCIHandlesWithinRead();
       if (!this.definitionReceipt) {
         await this.request('definition.begin', { ttl_seconds: 60 });
         await this.request('definition.verify', {});
@@ -563,11 +598,65 @@ export class RestrictedPublicationCISourceBroker {
           value.profileSha256 !== this.definitionHash || value.releaseGeneration !== this.expected.generation ||
           value.scope !== 'REGISTERED_DEFINITION_SOURCES_ONLY') fail('DEFINITION_BINDING');
       this.assertCurrent();
+      await this.verifyCIHandlesWithinRead();
       return this.definitionReceipt = this.receipt('definition', value);
     });
   }
-  private receipt(kind: 'ci' | 'definition', value: Record<string, any>) {
-    const handle = Object.freeze(Object.create(null));
+  async inspectCIInventory() {
+    return this.exclusive(async () => {
+      if (!this.ciReceipt || this.ledger.state !== 'CURRENT') fail('CI_RECEIPT_REQUIRED');
+      if (!this.inventoryReceipt) {
+        if (!this.store.capturePublicationOwnerHistory || !this.store.assertPublicationOwnerHistoryCurrent)
+          fail('CI_ORIGINAL_HISTORY_REQUIRED');
+        const history = await this.store.capturePublicationOwnerHistory(this.plugin, this.expected.accountId);
+        const rows = readPublicationHistoryReceipt(history, this.store.consumerGuardReceiptIdentity,
+          this.plugin, this.expected.accountId).rows;
+        const historical_bindings: Record<string, unknown>[] = [];
+        for (const row of rows) {
+          const old = JSON.parse(row.payload) as Ledger;
+          if (old.schema !== 'publication-main-source-operation/v1' || old.operationId === this.operationId) continue;
+          if (!old.dispatchBinding || !old.verifiedCI || !positive(old.runId) || !positive(old.attempt)) continue;
+          historical_bindings.push({ operationId: old.operationId,
+            ownerBinding: structuredClone(old.binding), runId: old.runId, attempt: old.attempt,
+            head: old.dispatchBinding.head, workflowSha256: old.dispatchBinding.workflowSha256,
+            operationNonce: old.dispatchBinding.operationNonce, verifiedCI: old.verifiedCI });
+        }
+        await this.store.assertPublicationOwnerHistoryCurrent(history, this.plugin, this.expected.accountId);
+        await this.request('ci.inventory.begin', { ttl_seconds: 60, historical_bindings });
+        await this.request('ci.inventory.verify', {});
+      }
+      const reply = await this.pollCurrent('ci.inventory.current');
+      const value = reply.result;
+      if (!object(value) || value.schema !== 'publication-ci-inventory-source/v1' ||
+          value.operation_id !== this.operationId || value.scope !== 'REGISTERED_WORKFLOW_HISTORY_ONLY' ||
+          value.repository !== REPOSITORY || value.workflow?.path !== WORKFLOW ||
+          canonical(value.owner_binding) !== canonical([this.expected.accountId, this.expected.deviceId,
+            this.expected.bootId, this.expected.ownerEpoch, this.expected.generation]) ||
+          value.anchor?.run_id !== this.ledger.runId || value.anchor?.attempt !== this.ledger.attempt ||
+          value.history_complete !== true || !hex(value.snapshot_sha256) || !Array.isArray(value.members)) fail('CI_INVENTORY_BINDING');
+      return this.inventoryReceipt = this.receipt('ci-inventory', value);
+    });
+  }
+  /** Original durable dispatch provenance, never a caller-supplied run binding. */
+  originalDispatchBinding() {
+    this.assertCurrent();
+    if (!this.ciReceipt || !this.ledger.dispatchBinding || !this.ledger.verifiedCI || this.ledger.state !== 'CURRENT')
+      fail('CI_RECEIPT_REQUIRED');
+    return structuredClone(this.ledger.dispatchBinding);
+  }
+  private async verifyCIHandlesWithinRead() {
+    // C requests Main facts while its worker thread is active. Never reenter B
+    // from that handler. Revalidate the actual CI sources before AND after the
+    // complete C read, in the same original sequenced worker.
+    for (const handle of [this.ciReceipt, this.inventoryReceipt]) {
+      if (!handle) continue;
+      const r = receipts.get(handle)!;
+      const reply = await this.pollCurrent(r.kind === 'ci' ? 'ci.current' : 'ci.inventory.current');
+      if (canonical(reply.result) !== canonical(r.value)) fail('CURRENT_CHANGED');
+    }
+  }
+  private receipt(kind: 'ci' | 'ci-inventory' | 'definition', value: Record<string, any>): object {
+    const handle = Object.freeze(Object.create(null)) as object;
     receipts.set(handle, { broker: this, kind, value: structuredClone(value) });
     return handle;
   }
@@ -576,8 +665,11 @@ export class RestrictedPublicationCISourceBroker {
     const r = receipts.get(handle);
     if (!r || r.broker !== this) fail('PRIVATE_RECEIPT_REQUIRED');
     return this.exclusive(async () => {
-      const reply = await this.pollCurrent(r.kind === 'ci' ? 'ci.current' : 'definition.current');
+      if (r.kind === 'definition') await this.verifyCIHandlesWithinRead();
+      const reply = await this.pollCurrent(r.kind === 'ci' ? 'ci.current' :
+        r.kind === 'ci-inventory' ? 'ci.inventory.current' : 'definition.current');
       if (canonical(reply.result) !== canonical(r.value)) fail('CURRENT_CHANGED');
+      if (r.kind === 'definition') await this.verifyCIHandlesWithinRead();
       this.assertCurrent();
       return structuredClone(r.value);
     });

@@ -309,6 +309,18 @@ function fixture(change?: (r: ControlledCoverageReport) => void) {
       ).toBe(original),
   };
 }
+it('forwards an exact planned generation to quiesce while ordinary invalidation has no cutover plan', async () => {
+  // This uses the pre-existing synthetic authority driver only to check routing;
+  // it makes no original listener, census or terminal policy-source claim.
+  const f = fixture();
+  const quiesce = vi.spyOn(f.driver, 'quiesce');
+  await f.authority.switchGeneration('planned-generation');
+  expect(quiesce.mock.calls).toEqual([['planned-generation']]);
+  await f.authority.invalidate();
+  expect(quiesce.mock.calls).toEqual([['planned-generation'], []]);
+  expect(await f.authority.status()).toBe('QUIESCING');
+});
+
 it('no controller or JSON/fake issuer can register production READY; scope is bound to the account store', async () => {
   const f = fixture();
   const unsupported = new ConsumerGuardCoverageAuthority(f.store, 'plugin', f.account, () => {});
