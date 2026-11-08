@@ -12,9 +12,10 @@ import { createRestrictedPartnerStore } from '../restrictedPartnerStore.js';
 import { digest } from '../restrictedPublicationProtocol.js';
 import { ManagedPublicationController, type PublisherReleaseSource } from '../restrictedPublicationManagedController.js';
 import { RestrictedPublicationOwnerRegistry, verifyOriginalRetirementReceipt } from '../restrictedPublicationOwnerRegistry.js';
-import { RestrictedPublicationResidentSource } from '../restrictedPublicationResidentSource.js';
+import { RestrictedPublicationResidentSource, type PinnedPublicationResidentSource } from '../restrictedPublicationResidentSource.js';
 import { assertNoUncertainPublicationCutover, commitPublicationGenerationCutover,
   preparePublicationGenerationCutover, clonePublicationGenerationPlan, publicationGenerationPlanIdentity,
+  publicationBootstrapSourceMap,
   type MainPublicationGenerationPlan } from '../restrictedPublicationPolicyCutover.js';
 
 const cleanup: Array<() => Promise<unknown>> = [];
@@ -38,6 +39,30 @@ it('clones CI runner expectations without serializing or executing their Main ap
   plan.sourcePlan.ciRunners![0].effects[0].identity.runId = 43;
   expect(copy.sourcePlan.ciRunners![0].effects[0].identity.runId).toBe(42);
   expect(publicationGenerationPlanIdentity(plan)).not.toBe(identity);
+});
+
+it('maps a CI runtime entry and its adjacent helper to canonical immutable source bytes', () => {
+  // Pure source/target metadata, not an installation or Main capability.
+  const entry = 'bridge_core/publication_ci_producer.py';
+  const profile: PinnedPublicationResidentSource = { root: '/immutable/release',
+    runtimeDirectory: '/private/listener', sourceDigest: digest('source'),
+    python: { path: '/fixed/python', sha256: digest('python') },
+    files: { 'macmini-jit-controller/start-approved-jit-runner.sh': digest('script'),
+      'macmini-jit-controller/publication_ci_owner.py': digest('helper'), [entry]: digest('producer') },
+    owners: [{ instanceId: 'controller', ownerId: 'core-jit.bridge-jit-controller',
+      sourceScope: 'REGISTERED_CI_PRODUCER', entryScript: entry,
+      originalRoot: '/actual/runtime', originalEntryScript: 'runner-controller/start-approved-jit-runner.sh',
+      originalArgv: ['/bin/bash', '/actual/runtime/runner-controller/start-approved-jit-runner.sh', '--run', '42'],
+      entryArgv: ['/fixed/python', '-I', '-B', '/immutable/release/' + entry, 'jit-controller', '--run', '42'],
+      originalBootstrapSha256: digest('script'), definitionDigest: digest('definition') }] };
+  const mapping = publicationBootstrapSourceMap(profile);
+  expect([...mapping.keys()]).toEqual(['/actual/runtime/runner-controller/start-approved-jit-runner.sh',
+    '/actual/runtime/runner-controller/publication_ci_owner.py']);
+  expect([...mapping.values()].map(x => [x.sourceRelativePath, x.sha256])).toEqual([
+    ['macmini-jit-controller/start-approved-jit-runner.sh', digest('script')],
+    ['macmini-jit-controller/publication_ci_owner.py', digest('helper')],
+  ]);
+  expect(profile.owners[0].originalEntryScript).toBe('runner-controller/start-approved-jit-runner.sh');
 });
 async function fixture() {
   const directory = await realpath(await mkdtemp(path.join(tmpdir(), 'main-policy-cutover-')));

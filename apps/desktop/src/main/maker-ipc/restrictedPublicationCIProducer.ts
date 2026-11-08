@@ -28,9 +28,11 @@ export interface OriginalCIEffectObservation {
 }
 export interface OriginalCIRunnerPlan {
   instanceId: string;
-  /** Exact Main-approved targets; names/IDs cannot be changed to retry an effect. */
+  /** Fixed Main targets. Only persistent-retire may omit unitInvocationId until
+   * the original producer observes it; every other field remains exact. */
   effects: readonly OriginalCIEffectDescriptor[];
-  /** Original Main approval, never supplied over an IPC or by the runner. */
+  /** Receives the complete actually observed descriptor before durable admit.
+   * This callback is original Main authority, never supplied over IPC. */
   assertEffectApproved(effect: Readonly<OriginalCIEffectDescriptor>): void | Promise<void>;
 }
 type Store = Pick<ReturnType<typeof createRestrictedPartnerStore>,
@@ -63,6 +65,44 @@ export function originalCIEffectIdentity(value: unknown) {
       !value.identity || typeof value.identity !== 'object' || Array.isArray(value.identity) ||
       !Object.keys(value.identity).length || Buffer.byteLength(canonical(value)) > 8192) fail('DESCRIPTOR');
   return digest(value);
+}
+const jitIdentityKeys = 'repository,route,runId,attempt,jobId,headSha,workflowPath,workflowBlob,goldenSha256';
+const effectIdentityKeys: Readonly<Record<OriginalCIEffectDescriptor['kind'], string>> = {
+  'persistent-registration': 'repository,poolId,poolDigest,runnerNames,distro',
+  'persistent-configure': 'repository,poolId,poolDigest,runnerNames,units,runnerDirectories,distro',
+  'persistent-retire': 'repository,poolId,poolDigest,runnerName,runnerId,unit,unitInvocationId,distro',
+  'jit-prepare': jitIdentityKeys, 'jit-register-start': jitIdentityKeys, 'jit-cleanup': jitIdentityKeys,
+  'controller-start': 'repository,route,runId,controllerSha256',
+};
+/** Validate expectation metadata, never an observed receipt or admission. The
+ * sole late observation is the retiring unit's actual invocation identity. */
+export function originalCIEffectPlanIdentity(value: OriginalCIEffectDescriptor) {
+  const id = originalCIEffectIdentity(value);
+  const late = value.kind === 'persistent-retire' && !Object.hasOwn(value.identity, 'unitInvocationId');
+  exact(value.identity, effectIdentityKeys[value.kind].split(',')
+    .filter(key => !late || key !== 'unitInvocationId').join(','));
+  if (Object.values(value.identity).some(item => item === null || item === undefined) ||
+      (value.kind === 'persistent-retire' && !late &&
+        (typeof value.identity.unitInvocationId !== 'string' || !/^[a-f0-9]{32}$/.test(value.identity.unitInvocationId))))
+    fail('PLAN');
+  originalCIEffectTarget(value);
+  return id;
+}
+/** Exact comparison against a fixed Main expectation. A true return is still
+ * only metadata comparison; the caller must hold the original private source. */
+export function matchesOriginalCIEffectPlan(expected: OriginalCIEffectDescriptor, observed: OriginalCIEffectDescriptor) {
+  originalCIEffectPlanIdentity(expected);
+  originalCIEffectIdentity(observed);
+  exact(observed.identity, effectIdentityKeys[observed.kind]);
+  if (observed.kind === 'persistent-retire' &&
+      (typeof observed.identity.unitInvocationId !== 'string' || !/^[a-f0-9]{32}$/.test(observed.identity.unitInvocationId)))
+    fail('EFFECT');
+  if (expected.kind === 'persistent-retire' && observed.kind === expected.kind &&
+      !Object.hasOwn(expected.identity, 'unitInvocationId')) {
+    const identity = { ...observed.identity }; delete identity.unitInvocationId;
+    return canonical(expected) === canonical({ ...observed, identity });
+  }
+  return canonical(expected) === canonical(observed);
 }
 /** Semantic target identity also excludes reviewed source/config hashes. A
  * changed controller, pool digest or workflow blob must not make the same
@@ -161,9 +201,11 @@ export class RestrictedPublicationCIProducer {
         observed.observation.unknownOperations !== 0 || observed.observation.ciEffect !== null ||
         typeof plan.assertEffectApproved !== 'function' || !Array.isArray(plan.effects) ||
         !plan.effects.length || plan.effects.length > 64) fail('PLAN');
-    const expected = plan.effects.map(x => [originalCIEffectIdentity(x), structuredClone(x)] as const);
-    if (new Set(expected.map(x => x[0])).size !== expected.length ||
-        new Set(plan.effects.map(originalCIEffectTarget)).size !== expected.length) fail('PLAN');
+    const expected = plan.effects.map(x => {
+      originalCIEffectPlanIdentity(x);
+      return [originalCIEffectTarget(x), structuredClone(x)] as const;
+    });
+    if (new Set(expected.map(x => x[0])).size !== expected.length) fail('PLAN');
     this.approved = new Map(expected); this.approve = plan.assertEffectApproved;
     this.handle = handle; producers.add(this);
   }
@@ -203,8 +245,9 @@ export class RestrictedPublicationCIProducer {
     return handle;
   }
   private async claim(observed: OriginalPublicationPeerObservation, effect: OriginalCIEffectObservation) {
-    const expected = this.approved.get(effect.effectId);
-    if (effect.state !== 'REQUESTED' || !expected || canonical(expected) !== canonical(effect.descriptor) ||
+    const targetSha256 = originalCIEffectTarget(effect.descriptor);
+    const expected = this.approved.get(targetSha256);
+    if (effect.state !== 'REQUESTED' || !expected || !matchesOriginalCIEffectPlan(expected, effect.descriptor) ||
         this.completed.has(effect.effectId)) fail('EFFECT_NOT_APPROVED');
     const binding = this.source.binding();
     const assertDrained = async () => {
@@ -213,11 +256,10 @@ export class RestrictedPublicationCIProducer {
     };
     // No operation/boot/generation/device component: replacing any of those
     // cannot replay an already claimed target in this original account DB.
-    const targetSha256 = originalCIEffectTarget(effect.descriptor);
     const key = digest(['publication-ci-runner-effect/v1', targetSha256]);
     if (await this.store.readConsumerGuardReceipt(this.plugin, binding.accountId, key)) fail('EFFECT_ALREADY_CLAIMED');
     await assertDrained();
-    await this.approve(structuredClone(expected));
+    await this.approve(structuredClone(effect.descriptor));
     await assertDrained();
     if (canonical(this.source.binding()) !== canonical(binding) || canonical(this.observation()) !== canonical(observed))
       fail('SOURCE_CHANGED');

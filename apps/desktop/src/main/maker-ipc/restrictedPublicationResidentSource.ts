@@ -46,10 +46,10 @@ function binding(value: PublicationSourceBinding) {
 }
 export type OriginalOwnerScope = 'RESIDENT_ORIGINAL_ENTRY' | 'REGISTERED_NAMESPACE_OWNER' |
   'REGISTERED_RESIDENT_NONPUBLISHER' | 'REGISTERED_CI_PRODUCER';
-const ciOriginalEntries: Readonly<Record<string, string>> = {
-  'core-jit.persistent-bridge-pool': 'macmini-jit-controller/sync-runner-pools.py',
-  'core-jit.bridge-jit-controller': 'macmini-jit-controller/start-approved-jit-runner.sh',
-  'core-jit.bridge-jit-dispatcher': 'macmini-jit-controller/jit-deploy-dispatcher.sh',
+const ciOriginalEntries: Readonly<Record<string, { role: string; entry: string }>> = {
+  'core-jit.persistent-bridge-pool': { role: 'persistent-pool', entry: 'macmini-jit-controller/sync-runner-pools.py' },
+  'core-jit.bridge-jit-controller': { role: 'jit-controller', entry: 'macmini-jit-controller/start-approved-jit-runner.sh' },
+  'core-jit.bridge-jit-dispatcher': { role: 'jit-dispatcher', entry: 'macmini-jit-controller/jit-deploy-dispatcher.sh' },
 };
 export interface OriginalPublicationOwnerDescriptor {
   instanceId: string;
@@ -70,6 +70,24 @@ export interface PinnedPublicationResidentSource {
   sourceDigest: string;
   runtimeDirectory: string;
   owners: ReadonlyArray<OriginalPublicationOwnerDescriptor>;
+}
+/** Source/target metadata only. Runtime copies keep their real paths while
+ * their bytes and adjacent helper remain bound to fixed canonical release pins. */
+export function originalCIProducerBootstrap(owner: OriginalPublicationOwnerDescriptor,
+  files: Readonly<Record<string, string>>) {
+  const source = Object.hasOwn(ciOriginalEntries, owner.ownerId) ? ciOriginalEntries[owner.ownerId] : undefined;
+  const sourceHelper = 'macmini-jit-controller/publication_ci_owner.py';
+  if (owner.sourceScope !== 'REGISTERED_CI_PRODUCER' || !source ||
+      owner.entryScript !== 'bridge_core/publication_ci_producer.py' ||
+      !relative(owner.originalEntryScript) || path.basename(owner.originalEntryScript) !== path.basename(source.entry) ||
+      !files || files[source.entry] !== owner.originalBootstrapSha256 || !hash(owner.originalBootstrapSha256) ||
+      !hash(files[sourceHelper]) || !hash(files[owner.entryScript]) ||
+      !Array.isArray(owner.originalArgv) || owner.originalArgv.length < 2 ||
+      path.resolve(owner.originalRoot, owner.originalArgv[1]) !== path.join(owner.originalRoot, owner.originalEntryScript) ||
+      !Array.isArray(owner.entryArgv) || canonical(owner.entryArgv.slice(4)) !==
+        canonical([source.role, ...owner.originalArgv.slice(2)])) fail('PROFILE');
+  return { sourceEntry: source.entry, sourceHelper,
+    runtimeHelper: path.join(path.dirname(owner.originalEntryScript), 'publication_ci_owner.py') };
 }
 type Phase = 'CONNECTED' | 'LOADED' | 'RUNNING' | 'FINISHED' | 'FENCED' | 'DRAINED' | 'RETIRED' | 'UNKNOWN';
 export interface OriginalPublicationPeerObservation {
@@ -190,9 +208,7 @@ export class RestrictedPublicationResidentSource {
           !Array.isArray(o.entryArgv) || o.entryArgv.length < 4 || o.entryArgv.length > 64 ||
           !o.entryArgv.every(opaque) || canonical(o.entryArgv.slice(0, 4)) !==
             canonical([profile.python.path, '-I', '-B', path.join(profile.root, o.entryScript)])) fail('PROFILE');
-      if (o.sourceScope === 'REGISTERED_CI_PRODUCER' &&
-          (o.entryScript !== 'bridge_core/publication_ci_producer.py' ||
-           !Object.hasOwn(ciOriginalEntries, o.ownerId) || ciOriginalEntries[o.ownerId] !== o.originalEntryScript)) fail('PROFILE');
+      if (o.sourceScope === 'REGISTERED_CI_PRODUCER') originalCIProducerBootstrap(o, profile.files);
       ids.add(o.instanceId);
     }
     this.profile = structuredClone(profile);
@@ -308,7 +324,13 @@ export class RestrictedPublicationResidentSource {
       if (total > 64 * TOTAL) fail('SOURCE_BUDGET');
     }
     await add(p.python.path, p.python.sha256, 128 * TOTAL);
-    for (const o of p.owners) await add(path.join(o.originalRoot, o.originalEntryScript), o.originalBootstrapSha256, 4 * TOTAL);
+    for (const o of p.owners) {
+      await add(path.join(o.originalRoot, o.originalEntryScript), o.originalBootstrapSha256, 4 * TOTAL);
+      if (o.sourceScope === 'REGISTERED_CI_PRODUCER') {
+        const ci = originalCIProducerBootstrap(o, p.files);
+        await add(path.join(o.originalRoot, ci.runtimeHelper), p.files[ci.sourceHelper], 4 * TOTAL);
+      }
+    }
   }
   private async verifyPinnedFiles() {
     for (const [file, expected] of this.directories) {
@@ -719,17 +741,20 @@ export class RestrictedPublicationResidentSource {
         if (!opaque(descriptor.instanceId) || ids.has(descriptor.instanceId) ||
             this.profile.owners.some(x => x.instanceId === descriptor.instanceId) ||
             !opaque(descriptor.ownerId) ||
-            !['RESIDENT_ORIGINAL_ENTRY', 'REGISTERED_NAMESPACE_OWNER', 'REGISTERED_RESIDENT_NONPUBLISHER'].includes(descriptor.sourceScope) ||
+            !['RESIDENT_ORIGINAL_ENTRY', 'REGISTERED_NAMESPACE_OWNER', 'REGISTERED_RESIDENT_NONPUBLISHER',
+              'REGISTERED_CI_PRODUCER'].includes(descriptor.sourceScope) ||
             !relative(descriptor.entryScript) || !relative(descriptor.originalEntryScript) ||
             !path.isAbsolute(descriptor.originalRoot) || path.normalize(descriptor.originalRoot) !== descriptor.originalRoot ||
             !Array.isArray(descriptor.originalArgv) || !descriptor.originalArgv.length ||
             descriptor.originalArgv.length > 64 || !descriptor.originalArgv.every(opaque) ||
             !Array.isArray(descriptor.entryArgv) || descriptor.entryArgv.length < 4 ||
             descriptor.entryArgv.length > 64 || !descriptor.entryArgv.every(opaque) ||
-            next.files[descriptor.originalEntryScript] !== descriptor.originalBootstrapSha256 ||
+            (descriptor.sourceScope !== 'REGISTERED_CI_PRODUCER' &&
+              next.files[descriptor.originalEntryScript] !== descriptor.originalBootstrapSha256) ||
             !hash(next.files[descriptor.entryScript]) || !hash(descriptor.definitionDigest) ||
             canonical(descriptor.entryArgv.slice(0, 4)) !==
               canonical([next.python.path, '-I', '-B', path.join(next.root, descriptor.entryScript)])) fail('NEXT_POLICY');
+        if (descriptor.sourceScope === 'REGISTERED_CI_PRODUCER') originalCIProducerBootstrap(descriptor, next.files);
         ids.add(descriptor.instanceId);
         const claimKey = digest(['publication-original-instance-claim/v1', this.expected.deviceId, descriptor.instanceId]);
         if (await this.store.readConsumerGuardReceipt(this.plugin, this.expected.accountId, claimKey))

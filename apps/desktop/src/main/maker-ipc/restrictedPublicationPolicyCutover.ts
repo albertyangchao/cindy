@@ -10,7 +10,7 @@ import { readPublicationHistoryReceipt, type createRestrictedPartnerStore } from
 import { ManagedPublicationController, readPreparedInstallReceipt } from './restrictedPublicationManagedController.js';
 import { isOriginalPublicationRegistry, type OriginalPublicationRegistryProfile,
   type RestrictedPublicationOwnerRegistry } from './restrictedPublicationOwnerRegistry.js';
-import { isOriginalPublicationSource, type PinnedPublicationResidentSource,
+import { isOriginalPublicationSource, originalCIProducerBootstrap, type PinnedPublicationResidentSource,
   type RestrictedPublicationResidentSource } from './restrictedPublicationResidentSource.js';
 import type { FixedCoverageProfile, MainPublicationSourcePlan } from './restrictedPublicationCoverageDriver.js';
 
@@ -135,26 +135,31 @@ type Prepared = { owner: object; controller: ManagedPublicationController; plan:
 const prepared = new WeakMap<object, Prepared>();
 const bootstrapDependencies = ['bridge_core/__init__.py', 'bridge_core/publication_owner_listener.py',
   'bridge_core/publication_resident_source.py'];
-function bootstrapPaths(profile: PinnedPublicationResidentSource) {
-  const paths = new Map<string, { originalRoot: string; relativePath: string; sha256: string }>();
+/** Pure mapping; creating this map neither switches a file nor grants approval. */
+export function publicationBootstrapSourceMap(profile: PinnedPublicationResidentSource) {
+  const paths = new Map<string, { originalRoot: string; relativePath: string; sourceRelativePath: string; sha256: string }>();
   for (const owner of profile.owners) {
-    const names = new Set([owner.originalEntryScript]);
-    if (owner.originalEntryScript !== 'monitor/publication_nonpublisher_owner.py') {
-      for (const name of bootstrapDependencies) names.add(name);
+    const names = new Map([[owner.originalEntryScript, owner.originalEntryScript]]);
+    if (owner.sourceScope === 'REGISTERED_CI_PRODUCER') {
+      const ci = originalCIProducerBootstrap(owner, profile.files);
+      names.set(owner.originalEntryScript, ci.sourceEntry);
+      names.set(ci.runtimeHelper, ci.sourceHelper);
+      // The adjacent CI helper loads Bridge from the actual pinned policy
+      // release; it never imports a second package copied into the runtime dir.
+    } else if (owner.originalEntryScript !== 'monitor/publication_nonpublisher_owner.py') {
+      for (const name of bootstrapDependencies) names.set(name, name);
       if (owner.entryScript === 'bridge_core/publication_namespace_owner.py') for (const name of [
         owner.entryScript, 'bridge_core/publication_consumer_enrollment.py',
         'bridge_core/publication_consumer_guards.py', 'bridge_core/publish_queue_consumers.py',
-        'bridge_core/html_contract.py', 'bridge_core/template_families.py']) names.add(name);
-      if (owner.sourceScope === 'REGISTERED_CI_PRODUCER') for (const name of [
-        'bridge_core/publication_ci_producer.py', 'macmini-jit-controller/publication_ci_owner.py']) names.add(name);
+        'bridge_core/html_contract.py', 'bridge_core/template_families.py']) names.set(name, name);
     }
-    for (const relativePath of names) {
+    for (const [relativePath, sourceRelativePath] of names) {
       const sha256 = relativePath === owner.originalEntryScript
-        ? owner.originalBootstrapSha256 : profile.files[relativePath];
-      if (!relative(relativePath) || !hex(sha256)) fail('BOOTSTRAP_SOURCE_REQUIRED');
+        ? owner.originalBootstrapSha256 : profile.files[sourceRelativePath];
+      if (!relative(relativePath) || !relative(sourceRelativePath) || !hex(sha256)) fail('BOOTSTRAP_SOURCE_REQUIRED');
       const target = path.join(owner.originalRoot, relativePath), old = paths.get(target);
       if (old && old.sha256 !== sha256) fail('BOOTSTRAP_CONFLICT');
-      paths.set(target, { originalRoot: owner.originalRoot, relativePath, sha256 });
+      paths.set(target, { originalRoot: owner.originalRoot, relativePath, sourceRelativePath, sha256 });
     }
   }
   return paths;
@@ -164,13 +169,13 @@ async function planBootstrapSwitch(oldProfiles: PinnedPublicationResidentSource[
   for (const next of nextProfiles) {
     const old = oldProfiles.find(x => x.runtimeDirectory === next.runtimeDirectory);
     if (!old) fail('POLICY_REALM_MISSING');
-    const before = bootstrapPaths(old);
-    for (const [target, item] of bootstrapPaths(next)) {
+    const before = publicationBootstrapSourceMap(old);
+    for (const [target, item] of publicationBootstrapSourceMap(next)) {
       if ([...oldProfiles, ...nextProfiles].some(profile => target === profile.root ||
           target.startsWith(profile.root + path.sep))) fail('IMMUTABLE_BOOTSTRAP_COLLISION');
       const previous = before.get(target);
       if (!previous) fail('ORIGINAL_BOOTSTRAP_UNOBSERVED');
-      const change = { previous: previous.sha256, next: item.sha256, source: path.join(next.root, item.relativePath) };
+      const change = { previous: previous.sha256, next: item.sha256, source: path.join(next.root, item.sourceRelativePath) };
       const existing = changes.get(target);
       if (existing && (existing.previous !== change.previous || existing.next !== change.next)) fail('BOOTSTRAP_CONFLICT');
       if (!existing) changes.set(target, change);

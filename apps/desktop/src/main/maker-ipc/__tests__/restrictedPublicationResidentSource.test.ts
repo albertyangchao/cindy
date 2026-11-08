@@ -211,3 +211,40 @@ it.each([
   expect(refused).toEqual(accepted ? undefined : 'FRAME_INVALID');
   expect(owner.terminalFrameReceived).toBe(accepted && terminal);
 });
+
+it.each([
+  ['core-jit.persistent-bridge-pool', 'persistent-pool', 'sync-runner-pools.py'],
+  ['core-jit.bridge-jit-controller', 'jit-controller', 'start-approved-jit-runner.sh'],
+  ['core-jit.bridge-jit-dispatcher', 'jit-dispatcher', 'jit-deploy-dispatcher.sh'],
+])('keeps the real runtime-copy path for %s before original pin verification', async (ownerId, role, filename) => {
+  const f = await fixture(), owner = f.profile.owners[0];
+  Object.assign(owner, { ownerId, sourceScope: 'REGISTERED_CI_PRODUCER',
+    entryScript: 'bridge_core/publication_ci_producer.py', originalEntryScript: filename,
+    originalArgv: ['/bin/bash', path.join(f.root, filename)],
+    entryArgv: [f.profile.python.path, '-I', '-B', path.join(f.root, 'bridge_core/publication_ci_producer.py'), role] });
+  f.profile.files = { ['macmini-jit-controller/' + filename]: owner.originalBootstrapSha256,
+    'macmini-jit-controller/publication_ci_owner.py': digest('helper'),
+    'bridge_core/publication_ci_producer.py': digest('producer') };
+  // The constructor must accept actual layout metadata, then fail on missing
+  // real source pins. This is not a successful original peer or process start.
+  await expect(f.start()).rejects.toThrow('SOURCE_PROFILE');
+  expect(f.rows()).toHaveLength(2);
+  expect(f.rows().map(x => JSON.parse((x as { payload: string }).payload))
+    .find(x => x.schema === 'publication-original-owner-listener/v1').listenerPid).toBeNull();
+});
+
+it('a runtime-copy path never permits a different CI role or canonical bootstrap hash', async () => {
+  const f = await fixture(), owner = f.profile.owners[0];
+  const entry = 'bridge_core/publication_ci_producer.py';
+  Object.assign(owner, { ownerId: 'core-jit.bridge-jit-controller', sourceScope: 'REGISTERED_CI_PRODUCER',
+    entryScript: entry, originalEntryScript: 'start-approved-jit-runner.sh',
+    originalArgv: ['/bin/bash', path.join(f.root, 'start-approved-jit-runner.sh')],
+    entryArgv: [f.profile.python.path, '-I', '-B', path.join(f.root, entry), 'jit-dispatcher'] });
+  f.profile.files = { 'macmini-jit-controller/start-approved-jit-runner.sh': owner.originalBootstrapSha256,
+    'macmini-jit-controller/publication_ci_owner.py': digest('helper'), [entry]: digest('producer') };
+  await expect(f.start()).rejects.toThrow('PROFILE');
+  owner.entryArgv[4] = 'jit-controller';
+  f.profile.files = { ...f.profile.files, 'macmini-jit-controller/start-approved-jit-runner.sh': digest('foreign') };
+  await expect(f.start()).rejects.toThrow('PROFILE');
+  expect(f.rows()).toEqual([]);
+});

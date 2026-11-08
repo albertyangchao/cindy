@@ -12,7 +12,8 @@ import { createRestrictedPartnerStore } from '../restrictedPartnerStore.js';
 import { canonical, digest } from '../restrictedPublicationProtocol.js';
 import { RestrictedPublicationResidentSource } from '../restrictedPublicationResidentSource.js';
 import { RestrictedPublicationCIProducer, consumeOriginalCIEffectPermit, originalCIEffectIdentity,
-  originalCIEffectTarget, validateOriginalCIEffect, type OriginalCIEffectDescriptor } from '../restrictedPublicationCIProducer.js';
+  originalCIEffectTarget, originalCIEffectPlanIdentity, matchesOriginalCIEffectPlan,
+  validateOriginalCIEffect, type OriginalCIEffectDescriptor } from '../restrictedPublicationCIProducer.js';
 
 const databases: Database.Database[] = [];
 afterEach(() => { for (const db of databases.splice(0)) db.close(); });
@@ -110,4 +111,31 @@ it('a source/config hash change cannot make the same runner target retryable', (
     runnerNames: [...pool.identity.runnerNames as string[]].reverse() } })).toBe(originalCIEffectTarget(pool));
   expect(originalCIEffectTarget({ ...descriptor, identity: { ...descriptor.identity, runId: 42 } }))
     .not.toBe(originalCIEffectTarget(descriptor));
+});
+
+it('binds the one late retirement observation without changing any fixed Main target', () => {
+  // Expectation/descriptor comparison only: no private peer or permit is made.
+  const expected: OriginalCIEffectDescriptor = { schema: 'publication-ci-effect/v1', kind: 'persistent-retire',
+    identity: { repository: 'albertyangchao/core-bridge', poolId: 'valerie-bridge-ci', poolDigest: digest('pool'),
+      runnerName: 'windows-ayc-core-bridge-ci-03', runnerId: 83, distro: 'ValerieCI',
+      unit: 'actions.runner.albertyangchao-core-bridge.windows-ayc-core-bridge-ci-03.service' } };
+  const observed = { ...expected, identity: { ...expected.identity, unitInvocationId: 'a'.repeat(32) } };
+  expect(matchesOriginalCIEffectPlan(expected, observed)).toBe(true);
+  expect(originalCIEffectIdentity(observed)).not.toBe(originalCIEffectPlanIdentity(expected));
+  expect(originalCIEffectTarget(observed)).toBe(originalCIEffectTarget(expected));
+  for (const change of [{ runnerId: 84 }, { poolDigest: digest('different') }, { unit: 'another.service' }])
+    expect(matchesOriginalCIEffectPlan(expected, { ...observed, identity: { ...observed.identity, ...change } })).toBe(false);
+  expect(matchesOriginalCIEffectPlan(observed, { ...observed,
+    identity: { ...observed.identity, unitInvocationId: 'b'.repeat(32) } })).toBe(false);
+  expect(() => matchesOriginalCIEffectPlan(expected, { ...observed,
+    identity: { ...observed.identity, unitInvocationId: '' } })).toThrow('EFFECT');
+  for (const value of [null, undefined, ''])
+    expect(() => originalCIEffectPlanIdentity({ ...expected,
+      identity: { ...expected.identity, unitInvocationId: value } })).toThrow('PLAN');
+  const missing = { ...expected.identity }; delete missing.poolDigest;
+  expect(() => originalCIEffectPlanIdentity({ ...expected, identity: missing })).toThrow('SCHEMA');
+  expect(() => originalCIEffectPlanIdentity({ ...expected,
+    identity: { ...expected.identity, extraObservedFact: 'not-allowed' } })).toThrow('SCHEMA');
+  expect(() => originalCIEffectPlanIdentity({ schema: 'publication-ci-effect/v1', kind: 'controller-start',
+    identity: { repository: 'albertyangchao/core-bridge', route: 'valerie-bridge', runId: 41 } })).toThrow('SCHEMA');
 });

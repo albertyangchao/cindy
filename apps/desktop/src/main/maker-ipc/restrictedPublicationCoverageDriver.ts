@@ -28,7 +28,7 @@ import {
   type PinnedPublicationResidentSource,
 } from './restrictedPublicationResidentSource.js';
 import { RestrictedPublicationOwnerRegistry } from './restrictedPublicationOwnerRegistry.js';
-import { RestrictedPublicationCIProducer, originalCIEffectIdentity, originalCIEffectTarget,
+import { RestrictedPublicationCIProducer, originalCIEffectPlanIdentity, originalCIEffectTarget,
   type OriginalCIRunnerPlan, type OriginalCIEffectDescriptor } from './restrictedPublicationCIProducer.js';
 import { assertNoUncertainPublicationCutover, clonePublicationGenerationPlan, publicationGenerationPlanIdentity,
   preparePublicationGenerationCutover, commitPublicationGenerationCutover,
@@ -176,7 +176,7 @@ function normalizeSourcePlan(sourcePlan?: MainPublicationSourcePlan): { metadata
         if (!opaque(runner.instanceId) || typeof runner.assertEffectApproved !== 'function' ||
             !Array.isArray(runner.effects) || !runner.effects.length || runner.effects.length > 64 ||
             Object.keys(runner).sort().join(',') !== 'assertEffectApproved,effects,instanceId') fail('SOURCE_PLAN');
-        const ids = runner.effects.map((effect: OriginalCIEffectDescriptor) => originalCIEffectIdentity(effect));
+        const ids = runner.effects.map((effect: OriginalCIEffectDescriptor) => originalCIEffectPlanIdentity(effect));
         if (new Set(ids).size !== ids.length ||
             new Set(runner.effects.map(originalCIEffectTarget)).size !== ids.length) fail('SOURCE_PLAN');
         runnerApprovals.set(runner.instanceId, runner.assertEffectApproved);
