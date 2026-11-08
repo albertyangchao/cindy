@@ -208,7 +208,8 @@ export class RestrictedPublicationResidentSource {
           !Array.isArray(o.entryArgv) || o.entryArgv.length < 4 || o.entryArgv.length > 64 ||
           !o.entryArgv.every(opaque) || canonical(o.entryArgv.slice(0, 4)) !==
             canonical([profile.python.path, '-I', '-B', path.join(profile.root, o.entryScript)])) fail('PROFILE');
-      if (o.sourceScope === 'REGISTERED_CI_PRODUCER') originalCIProducerBootstrap(o, profile.files);
+      if (o.sourceScope === 'REGISTERED_CI_PRODUCER')
+        originalCIProducerBootstrap(o as OriginalPublicationOwnerDescriptor, profile.files);
       ids.add(o.instanceId);
     }
     this.profile = structuredClone(profile);
@@ -754,7 +755,8 @@ export class RestrictedPublicationResidentSource {
             !hash(next.files[descriptor.entryScript]) || !hash(descriptor.definitionDigest) ||
             canonical(descriptor.entryArgv.slice(0, 4)) !==
               canonical([next.python.path, '-I', '-B', path.join(next.root, descriptor.entryScript)])) fail('NEXT_POLICY');
-        if (descriptor.sourceScope === 'REGISTERED_CI_PRODUCER') originalCIProducerBootstrap(descriptor, next.files);
+        if (descriptor.sourceScope === 'REGISTERED_CI_PRODUCER')
+          originalCIProducerBootstrap(descriptor as OriginalPublicationOwnerDescriptor, next.files);
         ids.add(descriptor.instanceId);
         const claimKey = digest(['publication-original-instance-claim/v1', this.expected.deviceId, descriptor.instanceId]);
         if (await this.store.readConsumerGuardReceipt(this.plugin, this.expected.accountId, claimKey))
