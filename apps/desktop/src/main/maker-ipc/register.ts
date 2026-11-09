@@ -5,7 +5,6 @@ import { createOwnerPublicationRuntime } from './ownerPublicationRuntime.js';
 import {controlledPublicationRuntime,resolveControlledPublicationRoot} from './restrictedPublicationCaller.js';
 import { captureBotPermissionEpoch } from './botPermissionDispatch.js';
 import { captureRestrictedPartnerEpoch } from './restrictedPartnerEpoch.js';
-import { isTrustedAppRendererWindow } from '../security/trustedAppRenderer.js';
 import { createRestrictedPartnerHost } from './restrictedPartnerHost.js';
 import { registerRuntimeSettingsSection } from '../app-settings/runtime.js';
 import { z as settingsSchema } from 'zod';
