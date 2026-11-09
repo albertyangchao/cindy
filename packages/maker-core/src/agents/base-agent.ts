@@ -44,6 +44,7 @@ import type {
 import type { CapabilityRoutingPolicy } from '../types/capability-routing.js';
 import { NotSupportedError } from '../types/capabilities.js';
 import type { AgentCredentialMode, AuthLoginOptions } from '../interfaces/auth-adapter.js';
+import { NATIVE_SUBSCRIPTION_ACCOUNT, type NativeSubscriptionAccount } from '../interfaces/auth-adapter.js';
 import type {
   MemoryStatus,
   MemorySetResult,
@@ -476,6 +477,7 @@ export interface CodexLocalCredentialModeSwitchContext {
 }
 
 export interface RefreshLocalModelsOptions {
+  [NATIVE_SUBSCRIPTION_ACCOUNT]?: NativeSubscriptionAccount;
   providerId?: string;
   /**
    * Bind model discovery to a specific local credential route.
@@ -488,6 +490,8 @@ export interface RefreshLocalModelsOptions {
    * 捕获监听器,让调用方按发起时的登录代际决定是否采用。
    */
   onSupportedModels?: (models: unknown[]) => void;
+  /** Codex: route a complete live snapshot to this caller instead of OAuth discovery. */
+  onModelsListed?: (models: readonly CodexModelListItem[]) => void | Promise<void>;
 }
 
 export interface ClaudeSubagentTaskRegistration {
@@ -857,7 +861,7 @@ export interface AgentDeps {
     sessionId: string,
     token: string,
     resolveProviderId: () => string | null,
-    options?: { scope?: 'session' | 'subagent-route' },
+    options?: { scope?: 'session' | 'subagent-route'; nativeSubscriptionAccount?: NativeSubscriptionAccount },
   ) => (() => void) | void;
 
   /**
@@ -1911,6 +1915,7 @@ export interface LocalAgentClient {
 }
 
 export interface StartSessionOptions {
+  [NATIVE_SUBSCRIPTION_ACCOUNT]?: NativeSubscriptionAccount;
   /** Host-minted external subject boundary; never accepted from wire/task JSON. */
   [RESTRICTED_PARTNER]?: RestrictedPartnerInput;
   [LOCAL_AGENT_CLIENT]?: LocalAgentClient;
@@ -2253,7 +2258,7 @@ export type TurnPermissionOrigin =
   | { kind: 'desktop' }
   | {
       kind: 'im';
-      channel: 'feishu' | 'discord' | 'slack' | 'wechat' | 'telegram' | 'dingtalk' | 'wecom';
+      channel: 'feishu' | 'discord' | 'slack' | 'wechat' | 'telegram' | 'dingtalk' | 'wecom' | 'imessage';
       taskId?: string;
     }
   | { kind: 'scheduler' }
