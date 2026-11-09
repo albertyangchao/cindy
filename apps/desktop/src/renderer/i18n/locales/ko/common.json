@@ -19390,5 +19390,27 @@
     "rendered": "문서 보기",
     "wrap": "자동 줄 바꿈",
     "lineNumbers": "줄 번호"
+  },
+  "restrictedOwnerPublication": {
+    "registerTitle": "본인의 iMessage ID 확인",
+    "registerMessage": "이 iMessage ID를 HTML 공개 게시용으로 등록할까요?",
+    "revokeTitle": "HTML 공개 게시 등록 취소",
+    "revokeMessage": "이 iMessage ID의 HTML 공개 게시 등록을 취소할까요?",
+    "scope": "등록은 아래 ID와 채널에만 적용됩니다. 게시할 때마다 완료된 내용과 최종 파일을 확인하고 승인해야 합니다.",
+    "identityCheckbox": "본인의 iMessage ID입니다. 아래 소스와 공개 게시 대상을 확인했습니다.",
+    "registerButton": "본인 ID 등록",
+    "revokeButton": "등록 취소"
+  },
+  "restrictedPartner": {
+    "originalSourceRoot": "이 대상의 원본 소스 루트 선택",
+    "fixedMemoryDirectory": "원본 PROFILE / MEMORY / INTERESTS 디렉터리 선택",
+    "originalAbsenceTitle": "원본 부재 증거 검토",
+    "originalAbsenceBody": "고정된 원본 소스 기록에 따르면 이 대상에게는 해당 데이터베이스가 존재한 적이 없습니다. 현재 파일이 없다는 사실이 아닌 정확한 원본 기록을 확인하세요.",
+    "approveOriginalAbsence": "원본 부재 기록을 검토했습니다",
+    "evidenceRevision": "원본 증거 리비전",
+    "title": "플러그인 접근",
+    "message": "{{partner}}에 대한 외부 입력을 허용할까요?",
+    "detail": "선택한 파트너의 페르소나와 명시적으로 선택한 파일만 사용할 수 있습니다. 다른 작업 기록, 소유자의 메모리, 자격 증명, 네트워크 및 일반 도구는 공유되지 않습니다. 메시징 경로는 활성화되지 않습니다.",
+    "resources": "이 외부 대상의 읽기 전용 리소스 선택"
   }
 }

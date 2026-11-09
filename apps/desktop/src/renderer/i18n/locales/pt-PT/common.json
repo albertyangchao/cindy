@@ -19646,5 +19646,27 @@
     "rendered": "Ver documento",
     "wrap": "Moldar linhas",
     "lineNumbers": "Números de linha"
+  },
+  "restrictedOwnerPublication": {
+    "registerTitle": "Confirmar a Minha Identidade do iMessage",
+    "registerMessage": "Registar esta identidade do iMessage para publicação pública de HTML?",
+    "revokeTitle": "Revogar o Registo de Publicação HTML",
+    "revokeMessage": "Revogar a publicação pública de HTML para esta identidade do iMessage?",
+    "scope": "O registo aplica-se apenas à identidade e ao canal apresentados. Cada publicação continua a exigir a aprovação do conteúdo concluído exato e do ficheiro final.",
+    "identityCheckbox": "Esta é a minha identidade do iMessage. Verifiquei a origem e o destino público abaixo.",
+    "registerButton": "Registar a Minha Identidade",
+    "revokeButton": "Revogar o Registo"
+  },
+  "restrictedPartner": {
+    "originalSourceRoot": "Selecionar a raiz da fonte original deste sujeito",
+    "fixedMemoryDirectory": "Selecionar o diretório original PROFILE / MEMORY / INTERESTS",
+    "originalAbsenceTitle": "Rever a prova original de ausência",
+    "originalAbsenceBody": "O registo fixo da fonte original indica que este sujeito nunca teve esta base de dados. Confirme esse registo exato, não apenas a ausência atual de um ficheiro.",
+    "approveOriginalAbsence": "Revi o registo original de ausência",
+    "evidenceRevision": "Revisão da prova original",
+    "title": "Acesso do plugin",
+    "message": "Permitir entradas externas para {{partner}}?",
+    "detail": "Apenas estão disponíveis a personalidade do parceiro selecionado e os ficheiros que escolher explicitamente. O histórico de outras tarefas, a memória do proprietário, as credenciais, a rede e as ferramentas gerais não são partilhados. Isto não ativa um canal de mensagens.",
+    "resources": "Escolher recursos só de leitura para este sujeito externo"
   }
 }

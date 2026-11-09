@@ -83,6 +83,7 @@ export function parsePackageArgs(argv, defaults = {}) {
     skipSmoke: false,
     allowUnsigned: false,
     noSign: false,
+    localOnly: false,
   };
   let archFlag = null;
   let regionSpecified = false;
@@ -112,8 +113,11 @@ export function parsePackageArgs(argv, defaults = {}) {
       // 环境,不具备该环境的机器打版本无关包时用它;与 --allow-unsigned
       // (放行"缺配置")语义互补。
       case '--no-sign': out.noSign = true; out.allowUnsigned = true; break;
+      // D3 local builds keep a real incremented version without becoming an
+      // official release. Never load Developer ID credentials in this mode.
+      case '--local-only': out.localOnly = true; out.noSign = true; out.allowUnsigned = true; break;
       default:
-        throw new Error(`未知参数: ${a}(支持 --platform/--arch/--region/--version/--skip-smoke/--allow-unsigned/--no-sign)`);
+        throw new Error(`未知参数: ${a}(支持 --platform/--arch/--region/--version/--skip-smoke/--allow-unsigned/--no-sign/--local-only)`);
     }
   }
 
@@ -160,6 +164,14 @@ export function parsePackageArgs(argv, defaults = {}) {
   ) {
     throw new Error(`非法 --version: ${out.versionSpec}(可选 x.y.z / major / minor / patch)`);
   }
+  if (out.localOnly) {
+    if (out.platform !== 'darwin' || out.archs.length !== 1 || out.archs[0] !== 'arm64') {
+      throw new Error('--local-only 只支持显式 --platform darwin --arch arm64');
+    }
+    if (!isExplicitVersion(out.versionSpec ?? '') || out.versionSpec === VERSIONLESS_VERSION) {
+      throw new Error('--local-only 必须传入本机已核基线递增后的 --version x.y.z；不查询 CDN 版本');
+    }
+  }
   return out;
 }
 
@@ -205,9 +217,9 @@ export async function resolvePackageVersion(versionSpec, fetchBaseline) {
 }
 
 /** 产物目录(相对 apps/desktop/release/):artifacts/<region>/<version|unversioned>/<platformKey> */
-export function artifactRelDir({ region, version, versionless, platformKey }) {
+export function artifactRelDir({ region, version, versionless, platformKey, localOnly = false }) {
   const versionSeg = versionless ? 'unversioned' : version;
-  return ['artifacts', region, versionSeg, platformKey].join('/');
+  return [localOnly ? 'local-artifacts' : 'artifacts', region, versionSeg, platformKey].join('/');
 }
 
 /**
@@ -230,6 +242,7 @@ export function artifactBaseName({ version, versionless }) {
  *   files: Array<{ role: string, name: string, sha256: string, size: number }>,
  *   signing: Record<string, unknown>,
  *   mcpAppsManual?: { sha256: string, size: number } | null,
+ *   localOnly?: boolean,
  * }} ctx
  */
 export function buildBuildInfo(ctx) {
@@ -237,6 +250,8 @@ export function buildBuildInfo(ctx) {
     // v2 移除无运行语义的 package channel；发布通道只属于 publish 阶段。
     schemaVersion: 2,
     product: 'cindy-desktop',
+    // Absent in existing official receipts; explicit on local-only builds.
+    ...(ctx.localOnly ? { localOnly: true, distribution: 'local-only' } : {}),
     // 版本无关包 version 记 null,占位符不冒充真实版本。
     version: ctx.versionless ? null : ctx.version,
     versionless: ctx.versionless,

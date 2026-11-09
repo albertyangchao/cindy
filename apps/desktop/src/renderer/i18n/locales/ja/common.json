@@ -19390,5 +19390,27 @@
     "rendered": "文書を表示",
     "wrap": "行の折り返し",
     "lineNumbers": "行番号"
+  },
+  "restrictedOwnerPublication": {
+    "registerTitle": "自分の iMessage ID を確認",
+    "registerMessage": "この iMessage ID を HTML 公開用に登録しますか？",
+    "revokeTitle": "HTML 公開の登録を取り消す",
+    "revokeMessage": "この iMessage ID の HTML 公開登録を取り消しますか？",
+    "scope": "登録は以下の ID とチャネルのみに適用されます。公開のたびに、完成した内容と最終ファイルの承認が必要です。",
+    "identityCheckbox": "これは自分の iMessage ID です。以下のソースと公開先を確認しました。",
+    "registerButton": "自分の ID を登録",
+    "revokeButton": "登録を取り消す"
+  },
+  "restrictedPartner": {
+    "originalSourceRoot": "この対象の元のソースルートを選択",
+    "fixedMemoryDirectory": "元の PROFILE / MEMORY / INTERESTS ディレクトリを選択",
+    "originalAbsenceTitle": "元の不存在証拠を確認",
+    "originalAbsenceBody": "固定された元のソース記録では、この対象にこのデータベースが存在したことはありません。現在ファイルがないことではなく、その元の記録を確認してください。",
+    "approveOriginalAbsence": "元の不存在記録を確認しました",
+    "evidenceRevision": "元の証拠のリビジョン",
+    "title": "プラグインのアクセス",
+    "message": "{{partner}} への外部入力を許可しますか？",
+    "detail": "選択したパートナーの人格設定と、明示的に選択したファイルのみを利用できます。他のタスク履歴、所有者のメモリ、認証情報、ネットワーク、汎用ツールは共有されません。メッセージ経路は有効になりません。",
+    "resources": "この外部対象の読み取り専用リソースを選択"
   }
 }

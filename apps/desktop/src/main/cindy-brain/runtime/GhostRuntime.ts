@@ -56,6 +56,8 @@ interface GhostRuntimeOptions {
 
 interface RuntimeEntry {
   state: GhostRuntimeState;
+  /** Invalidates synchronous cleanup/start callbacks after explicit stop or replacement. */
+  generation: number;
   handle: SandboxHandle | null;
   loading: Promise<void> | null;
   /** 当前沙箱按哪一份安装拉起(sandboxIdentity);换版后据此识别过期沙箱。 */
@@ -100,6 +102,16 @@ export class GhostRuntime {
     return out;
   }
 
+  /** Read-only recovery check: a crash never authorizes a different install.
+   * The caller must still recheck the current owner, enabled state and residency.
+   */
+  canRestartCrashed(ghost: InstalledGhost): boolean {
+    const id = installedGhostStoragePart(ghost);
+    const entry = this.entries.get(id);
+    return entry?.state === 'crashed' && entry.identity === sandboxIdentity(ghost) &&
+      (this.options.startBlockedReason?.(id) ?? null) === null;
+  }
+
   /**
    * 拉起沙箱。幂等:starting/running 直接返回当前态;fused 拒绝(须先 resetFuse,
    * 即用户重新唤醒);stopping 拒绝(等熄灯完成)。
@@ -119,7 +131,13 @@ export class GhostRuntime {
     const blocked = this.options.startBlockedReason?.(id) ?? null;
     if (blocked !== null) return { ok: false, reason: blocked };
 
+    const generation = ++entry.generation;
+    entry.identity = identity;
     this.setState(id, entry, 'starting');
+    // A synchronous lifecycle observer may explicitly stop this startup.
+    if (entry.generation !== generation || this.stateOf(id) !== 'starting' || entry.handle !== null || entry.identity !== identity) {
+      return { ok: false, reason: '插件启动已停止或实例已更换' };
+    }
     // 沙箱创建本身也可能同步 throw(如 app 未 ready、窗口创建失败):同样按
     // 一次崩溃记账并返回结构化失败,绝不让 state 卡死在 starting(review P0)。
     let handle: SandboxHandle;
@@ -127,12 +145,15 @@ export class GhostRuntime {
       handle = this.options.adapter.create(ghost);
     } catch (err) {
       this.options.log?.warn('ghost sandbox create failed', { id, error: err instanceof Error ? err.message : String(err) });
-      this.recordCrash(id, entry);
+      if (entry.generation === generation && this.stateOf(id) === 'starting') this.recordCrash(id, entry);
       return { ok: false, reason: '沙箱创建失败' };
     }
+    if (entry.generation !== generation || this.stateOf(id) !== 'starting') {
+      handle.destroy();
+      return { ok: false, reason: '插件启动已停止或实例已更换' };
+    }
     entry.handle = handle;
-    entry.identity = identity;
-    handle.onGone((details) => this.handleGone(id, details.reason));
+    handle.onGone((details) => this.handleGone(id, handle, details.reason));
     try {
       entry.loading = handle.load();
       await entry.loading;
@@ -211,13 +232,23 @@ export class GhostRuntime {
   /** 熄灯(沉睡 / 抽离 / 闲置超时 / 退出前逐个关)。幂等。 */
   stop(id: string): void {
     const entry = this.entries.get(id);
-    if (!entry || !entry.handle || entry.state === 'off') return;
+    if (!entry) return;
+    entry.generation++;
+    if (entry.state === 'off') return;
+    if (!entry.handle) {
+      // A resident can be waiting for its crash backoff with no live handle.
+      // Explicit stop still changes lifecycle state and cancels that recovery.
+      // Do not clear a fuse; only an explicit resetFuse permits another spawn.
+      if (entry.state !== 'fused') this.setState(id, entry, 'off');
+      return;
+    }
+    const handle = entry.handle;
+    entry.handle = null;
     this.setState(id, entry, 'stopping');
     // 当前直接销毁:沙箱页面没有需要善后的状态(先礼后兵的
     // "礼"——shutdown 通知 + 宽限——等管子协议丰满后在此插入)。
-    entry.handle.destroy();
-    entry.handle = null;
-    this.setState(id, entry, 'off');
+    handle.destroy();
+    if (entry.handle === null && this.stateOf(id) === 'stopping') this.setState(id, entry, 'off');
   }
 
   /** 仅 dev:强崩沙箱进程,QA 崩溃隔离链路。 */
@@ -239,9 +270,11 @@ export class GhostRuntime {
   /** 主机退出 / 模块收尾:销毁全部沙箱。 */
   destroyAll(): void {
     for (const [id, entry] of this.entries) {
+      entry.generation++;
       if (entry.handle) {
-        entry.handle.destroy();
+        const handle = entry.handle;
         entry.handle = null;
+        handle.destroy();
       }
       if (entry.state !== 'fused') this.setState(id, entry, 'off');
     }
@@ -250,21 +283,25 @@ export class GhostRuntime {
   private getEntry(id: string): RuntimeEntry {
     let entry = this.entries.get(id);
     if (!entry) {
-      entry = { state: 'off', handle: null, loading: null, identity: null, crashTimestamps: [] };
+      entry = { state: 'off', generation: 0, handle: null, loading: null, identity: null, crashTimestamps: [] };
       this.entries.set(id, entry);
     }
     return entry;
   }
 
   /** 沙箱进程意外死亡:收尸 + 熔断记账。 */
-  private handleGone(id: string, reason: string): void {
+  private handleGone(id: string, handle: SandboxHandle, reason: string): void {
     const entry = this.entries.get(id);
     if (!entry) return;
-    // stop()/destroyAll() 已把 handle 摘掉的迟到事件,忽略。
-    if (!entry.handle) return;
+    // A late callback from a stopped/replaced sandbox cannot kill its successor.
+    if (entry.handle !== handle) return;
+    const generation = entry.generation;
     this.options.log?.warn('ghost sandbox gone', { id, reason });
-    entry.handle.destroy();
     entry.handle = null;
+    handle.destroy();
+    // destroy can synchronously trigger explicit stop/account cleanup or even
+    // a replacement spawn. That newer intent must not be overwritten as crashed.
+    if (entry.generation !== generation || entry.handle !== null) return;
     this.recordCrash(id, entry);
   }
 

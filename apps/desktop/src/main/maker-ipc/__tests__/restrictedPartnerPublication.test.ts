@@ -1,7 +1,8 @@
 import Database from 'better-sqlite3';
 import { drizzle } from 'drizzle-orm/better-sqlite3';
 import { createHash } from 'node:crypto';
-import { expect, it } from 'vitest';
+import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+import { restrictedPublicationLaunchEnvironment } from '../restrictedPublicationLaunch.js';
 import { releaseId, wireBinding } from '../restrictedPublicationProtocol.js';
 import {
   createNativePublicationAuthority,
@@ -13,6 +14,9 @@ import {
 import { createRestrictedPartnerStore } from '../restrictedPartnerStore.js';
 import { approveNativePublicRelease } from '../restrictedPublicationApproval.js';
 import type { DbClient } from '../../localDb/client/DbClient.js';
+// Existing strict publisher cases exercise the retained, explicitly enabled path.
+beforeEach(() => vi.stubEnv(restrictedPublicationLaunchEnvironment, '1'));
+afterEach(() => vi.unstubAllEnvs());
 const sha = (x: string) => createHash('sha256').update(x).digest('hex');
 function receipt(a: NativePublicationRecord) {
   const r: Omit<NativePublicationReceipt, 'receiptSha256'> = {
@@ -116,7 +120,9 @@ async function fixture(scenario = 'complete') {
     identity: sha('reviewed-runtime'),
     publicOrigin: 'https://reports.example.invalid',
     dispatcher: 'scripts.publish_generic_html_direct',
-    verify: async () => {},
+    verify: async () => {
+      if (scenario === 'disable-verify') vi.stubEnv(restrictedPublicationLaunchEnvironment, '0');
+    },
     inspect: async (a) => ({
       artifactSha256: sha('html'),
       publisherBindingSha256: sha('metadata'),
@@ -131,6 +137,7 @@ async function fixture(scenario = 'complete') {
       if (scenario !== 'fake-ack') {
         await control.beforeEffect('remote-staging-prepare');
         if (scenario === 'revoke-upload') active = false;
+        if (scenario === 'disable-upload') vi.stubEnv(restrictedPublicationLaunchEnvironment, '0');
         await control.beforeEffect('remote-staging-upload');
         await control.beforeEffect('remote-transaction');
       }
@@ -159,6 +166,7 @@ async function fixture(scenario = 'complete') {
           expect(options.checkboxChecked).toBe(false);
           expect(options.detail).toContain(sha(c.output));
           if (scenario === 'late-approval') active = false;
+          if (scenario === 'disable-approval') vi.stubEnv(restrictedPublicationLaunchEnvironment, '0');
           return {
             response: scenario === 'cancel' ? 0 : 1,
             checkboxChecked: scenario !== 'private-output',
@@ -199,7 +207,13 @@ it('actual native public approval + real account SQL action claims each effect o
       'remote-staging-upload',
       'remote-transaction',
     ]);
-    expect((await f.service.read(f.g, a.nativeActionId)).returnAllowed).toBe(true);
+    const publicMetadata = await f.service.read(f.g, a.nativeActionId);
+    expect(publicMetadata.returnAllowed).toBe(true);
+    expect(Object.keys(publicMetadata).sort()).toEqual([
+      'nativeActionId', 'actionRevision', 'state', 'completedOutputSha256',
+      'artifactSha256', 'publisherBindingSha256', 'artifactRelative', 'expiresAt',
+      'runtimeReady', 'returnAllowed', 'publicUrl',
+    ].sort());
     expect((await f.service.run(f.g, a.nativeActionId)).state).toBe('HELD');
     expect(f.effects).toHaveLength(3);
     f.revoke();
@@ -221,6 +235,8 @@ for (const scenario of [
   'late-approval',
   'unknown-source',
   'runtime-missing',
+  'disable-verify',
+  'disable-approval',
 ])
   it(
     'publication native boundary ' + scenario + ' cannot reserve or dispatch from a bool/old claim',
@@ -270,6 +286,89 @@ it('guessed action ids, cross-subject read and changed account cannot retrieve a
     f.accountChange();
     await expect(f.service.read(f.g, a.nativeActionId)).rejects.toThrow('OWNER_CHANGED');
     expect(f.effects).toHaveLength(0);
+  } finally {
+    f.sql.close();
+  }
+});
+
+it('launch default defers restricted publication before approval, rows or remote effects', async () => {
+  vi.stubEnv(restrictedPublicationLaunchEnvironment, undefined);
+  const f = await fixture();
+  try {
+    const sourceBefore = JSON.stringify(f.c);
+    await expect(f.service.prepare(f.g, f.c.runId)).rejects.toThrow(
+      'RESTRICTED_PUBLICATION_DEFERRED_POST_LAUNCH',
+    );
+    expect(f.prompts()).toBe(0);
+    expect(f.effects).toEqual([]);
+    expect(f.sql.prepare("SELECT count(*) n FROM plugin_task_requests WHERE target_id LIKE 'restricted:publication:%'").get()).toEqual({ n: 0 });
+    expect(await f.service.lookup(f.g, f.c.runId)).toMatchObject({
+      state: 'NOT_OBSERVED',
+      publicUrl: null, returnAllowed: false,
+    });
+    expect(JSON.stringify(f.c)).toBe(sourceBefore);
+    await expect(f.service.lookup({ ...f.g, principalId: sha('other') }, f.c.runId)).rejects.toThrow('DENIED');
+    f.accountChange();
+    await expect(f.service.prepare(f.g, f.c.runId)).rejects.toThrow('OWNER_CHANGED');
+  } finally {
+    f.sql.close();
+  }
+});
+
+it('disabling a prepared action preserves it without running, reconciling or releasing its URL', async () => {
+  const f = await fixture();
+  try {
+    const a = await f.service.prepare(f.g, f.c.runId);
+    vi.stubEnv(restrictedPublicationLaunchEnvironment, '0');
+    await expect(f.service.run(f.g, a.nativeActionId)).rejects.toThrow('RESTRICTED_PUBLICATION_DEFERRED_POST_LAUNCH');
+    await expect(f.service.reconcile(f.g, a.nativeActionId)).rejects.toThrow('RESTRICTED_PUBLICATION_DEFERRED_POST_LAUNCH');
+    expect(await f.service.record(a.nativeActionId)).toEqual(a);
+    expect(await f.service.read(f.g, a.nativeActionId)).toMatchObject({
+      state: 'PREPARED_NO_REMOTE_EFFECT',
+      publicUrl: null, returnAllowed: false, runtimeReady: false,
+    });
+    expect(f.prompts()).toBe(1);
+    expect(f.effects).toEqual([]);
+  } finally {
+    f.sql.close();
+  }
+});
+
+it('disabling after a completed publication hides its historical URL and never replays it', async () => {
+  const f = await fixture();
+  try {
+    const a = await f.service.prepare(f.g, f.c.runId);
+    await f.service.run(f.g, a.nativeActionId);
+    const persisted = await f.service.record(a.nativeActionId);
+    vi.stubEnv(restrictedPublicationLaunchEnvironment, 'false');
+    expect(await f.service.read(f.g, a.nativeActionId)).toMatchObject({
+      state: 'APPLIED_VERIFIED',
+      publicUrl: null, returnAllowed: false, runtimeReady: false,
+    });
+    expect(await f.service.lookup(f.g, f.c.runId)).toMatchObject({ publicUrl: null, returnAllowed: false });
+    expect(await f.service.record(a.nativeActionId)).toEqual(persisted);
+    await expect(f.service.read({ ...f.g, principalId: sha('other') }, a.nativeActionId)).rejects.toThrow('DENIED');
+    vi.stubEnv(restrictedPublicationLaunchEnvironment, 'true');
+    expect((await f.service.run(f.g, a.nativeActionId)).state).toBe('HELD');
+    expect(f.effects).toHaveLength(3);
+  } finally {
+    f.sql.close();
+  }
+});
+
+it('disabling between remote effects retains UNKNOWN and re-enabling never retries the action', async () => {
+  const f = await fixture('disable-upload');
+  try {
+    const a = await f.service.prepare(f.g, f.c.runId);
+    await expect(f.service.run(f.g, a.nativeActionId)).rejects.toThrow('UNKNOWN');
+    expect((await f.service.record(a.nativeActionId)).state).toBe('UNKNOWN');
+    expect(f.effects).toEqual(['remote-staging-prepare']);
+    expect(await f.service.read(f.g, a.nativeActionId)).toMatchObject({
+      state: 'UNKNOWN', publicUrl: null, returnAllowed: false,
+    });
+    vi.stubEnv(restrictedPublicationLaunchEnvironment, '1');
+    expect((await f.service.run(f.g, a.nativeActionId)).state).toBe('HELD');
+    expect(f.effects).toEqual(['remote-staging-prepare']);
   } finally {
     f.sql.close();
   }

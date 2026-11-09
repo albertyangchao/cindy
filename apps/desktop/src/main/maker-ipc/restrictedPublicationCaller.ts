@@ -1,3 +1,4 @@
+import { readRestrictedPublicationLaunchPolicy, requireRestrictedPublicationEnabled } from './restrictedPublicationLaunch.js';
 import { getCurrentDbClientSnapshot, type CurrentDbClientSnapshot } from '../localDb/client/current.js';
 import {
   isManagedCoverageDriver,
@@ -97,6 +98,7 @@ export function createControlledPublicationAssembly(
   profile: FixedCoverageProfile,
   sourcePlan?: MainPublicationSourcePlan,
 ) {
+  requireRestrictedPublicationEnabled();
   if (!snapshot || getCurrentDbClientSnapshot() !== snapshot || currentAssemblies.get(snapshot)?.pending) denied();
   const assembly = { pending: 0 };
   const assertOwner = () => {
@@ -120,6 +122,7 @@ export function createControlledPublicationAssembly(
     accountScopeRef, store, controller, driver, authority,
     async activate(generation: string) {
       assertOwner();
+      requireRestrictedPublicationEnabled();
       if (closed || assembly.pending) denied();
       assembly.pending++;
       try {
@@ -159,6 +162,7 @@ export function bindControlledPublicationRoot(
   authority: ConsumerGuardCoverageAuthority,
   driver: ManagedCoverageDriver,
 ): void {
+  requireRestrictedPublicationEnabled();
   if (!accountSnapshot || !ownerEpoch || !isManagedCoverageDriver(driver)) denied();
   const live = getCurrentDbClientSnapshot();
   if (
@@ -182,6 +186,7 @@ export function resolveControlledPublicationRoot(
   current: () => void,
 ): RegisteredPublicationRoot | undefined {
   current();
+  if (!readRestrictedPublicationLaunchPolicy().enabled) return undefined;
   if (
     !accountSnapshot ||
     getCurrentDbClientSnapshot() !== accountSnapshot ||
@@ -316,6 +321,7 @@ export function controlledPublicationRuntime(
   guards: { effectCurrent(): void; readCurrent(): void },
   io: MainTransport = transport,
 ): NativePublisherRuntime {
+  requireRestrictedPublicationEnabled();
   if (
     !pin ||
     !path.isAbsolute(pin.root) ||
@@ -361,6 +367,7 @@ export function controlledPublicationRuntime(
     ]);
   const registeredDefinition = rootDefinition();
   const coverageBindingCurrent = () => {
+    requireRestrictedPublicationEnabled();
     if (
       pin.managedPublisher !== managedPublisher ||
       pin.managedPublisher?.controller !== managedController ||
@@ -510,6 +517,7 @@ export function controlledPublicationRuntime(
     return JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(result.stdout));
   };
   const verify = async () => {
+    requireRestrictedPublicationEnabled();
     await verifyFiles();
     await managedController?.verifyCurrent(pin.root);
     await pin.assertConsumerGuards();

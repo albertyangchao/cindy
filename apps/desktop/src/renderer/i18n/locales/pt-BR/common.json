@@ -19646,5 +19646,27 @@
     "rendered": "Ver documento",
     "wrap": "Quebra de linha",
     "lineNumbers": "Números de linha"
+  },
+  "restrictedOwnerPublication": {
+    "registerTitle": "Confirmar Minha Identidade do iMessage",
+    "registerMessage": "Registrar esta identidade do iMessage para publicação pública de HTML?",
+    "revokeTitle": "Revogar Registro de Publicação HTML",
+    "revokeMessage": "Revogar a publicação pública de HTML para esta identidade do iMessage?",
+    "scope": "O registro se aplica apenas à identidade e ao canal apresentados. Cada publicação ainda exige a aprovação do conteúdo concluído exato e do arquivo final.",
+    "identityCheckbox": "Esta é minha identidade do iMessage. Verifiquei a origem e o destino público abaixo.",
+    "registerButton": "Registrar Minha Identidade",
+    "revokeButton": "Revogar Registro"
+  },
+  "restrictedPartner": {
+    "originalSourceRoot": "Selecionar a raiz da fonte original deste sujeito",
+    "fixedMemoryDirectory": "Selecionar o diretório original PROFILE / MEMORY / INTERESTS",
+    "originalAbsenceTitle": "Revisar a evidência original de ausência",
+    "originalAbsenceBody": "O registro fixo da fonte original indica que este sujeito nunca teve este banco de dados. Confirme esse registro exato, não apenas a ausência atual de um arquivo.",
+    "approveOriginalAbsence": "Revisei o registro original de ausência",
+    "evidenceRevision": "Revisão da evidência original",
+    "title": "Acesso do plugin",
+    "message": "Permitir entradas externas para {{partner}}?",
+    "detail": "Somente a personalidade do parceiro selecionado e os arquivos que você escolher explicitamente ficam disponíveis. O histórico de outras tarefas, a memória do proprietário, as credenciais, a rede e as ferramentas gerais não são compartilhados. Isso não ativa um canal de mensagens.",
+    "resources": "Escolher recursos somente leitura para este sujeito externo"
   }
 }

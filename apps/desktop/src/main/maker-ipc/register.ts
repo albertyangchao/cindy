@@ -1,4 +1,7 @@
 import {approveNativePublicRelease} from './restrictedPublicationApproval.js';
+import { approveOwnerPublicationIdentity } from './restrictedOwnerPublicationApproval.js';
+import { resolveOwnerPublicationRoot } from './ownerPublicationRoot.js';
+import { createOwnerPublicationRuntime } from './ownerPublicationRuntime.js';
 import {controlledPublicationRuntime,resolveControlledPublicationRoot} from './restrictedPublicationCaller.js';
 import { captureBotPermissionEpoch } from './botPermissionDispatch.js';
 import { captureRestrictedPartnerEpoch } from './restrictedPartnerEpoch.js';
@@ -15302,6 +15305,35 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
   const restrictedPartnerHost = createRestrictedPartnerHost({
     inputUrls:true,
     publication:{approve:input=>approveNativePublicRelease(input,{window:getDeepLinkMainWindow,trusted:isTrustedAppRendererWindow,show:(win,options)=>dialog.showMessageBox(win,options)}),runtime:(effectCurrent,readCurrent)=>{const snapshot=getCurrentDbClientSnapshot();const pin=resolveControlledPublicationRoot(snapshot,snapshot,readCurrent);return pin?controlledPublicationRuntime(pin,{effectCurrent,readCurrent}):undefined}},
+    ownerPublication: {
+      confirmIdentity: input => approveOwnerPublicationIdentity(input, {
+        window: getDeepLinkMainWindow, trusted: isTrustedAppRendererWindow,
+        show: (window, options) => dialog.showMessageBox(window, options), text: t,
+      }),
+      approve: input => approveNativePublicRelease(input, {
+        window: getDeepLinkMainWindow, trusted: isTrustedAppRendererWindow,
+        show: (window, options) => dialog.showMessageBox(window, options),
+      }),
+      runtime: async (effectCurrent, readCurrent) => {
+        readCurrent();
+        if (!process.env.CINDY_OWNER_PUBLICATION_BRIDGE_ROOT && !process.env.CINDY_OWNER_PUBLICATION_PYTHON)
+          return undefined;
+        const snapshot = getCurrentDbClientSnapshot();
+        const ownerCurrent = () => {
+          readCurrent();
+          if (!snapshot || getCurrentDbClientSnapshot() !== snapshot) throw Error('PERMISSION_DENIED');
+        };
+        ownerCurrent();
+        const dispatchRoot = ownerScopedUserDataPath('owner-publication-dispatch');
+        await fsp.mkdir(dispatchRoot, { recursive: true, mode: 0o700 });
+        ownerCurrent();
+        const pin = await resolveOwnerPublicationRoot({ dispatchRoot });
+        ownerCurrent();
+        return pin ? createOwnerPublicationRuntime(pin, {
+          effectCurrent: () => { ownerCurrent(); effectCurrent(); }, readCurrent: ownerCurrent,
+        }) : undefined;
+      },
+    },
     research:true,
     modelConfiguration:async(id,current)=>{current();const sessionId=await resolvePluginTargetSession('bot',id);current();const meta=await maker.getSessionMeta(sessionId);current();if(!meta||meta.agentKind!=='codex'||meta.remoteHostId||meta.agentDeviceId)throw Error('RESTRICTED_PARTNER_RUNNER_UNSUPPORTED');const providerId=getSessionProvider(sessionId);if(!providerId)throw Error('ROUTE_UNAVAILABLE');const execution=await resolveSessionExecution({agentKind:'codex',model:meta.model,providerId,effort:meta.effort},sessionId);current();if(execution.agentKind!=='codex'||execution.providerId!==providerId)throw Error('RESTRICTED_PARTNER_ROUTE_UNSUPPORTED');return {providerId:execution.providerId,modelId:execution.model};},
     executionReady: async()=>{

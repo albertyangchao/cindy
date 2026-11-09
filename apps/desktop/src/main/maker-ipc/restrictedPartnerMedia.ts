@@ -1,4 +1,9 @@
 import {validateRestrictedUrlInput,projectedUrlInput,normalizeRestrictedUrlImage} from './restrictedPartnerUrlInput.js';
+import { isRestrictedHeif } from '../cindy-brain/restrictedMediaImage.js';
+import {
+  restrictedMediaAvailability,
+  restrictedMediaNotConfigured,
+} from '../cindy-brain/restrictedMediaAvailability.js';
 import {
   analyzeRestrictedVideo,
   validatePreparedVideo,
@@ -101,13 +106,22 @@ export async function restrictedPartnerMedia(
   const config = await restrictedMediaConfiguration(g.partnerId, current);
   current();
   const routes = g.media ?? {};
+  const availability = restrictedMediaAvailability(routes, config.routes);
   const authority = current;
   current = () => {
     authority();
     config.assertCurrent(Object.keys(routes) as MediaKind[]);
   };
   for (const kind of Object.keys(routes) as MediaKind[])
-    if (JSON.stringify(routes[kind]) !== JSON.stringify(config.routes[kind])) fail();
+    if (availability[kind].state === 'REAPPROVAL_REQUIRED') fail();
+  const imageInputKind = (inputBinding?: MediaBinding) => {
+    const candidates = (['vision', 'edit'] as const).filter((kind) => {
+      const route = routes[kind];
+      return route && (!inputBinding ||
+        (route.providerId === inputBinding.providerId && route.modelId === inputBinding.modelId));
+    });
+    return candidates.find((kind) => availability[kind].state === 'READY') ?? candidates[0];
+  };
   const c = claim.channel;
   if (!c) fail();
   const resourceFingerprint = grantResourceFingerprint(g);
@@ -467,8 +481,11 @@ export async function restrictedPartnerMedia(
     sourceSha256: string;
     normalizedSha256: string;
     partial: boolean;
+    sourceFrameCount?: 'NOT_OBSERVED';
+    heifFirstImageOnly?: true;
   }> = [];
   const videos = new Map<string, PreparedVideo>();
+  const unavailableInputs: Array<{ id: string; kind: MediaKind; state: 'NOT_CONFIGURED' }> = [];
   if (inputs.length > 4) fail();
   let total = 0;
   for (const item of inputs) {
@@ -476,15 +493,27 @@ export async function restrictedPartnerMedia(
     if(item.type==='image-url'){
       if(!resultUrlLoader||!urlAuthorization?.approve)fail();
       validateRestrictedUrlInput(g,claim,item);
-      const selected=g.media?.vision?'vision':'edit',b=makeBinding(selected,'input-url:'+item.urlSha256);
+      const selected=imageInputKind(item.binding);
+      if(!selected)fail();
+      const b=makeBinding(selected,'input-url:'+item.urlSha256);
       const permit:MediaPermit={binding:b,kind:selected,signal:signal.signal,assertCurrent:current};
+      if(availability[selected].state==='NOT_CONFIGURED'){
+        if(await readRow(urlStageKey(permit,item.urlSha256,'input'))){
+          unknown=true;
+          throw Error('RESTRICTED_MEDIA_UNKNOWN');
+        }
+        unavailableInputs.push({id:item.id,kind:selected,state:'NOT_CONFIGURED'});
+        continue;
+      }
       await urlAuthorization.approve(permit,item.url,'input');current();
       const downloaded=await resultUrlLoader(permit,item.url,'input');current();
       if(downloaded.sourceSha256!==item.urlSha256||!sameBinding(downloaded.binding,b))fail();
       const bytes=await normalizeRestrictedUrlImage(downloaded.bytes,downloaded.mimeType,current);current();
       total+=bytes.length;if(total>8*1024*1024)fail();
       const prepared=await ingest(permit,bytes,'image/png');current();
-      context.push({id:prepared.id,mimeType:'image/png',sourceSha256:downloaded.sha256,normalizedSha256:prepared.sha256,partial:false});
+      context.push({id:prepared.id,mimeType:'image/png',sourceSha256:downloaded.sha256,normalizedSha256:prepared.sha256,
+        partial:isRestrictedHeif(downloaded.mimeType),
+        ...(isRestrictedHeif(downloaded.mimeType)?{sourceFrameCount:'NOT_OBSERVED' as const,heifFirstImageOnly:true as const}:{})});
       continue;
     }
     if (item.type === 'video') {
@@ -532,7 +561,7 @@ export async function restrictedPartnerMedia(
     )
       fail();
     const kind = item.mimeType.startsWith('image/')
-      ? 'vision'
+      ? imageInputKind()
       : item.mimeType.startsWith('audio/')
         ? 'stt'
         : null;
@@ -573,11 +602,38 @@ export async function restrictedPartnerMedia(
       if (
         !a ||
         Object.keys(a).some((k) => !['kind', 'text', 'inputId'].includes(k)) ||
+        !['vision', 'draw', 'edit', 'stt', 'tts'].includes(a.kind) ||
         !routes[a.kind] ||
         typeof a.text !== 'string'
       )
         fail();
       const slot = sha(JSON.stringify([a.kind, a.text, a.inputId ?? null]));
+      if (availability[a.kind].state === 'NOT_CONFIGURED') {
+        // Configuration status must not make malformed or foreign inputs valid.
+        // Keep this before the durable paid claim. A pre-existing slot remains
+        // held even if configuration has disappeared since its dispatch.
+        const needsInput = ['vision', 'edit', 'stt'].includes(a.kind);
+        const hasInput = typeof a.inputId === 'string' && a.inputId.length > 0;
+        if (
+          !a.text.trim() ||
+          Buffer.byteLength(a.text, 'utf8') > 32_000 ||
+          (a.inputId !== undefined && (!hasInput || a.inputId!.length > 256)) ||
+          needsInput !== hasInput
+        ) fail();
+        if (needsInput) {
+          const input = assets.get(a.inputId!);
+          const family = a.kind === 'stt' ? 'audio/' : 'image/';
+          const unavailableUrl = family === 'image/' &&
+            unavailableInputs.some((item) => item.id === a.inputId);
+          if ((!input || !input.mimeType.startsWith(family)) && !unavailableUrl) fail();
+        }
+        current();
+        if (await readRow('restricted:effect:' + claim.runId + ':' + slot)) {
+          unknown = true;
+          throw Error('RESTRICTED_MEDIA_UNKNOWN');
+        }
+        return restrictedMediaNotConfigured(a.kind);
+      }
       const prior = receipts.get(slot);
       if (prior)
         return {
@@ -685,7 +741,6 @@ export async function restrictedPartnerMedia(
         fail();
       const video = videos.get(a.sourceId);
       if (!video) fail();
-      if (effectCount + 1 + video!.frames.length > 8) fail();
       const authority = { binding: video!.binding, signal: signal.signal, assertCurrent: current };
       const key =
         'restricted:video:' + sha(JSON.stringify([claim.runId, video!.binding.effectSlot, a.text]));
@@ -701,6 +756,11 @@ export async function restrictedPartnerMedia(
         unknown = true;
         throw Error('RESTRICTED_MEDIA_UNKNOWN');
       }
+      if (availability.vision.state === 'NOT_CONFIGURED') {
+        current();
+        return restrictedMediaNotConfigured('vision');
+      }
+      if (effectCount + 1 + video!.frames.length > 8) fail();
       const result = await analyzeRestrictedVideo(
         adapter,
         {
@@ -790,9 +850,12 @@ export async function restrictedPartnerMedia(
   };
   return {
     inputText,
+    availability,
     context: JSON.stringify({
       authorizedRequestMedia: context,
       approvedMediaRoutes: routes,
+      mediaAvailability: availability,
+      unavailableRequestMedia: unavailableInputs,
       authorizedVideoSources: [...videos.values()].map((v) => ({
         sourceId: v.sourceId,
         sourceSha256: v.sourceSha256,

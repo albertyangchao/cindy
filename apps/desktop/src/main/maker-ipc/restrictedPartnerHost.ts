@@ -1,10 +1,15 @@
-import {createNativePublicationAuthority,type NativePublisherRuntime,type NativePublicationOwnerInput} from './restrictedPartnerPublication.js';
+import {createNativePublicationAuthority,createOwnerBridgePublicationAuthority,type NativePublisherRuntime,type NativePublicationOwnerInput} from './restrictedPartnerPublication.js';
+import { createOwnerPublicationRegistration, assertOwnerPublicationPermitCurrent, type OwnerPublicationIdentityInput } from './restrictedOwnerPublication.js';
+import { readRestrictedPublicationLaunchPolicy } from './restrictedPublicationLaunch.js';
+import { restrictedMediaAvailability } from '../cindy-brain/restrictedMediaAvailability.js';
+import { captureRestrictedPartnerLaunch, refreshRestrictedPartnerLaunch, holdRestrictedPartnerLaunch } from './restrictedPartnerLaunch.js';
 import {validateRestrictedUrlInput} from './restrictedPartnerUrlInput.js';
 import {
   legacyMemoryNamespaces,
   approveMemorySources,
   assertMemorySources,
   originalDatabasePath,
+  migrateRestrictedPartnerData,
 } from './restrictedPartnerLegacyMemory.js';
 import {
   validateRequirements,
@@ -22,12 +27,18 @@ import { createRestrictedPartnerStore } from './restrictedPartnerStore.js';
 import {
   createRestrictedPartnerExecution,
   validGrant,
+  validGrantRecord,
   type RestrictedPartnerGrant,
 } from './restrictedPartnerExecution.js';
 
 export interface RestrictedPartnerHostDeps {
   inputUrls?: boolean;
   publication?:{approve(input:NativePublicationOwnerInput):Promise<{approved:boolean;publicNonPersonal:boolean}>;runtime(effectCurrent:()=>void,readCurrent:()=>void):NativePublisherRuntime|undefined};
+  ownerPublication?: {
+    confirmIdentity(input: OwnerPublicationIdentityInput): Promise<boolean>;
+    approve(input: NativePublicationOwnerInput): Promise<{ approved: boolean; publicNonPersonal: boolean }>;
+    runtime(effectCurrent: () => void, readCurrent: () => void): Promise<NativePublisherRuntime | undefined>;
+  };
   executionReady?(): Promise<boolean>;
   research?: true;
   modelConfiguration?(
@@ -125,6 +136,7 @@ const safeGrant = (g: RestrictedPartnerGrant, ready = false, research = false) =
     ...(g.memorySources ? ['partner_durable_memory'] : []),
     'partner_history',
     'partner_memory',
+    'partner_migrated_data',
     ...(Object.keys(g.media ?? {}).length ? ['partner_media'] : []),
   ],
 });
@@ -134,6 +146,7 @@ export function createRestrictedPartnerHost(deps: RestrictedPartnerHostDeps) {
   const binding = new Set<string>();
   const epochs = new Map<string, number>();
   const jobs = new Map<string, Promise<unknown>>();
+  const launchSnapshots = new Map<string, { handle: object; routes: unknown; pluginId: string; grantId: string }>();
   return async (pluginId: string, raw: unknown, authorized: () => void): Promise<unknown> => {
     authorized();
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return fail('INVALID_PARAMS');
@@ -149,6 +162,7 @@ export function createRestrictedPartnerHost(deps: RestrictedPartnerHostDeps) {
     const store = createRestrictedPartnerStore(snapshot.client, current);
     if (a.operation === 'capabilities' && Object.keys(a).length === 1) {
       const ready = process.platform === 'darwin' && (await deps.executionReady?.()) === true;
+      const publicationLaunch = readRestrictedPublicationLaunchPolicy();
       current();
       return {
         version: 1,
@@ -165,9 +179,12 @@ export function createRestrictedPartnerHost(deps: RestrictedPartnerHostDeps) {
         egress: 'original-caller-only',
         media: deps.mediaConfiguration ? 'owner-approved-core-routes' : false,
         imageUrlInput:deps.inputUrls&&deps.prepare?'native-owner-per-inbox-source':false,
-        publicReleaseAuthority:deps.publication?'native-owner-action/v1':false,
+        publicationLaunch,
+        publicReleaseAuthority:publicationLaunch.enabled&&deps.publication?'native-owner-action/v1':false,
+        ownerPublicReleaseAuthority: deps.ownerPublication ? 'native-owner-bridge/v1' : false,
         unsupported: ['unscoped-mcp', 'shell', 'remote-runner', 'claude-code', 'pi'],
         normalTasksFallback: false,
+        subjectMigration: 'subject-scoped-idempotent/v1',
       };
     }
     if (a.operation === 'list' && Object.keys(a).length === 1) {
@@ -319,8 +336,10 @@ export function createRestrictedPartnerHost(deps: RestrictedPartnerHostDeps) {
     }
     const grant = await store.readGrant(pluginId, grantId);
     current();
-    validGrant(grant);
-    const historicalPublication=a.operation==='publication'&&['read','lookup','reconcile'].includes(String(a.action));
+    const historicalPublication=(a.operation==='publication'&&['read','lookup','reconcile'].includes(String(a.action))) ||
+      (a.operation==='owner_publication'&&['read','lookup','reconcile','revoke'].includes(String(a.action)));
+    if (historicalPublication) validGrantRecord(grant);
+    else validGrant(grant);
     if (!grant || (!historicalPublication&&(!grant.enabled||grant.approvalRevision!==approval||binding.has(grantId))))
       return fail('PERMISSION_DENIED');
     const executionEpoch = epochs.get(grantId) ?? 0;
@@ -346,17 +365,9 @@ export function createRestrictedPartnerHost(deps: RestrictedPartnerHostDeps) {
         assertGrant(grant),
       );
       assertGrant(grant);
+      const mediaAvailability = restrictedMediaAvailability(grant.media ?? {}, currentMedia?.routes ?? {});
       facts.media = Object.fromEntries(
-        ['vision', 'draw', 'edit', 'stt', 'tts'].map((kind) => {
-          const k = kind as keyof NonNullable<RestrictedPartnerGrant['media']>;
-          return [
-            kind,
-            Boolean(
-              grant.media?.[k] &&
-              JSON.stringify(grant.media[k]) === JSON.stringify(currentMedia?.routes[k]),
-            ),
-          ];
-        }),
+        Object.entries(mediaAvailability).map(([kind, value]) => [kind, value.state === 'READY']),
       );
       const modelRoute = await deps.modelConfiguration?.(grant.partnerId, () => assertGrant(grant));
       assertGrant(grant);
@@ -413,6 +424,7 @@ export function createRestrictedPartnerHost(deps: RestrictedPartnerHostDeps) {
       if (!legacyAvailable) facts.tools = facts.tools.filter((t) => t !== 'partner_memory_search');
       return {
         ...facts,
+        mediaAvailability,
         missingRequirements: grant.requirements
           ? [
               ...(!modelAvailable ? ['model-route'] : []),
@@ -436,6 +448,60 @@ export function createRestrictedPartnerHost(deps: RestrictedPartnerHostDeps) {
     if (revisions.has(grantId) && revisions.get(grantId) !== grant.revision)
       return fail('STALE_REVISION');
     revisions.set(grantId, grant.revision);
+    if (a.operation === 'migration') {
+      if (Object.keys(a).some((key) => ![
+        'operation', 'principalId', 'partnerId', 'expectedRevision', 'mode', 'snapshot',
+      ].includes(key)) || a.partnerId !== grant.partnerId ||
+          a.expectedRevision !== grant.revision || !['dry-run', 'apply'].includes(String(a.mode)))
+        return fail('INVALID_PARAMS');
+      sourceRequired = true;
+      assertGrant(grant);
+      return migrateRestrictedPartnerData(snapshot.client, grant, a.mode as 'dry-run' | 'apply',
+        a.snapshot, () => assertGrant(grant));
+    }
+    if (a.operation === 'launch_snapshot') {
+      if (Object.keys(a).some(k => !['operation','principalId','partnerId','expectedRevision','routes','snapshotId'].includes(k)) ||
+          a.partnerId !== grant.partnerId || a.expectedRevision !== grant.revision ||
+          (a.snapshotId !== undefined && typeof a.snapshotId !== 'string')) return fail('INVALID_PARAMS');
+      sourceRequired = true;
+      if (!grant.requirements || (await readiness()).missingRequirements.length)
+        return fail('RESTRICTED_PARTNER_REQUIREMENTS_UNMET');
+      assertGrant(grant);
+      if (typeof a.snapshotId === 'string') {
+        const saved = launchSnapshots.get(a.snapshotId);
+        if (!saved || saved.pluginId !== pluginId || saved.grantId !== grant.id) return fail('RESTRICTED_PARTNER_LAUNCH_UNPROVEN');
+        return refreshRestrictedPartnerLaunch(saved.handle, snapshot.client, grant, a.routes, () => assertGrant(grant));
+      }
+      const source = await captureRestrictedPartnerLaunch(snapshot.client, grant, a.routes, () => assertGrant(grant));
+      if (launchSnapshots.size >= 32) launchSnapshots.delete(launchSnapshots.keys().next().value!);
+      launchSnapshots.set(source.facts.snapshotId, { handle: source.handle, routes: structuredClone(a.routes), pluginId, grantId: grant.id });
+      return source.facts;
+    }
+    if (a.operation === 'launch_fence') {
+      if (Object.keys(a).sort().join() !== 'expectedRevision,operation,operationId,principalId,snapshotId' ||
+          a.expectedRevision !== grant.revision || typeof a.snapshotId !== 'string' ||
+          typeof a.operationId !== 'string' || !/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(a.operationId))
+        return fail('INVALID_PARAMS');
+      const saved = launchSnapshots.get(a.snapshotId);
+      if (!saved || saved.pluginId !== pluginId || saved.grantId !== grant.id) return fail('RESTRICTED_PARTNER_LAUNCH_UNPROVEN');
+      sourceRequired = true;
+      await refreshRestrictedPartnerLaunch(saved.handle, snapshot.client, grant, saved.routes, () => assertGrant(grant));
+      assertGrant(grant);
+      revisions.delete(grantId);
+      binding.add(grantId);
+      epochs.set(grantId, (epochs.get(grantId) ?? 0) + 1);
+      try {
+        const next = await store.control(grant, false);
+        current();
+        if (!next) return fail('STALE_REVISION');
+        const held = await holdRestrictedPartnerLaunch(saved.handle, snapshot.client, grant, next, a.operationId, () => {
+          current(); partnerCurrent();
+          if (grant.memorySources) assertMemorySources(grant.memorySources, current);
+        });
+        revisions.set(grantId, next.revision);
+        return { ...safeGrant(next), launchHold: held, unknownPreserved: true };
+      } finally { binding.delete(grantId); }
+    }
     if(a.operation==='publication'){
       if(!deps.publication||!['prepare','run','read','lookup','reconcile'].includes(String(a.action))||Object.keys(a).some(k=>!['operation','principalId','action','runId','nativeActionId','expectedRevision'].includes(k))||
        (['prepare','lookup'].includes(String(a.action))?(!id(a.runId)||a.nativeActionId!==undefined):(!/^[a-f0-9-]{36}$/.test(String(a.nativeActionId))||a.runId!==undefined))||
@@ -446,6 +512,46 @@ export function createRestrictedPartnerHost(deps: RestrictedPartnerHostDeps) {
       if(a.action==='run'){sourceRequired=true;assertGrant(grant);await service.run(grant,a.nativeActionId as string);return service.read(grant,a.nativeActionId as string);}
       if(a.action==='reconcile')await service.reconcile(grant,a.nativeActionId as string);
       return service.read(grant,a.nativeActionId as string);
+    }
+    if (a.operation === 'owner_publication') {
+      const action = String(a.action);
+      const byRun = ['status', 'register', 'prepare', 'lookup'].includes(action);
+      if (!deps.ownerPublication || !['status', 'register', 'revoke', 'prepare', 'run', 'read', 'lookup', 'reconcile'].includes(action) ||
+          Object.keys(a).some(k => !['operation', 'principalId', 'action', 'runId', 'nativeActionId', 'expectedRevision'].includes(k)) ||
+          (byRun ? !id(a.runId) || a.nativeActionId !== undefined :
+            action === 'revoke' ? a.runId !== undefined || a.nativeActionId !== undefined :
+              !/^[a-f0-9-]{36}$/.test(String(a.nativeActionId)) || a.runId !== undefined) ||
+          (['register', 'prepare', 'run'].includes(action) && a.expectedRevision !== grant.revision) ||
+          (action === 'revoke' && a.expectedRevision !== undefined))
+        return fail('INVALID_PARAMS');
+      let effectCurrent = () => assertGrant(grant);
+      let runtime: NativePublisherRuntime | undefined;
+      try { runtime = await deps.ownerPublication.runtime(() => effectCurrent(), current); }
+      catch { if (!['status', 'revoke', 'read', 'lookup'].includes(action)) return fail('NATIVE_PUBLICATION_RUNTIME_UNAVAILABLE'); }
+      current();
+      const ports = { readGrant: (id: string) => store.readGrant(pluginId, id),
+        readRun: (id: string) => store.byRun(pluginId, id), runtime: () => runtime };
+      const registration = createOwnerPublicationRegistration(snapshot.client, pluginId, current, assertGrant,
+        { ...ports, confirm: deps.ownerPublication.confirmIdentity });
+      if (action === 'status') return registration.status(grant, a.runId as string);
+      if (action === 'register') { sourceRequired = true; assertGrant(grant); return registration.register(grant, a.runId as string); }
+      if (action === 'revoke') return registration.revoke(grant);
+      const permit = registration.permit();
+      effectCurrent = () => {
+        assertGrant(grant);
+        assertOwnerPublicationPermitCurrent(permit, snapshot.client, pluginId);
+      };
+      const service = createOwnerBridgePublicationAuthority(snapshot.client, pluginId, current, assertGrant,
+        { ...ports, approve: deps.ownerPublication.approve }, permit);
+      if (action === 'lookup') return service.lookup(grant, a.runId as string);
+      if (action === 'prepare') {
+        sourceRequired = true; assertGrant(grant);
+        const prepared = await service.prepare(grant, a.runId as string);
+        return service.read(grant, prepared.nativeActionId);
+      }
+      if (action === 'run') { sourceRequired = true; assertGrant(grant); await service.run(grant, a.nativeActionId as string); }
+      if (action === 'reconcile') await service.reconcile(grant, a.nativeActionId as string);
+      return service.read(grant, a.nativeActionId as string);
     }
     if (
       a.operation === 'binding' &&

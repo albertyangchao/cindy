@@ -446,9 +446,22 @@ export function createRestrictedPartnerStore(db: DbClient, assertOwner: () => vo
         `INSERT INTO plugin_task_requests
         (id,plugin_id,operation,target_id,request_key,fingerprint,payload,revision,created_at)
         SELECT ?,?,'target',?,?,?,?,1,?
-        WHERE NOT EXISTS (SELECT 1 FROM plugin_task_requests WHERE operation='target'
-          AND plugin_id=? AND target_id LIKE 'restricted:input:%' AND json_extract(payload,'$.principalId')=?
-          AND COALESCE(json_extract(payload,'$.state'),'UNKNOWN') <> 'COMPLETE')
+        WHERE NOT EXISTS (SELECT 1 FROM plugin_task_requests u WHERE u.operation='target'
+          AND u.plugin_id=? AND u.target_id LIKE 'restricted:input:%' AND json_extract(u.payload,'$.principalId')=?
+          AND COALESCE(json_extract(u.payload,'$.state'),'UNKNOWN') <> 'COMPLETE'
+          AND NOT EXISTS (SELECT 1 FROM plugin_task_requests h WHERE h.plugin_id=u.plugin_id AND h.operation='target'
+            AND h.target_id='restricted:launch-held:' || json_extract(u.payload,'$.inputId')
+            AND json_extract(h.payload,'$.schema')='restricted-native-launch-hold/v1'
+            AND json_extract(h.payload,'$.sourceId')=u.id AND json_extract(h.payload,'$.sourcePayload')=u.payload
+            AND json_extract(h.payload,'$.sourceRevision')=u.revision
+            AND json_extract(h.payload,'$.sourceCreatedAt')=u.created_at
+            AND json_extract(h.payload,'$.principalId')=json_extract(u.payload,'$.principalId')))
+        AND NOT EXISTS (SELECT 1 FROM plugin_task_requests h WHERE h.plugin_id=? AND h.operation='target'
+          AND h.target_id LIKE 'restricted:launch-held:%'
+          AND json_extract(h.payload,'$.schema')='restricted-native-launch-hold/v1'
+          AND json_extract(h.payload,'$.principalId')=?
+          AND (json_extract(h.payload,'$.inputId')=? OR
+            (json_extract(h.payload,'$.connectionId')=? AND json_extract(h.payload,'$.eventId')=?)))
         ON CONFLICT DO NOTHING`,
         [
           `restricted-run:${claim.runId}`,
@@ -460,6 +473,11 @@ export function createRestrictedPartnerStore(db: DbClient, assertOwner: () => vo
           Date.now(),
           claim.pluginId,
           claim.principalId,
+          claim.pluginId,
+          claim.principalId,
+          claim.inputId,
+          claim.channel?.connectionId ?? null,
+          claim.channel?.eventId ?? null,
         ],
       );
       assertOwner();

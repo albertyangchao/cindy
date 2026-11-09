@@ -93,6 +93,25 @@ it('loads exact approved source bytes via credential-isolated existing guarded f
   );
   expect(io.fetch).toHaveBeenCalledOnce();
 });
+// Input HEIC must reach the trusted image decoder; adding it to the global blob
+// or provider-output whitelist would bypass required normalization.
+it('routes byte-sniffed HEIC only as an approved input source and keeps output MIME rules unchanged', async () => {
+  const bytes = Buffer.alloc(24); bytes.writeUInt32BE(24); bytes.write('ftyp', 4);
+  bytes.write('isom', 8); bytes.write('heic', 16); bytes.write('mif1', 20);
+  for (const role of ['input', 'output'] as const) {
+    const s = setup();
+    io.fetch.mockResolvedValue({ response: new Response(bytes, { headers: { 'content-type': 'image/heic' } }), release: s.release });
+    const result = s.loader(s.permit, 'https://images.example.test/source.heic', role);
+    if (role === 'input') {
+      expect(await result).toMatchObject({ bytes, mimeType: 'image/heic', sha256: sha(bytes), role });
+      expect(s.ports.complete).toHaveBeenCalledOnce();
+    } else {
+      await expect(result).rejects.toThrow('UNKNOWN');
+      expect(s.ports.complete).not.toHaveBeenCalled();
+      expect(s.ports.unknown).toHaveBeenCalledOnce();
+    }
+  }
+});
 it.each([
   'http://images.example.test/a',
   'https://127.0.0.1/a',

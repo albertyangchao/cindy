@@ -19390,5 +19390,27 @@
         "deny": "拒絕"
       }
     }
+  },
+  "restrictedOwnerPublication": {
+    "registerTitle": "核本人 iMessage 身分",
+    "registerMessage": "欲以此 iMessage 身分登記 HTML 公開發佈乎？",
+    "revokeTitle": "撤 HTML 公開發佈之登記",
+    "revokeMessage": "撤此 iMessage 身分之 HTML 公開發佈登記乎？",
+    "scope": "所登記者，僅及下列身分與通道。每次發佈，仍須核准確切成文及末定檔案。",
+    "identityCheckbox": "此乃本人之 iMessage 身分。下列來源與公開目標，皆已核明。",
+    "registerButton": "登記本人身分",
+    "revokeButton": "撤銷登記"
+  },
+  "restrictedPartner": {
+    "originalSourceRoot": "擇此主體之原始來源根目錄",
+    "fixedMemoryDirectory": "擇原始 PROFILE / MEMORY / INTERESTS 目錄",
+    "originalAbsenceTitle": "核原始未有之據",
+    "originalAbsenceBody": "既定原始來源記錄載明，此主體未嘗有此資料庫。須核該原始記錄，勿僅以今無檔案為據。",
+    "approveOriginalAbsence": "原始未有之記錄已核",
+    "evidenceRevision": "原始證據版次",
+    "title": "法器存取",
+    "message": "許外來輸入予 {{partner}} 乎？",
+    "detail": "僅所選夥伴之人格及明擇之檔案可用。餘差事之歷史、主人記憶、憑證、網路及通用工具皆不共用。此舉不啟訊息通道。",
+    "resources": "擇此外來主體可唯讀之資料"
   }
 }

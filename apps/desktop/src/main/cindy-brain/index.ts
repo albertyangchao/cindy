@@ -133,6 +133,7 @@ import {
 import { t as authorizationText } from '../i18n.js';
 import { getBotAuthorizationService } from '../maker-ipc/botAuthorizationService.js';
 import { isResidentBrowserGhost, spawnResidentGhost } from './residentGhost.js';
+import { ResidentGhostRestart } from './runtime/ResidentGhostRestart.js';
 import { handleRoutineRequest } from './routineSlot.js';
 import { getRoutineEngine, disconnectRoutineSource, relocateRoutinePluginSource } from '../routines/service.js';
 import {
@@ -2558,6 +2559,24 @@ export function acceptPluginInvocation(id: string, invocationId: string): void {
   catch { log.warn('plugin invocation acceptance bookkeeping unavailable'); }
 }
 
+const residentGhostRestart = new ResidentGhostRestart({
+  current: id => {
+    if (isAppSessionBoundaryPending()) return null;
+    // Runtime ids are exact physical instances; do not fall back to a same-name
+    // plugin when an installation was removed or its namespace changed.
+    const ghost = findGhostForPhysicalStoragePart(id);
+    if (!ghost?.enabled || !isResidentBrowserGhost(ghost.manifest) ||
+        !isGhostAvailableForActiveSession(id) || !runtimeSingleton?.canRestartCrashed(ghost)) return null;
+    const owner = getActiveDataOwnerPushStamp();
+    return {
+      identity: JSON.stringify([activeOwnerScopeKey(), owner.ownerGeneration, id, ghost.dir,
+        ghostInstallApprovalToken(ghost.approval), ghost.manifest.version, ghost.namespace ?? null]),
+      restart: () => spawnIfResident(ghost),
+    };
+  },
+  onError: id => log.warn('resident ghost recovery held', { id }),
+});
+
 export function getGhostRuntime(): GhostRuntime {
   if (!runtimeSingleton) {
     runtimeSingleton = new GhostRuntime({
@@ -2570,6 +2589,7 @@ export function getGhostRuntime(): GhostRuntime {
       // 关闭(沉睡)/ 重载都由用户在面板上决定,主机只记日志。
       onFused: (id) => log.warn('ghost fused after repeated crashes', { id }),
       onStateChanged: (id, state) => {
+        residentGhostRestart.onStateChanged(id, state);
         const storagePart = isValidPluginInstallRelId(id) ? pluginInstallStoragePart(id) : id;
         log.info('ghost runtime state', { id, state });
         if (state !== 'running') disconnectRoutineSource(storagePart);
@@ -10190,7 +10210,7 @@ export function registerGhostIpc(): void {
       try { return { ok: true, data: await pluginTargetSlot.handle(id, payload, assertAuthorized) }; }
       catch (error) {
         const rawCode = (error as { code?: unknown })?.code ?? (error instanceof Error ? error.message : '');
-        const code = ['RESTRICTED_MEDIA_DENIED','RESTRICTED_MEDIA_UNKNOWN','RESTRICTED_PARTNER_HISTORY_DENIED','RESTRICTED_PARTNER_CHANNEL_READ_ONLY','RESTRICTED_PARTNER_ROUTE_UNSUPPORTED', 'RESTRICTED_PARTNER_ASYNC_AUTHORITY', 'RESTRICTED_PARTNER_CLAIM_INVALID', 'RESTRICTED_PARTNER_CLEANUP_UNKNOWN', 'RESTRICTED_PARTNER_EGRESS_UNPROVEN', 'RESTRICTED_PARTNER_EXECUTION_IDENTITY_UNKNOWN', 'RESTRICTED_PARTNER_EXECUTION_UNKNOWN', 'RESTRICTED_PARTNER_GRANT_CONFLICT', 'RESTRICTED_PARTNER_GRANT_INVALID', 'RESTRICTED_PARTNER_INPUT_CONFLICT', 'RESTRICTED_PARTNER_INPUT_INVALID', 'RESTRICTED_PARTNER_INVALID', 'RESTRICTED_PARTNER_NATIVE_VERSION_UNVERIFIED', 'RESTRICTED_PARTNER_REQUIREMENTS_INVALID', 'RESTRICTED_PARTNER_REQUIREMENTS_UNMET', 'RESTRICTED_PARTNER_MEMORY_SOURCE_DENIED', 'RESTRICTED_PARTNER_RESEARCH_UNKNOWN', 'RESTRICTED_PARTNER_NO_RESUBMIT', 'RESTRICTED_PARTNER_OUTPUT_INVALID', 'RESTRICTED_PARTNER_OUTPUT_LIMIT', 'RESTRICTED_PARTNER_PAUSED', 'RESTRICTED_PARTNER_PERSONA_CHANGED', 'RESTRICTED_PARTNER_RESOURCE_DENIED', 'RESTRICTED_PARTNER_RESULT_CONFLICT', 'RESTRICTED_PARTNER_REVOKED', 'RESTRICTED_PARTNER_RUNNER_UNSUPPORTED', 'RESTRICTED_PARTNER_SCOPE_DENIED', 'RESTRICTED_PARTNER_TOOL_INVALID', 'PERMISSION_DENIED', 'HOST_NOT_READY', 'INVALID_PARAMS', 'INVALID_ATTACHMENTS', 'INVALID_INVOCATION', 'TASK_BUSY', 'TARGET_UNAVAILABLE', 'SUPERSEDED', 'REQUEST_KEY_CONFLICT', 'DELIVERY_UNCERTAIN', 'DELIVERY_REJECTED', 'STALE_REVISION', 'ROUTE_UNAVAILABLE'].includes(String(rawCode)) ? String(rawCode) : 'HOST_NOT_READY';
+        const code = ['NATIVE_PUBLIC_RELEASE_DENIED','NATIVE_PUBLICATION_RUNTIME_UNAVAILABLE','NATIVE_PUBLICATION_CONFLICT','NATIVE_PUBLICATION_PENDING','NATIVE_PUBLICATION_UNKNOWN','OWNER_PUBLICATION_DENIED','OWNER_PUBLICATION_CONFLICT','OWNER_PUBLICATION_PENDING','OWNER_PUBLICATION_IDENTITY_CONFLICT','OWNER_PUBLICATION_ROOT_UNAVAILABLE','OWNER_PUBLICATION_SOURCE_CHANGED','OWNER_PUBLICATION_RUNTIME_DENIED','OWNER_PUBLICATION_OPERATION_UNKNOWN','RESTRICTED_PARTNER_LAUNCH_UNPROVEN','RESTRICTED_PARTNER_LAUNCH_LIMIT','RESTRICTED_PARTNER_MIGRATION_DENIED','RESTRICTED_PARTNER_MIGRATION_CONFLICT','RESTRICTED_MEDIA_DENIED','RESTRICTED_MEDIA_UNKNOWN','RESTRICTED_PARTNER_HISTORY_DENIED','RESTRICTED_PARTNER_CHANNEL_READ_ONLY','RESTRICTED_PARTNER_ROUTE_UNSUPPORTED', 'RESTRICTED_PARTNER_ASYNC_AUTHORITY', 'RESTRICTED_PARTNER_CLAIM_INVALID', 'RESTRICTED_PARTNER_CLEANUP_UNKNOWN', 'RESTRICTED_PARTNER_EGRESS_UNPROVEN', 'RESTRICTED_PARTNER_EXECUTION_IDENTITY_UNKNOWN', 'RESTRICTED_PARTNER_EXECUTION_UNKNOWN', 'RESTRICTED_PARTNER_GRANT_CONFLICT', 'RESTRICTED_PARTNER_GRANT_INVALID', 'RESTRICTED_PARTNER_INPUT_CONFLICT', 'RESTRICTED_PARTNER_INPUT_INVALID', 'RESTRICTED_PARTNER_INVALID', 'RESTRICTED_PARTNER_NATIVE_VERSION_UNVERIFIED', 'RESTRICTED_PARTNER_REQUIREMENTS_INVALID', 'RESTRICTED_PARTNER_REQUIREMENTS_UNMET', 'RESTRICTED_PARTNER_MEMORY_SOURCE_DENIED', 'RESTRICTED_PARTNER_RESEARCH_UNKNOWN', 'RESTRICTED_PARTNER_NO_RESUBMIT', 'RESTRICTED_PARTNER_OUTPUT_INVALID', 'RESTRICTED_PARTNER_OUTPUT_LIMIT', 'RESTRICTED_PARTNER_PAUSED', 'RESTRICTED_PARTNER_PERSONA_CHANGED', 'RESTRICTED_PARTNER_RESOURCE_DENIED', 'RESTRICTED_PARTNER_RESULT_CONFLICT', 'RESTRICTED_PARTNER_REVOKED', 'RESTRICTED_PARTNER_RUNNER_UNSUPPORTED', 'RESTRICTED_PARTNER_SCOPE_DENIED', 'RESTRICTED_PARTNER_TOOL_INVALID', 'PERMISSION_DENIED', 'HOST_NOT_READY', 'INVALID_PARAMS', 'INVALID_ATTACHMENTS', 'INVALID_INVOCATION', 'TASK_BUSY', 'TARGET_UNAVAILABLE', 'SUPERSEDED', 'REQUEST_KEY_CONFLICT', 'DELIVERY_UNCERTAIN', 'DELIVERY_REJECTED', 'STALE_REVISION', 'ROUTE_UNAVAILABLE'].includes(String(rawCode)) ? String(rawCode) : 'HOST_NOT_READY';
         return { ok: false, error: { code, message: code, retryable: code === 'TASK_BUSY' } };
       }
     }

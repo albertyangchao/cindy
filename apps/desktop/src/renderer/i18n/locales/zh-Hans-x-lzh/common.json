@@ -19390,5 +19390,27 @@
         "deny": "拒绝"
       }
     }
+  },
+  "restrictedOwnerPublication": {
+    "registerTitle": "核本人 iMessage 身份",
+    "registerMessage": "欲以此 iMessage 身份登记 HTML 公开发布乎？",
+    "revokeTitle": "撤 HTML 公开发布之登记",
+    "revokeMessage": "撤此 iMessage 身份之 HTML 公开发布登记乎？",
+    "scope": "所登记者，仅及下列身份与通道。每次发布，仍须核准确切成文及末定文件。",
+    "identityCheckbox": "此乃本人之 iMessage 身份。下列来源与公开目标，皆已核明。",
+    "registerButton": "登记本人身份",
+    "revokeButton": "撤销登记"
+  },
+  "restrictedPartner": {
+    "originalSourceRoot": "择此主体之原始来源根目录",
+    "fixedMemoryDirectory": "择原始 PROFILE / MEMORY / INTERESTS 目录",
+    "originalAbsenceTitle": "核原始未有之据",
+    "originalAbsenceBody": "既定原始来源记录载明，此主体未尝有此数据库。须核该原始记录，勿仅以今无文件为据。",
+    "approveOriginalAbsence": "原始未有之记录已核",
+    "evidenceRevision": "原始证据版次",
+    "title": "法器存取",
+    "message": "许外来输入予 {{partner}} 乎？",
+    "detail": "仅所选伙伴之人格及明择之文件可用。余差事之历史、主人记忆、凭证、网络及通用工具皆不共用。此举不启消息通道。",
+    "resources": "择此外来主体可唯读之资料"
   }
 }

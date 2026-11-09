@@ -1,0 +1,103 @@
+{
+  "generatedBy": "plugins/bluebubbles-connect/core/partner-url-input.cjs:prepare",
+  "scenario": "approved vision unavailable; approved edit ready",
+  "grant": {
+    "version": 1,
+    "id": "grant",
+    "pluginId": "plugin",
+    "partnerId": "partner",
+    "principalId": "4b1703fcc76cda5156d7d63cbd6fea8af0bf2d9b8a3e1c3b8696fc893edeb003",
+    "revision": 1,
+    "enabled": true,
+    "dispatchEnabled": true,
+    "dispatchEpoch": 1,
+    "personaSha256": "5761992fcd4dd417d71973e529bd08119bd9ec524a0c204a8a50e9a2b863287f",
+    "resourceIds": [],
+    "resources": [],
+    "approvalRevision": "approved",
+    "media": {
+      "vision": {
+        "providerId": "synthetic",
+        "modelId": "vision"
+      },
+      "edit": {
+        "providerId": "synthetic",
+        "modelId": "edit"
+      }
+    },
+    "requirements": {
+      "version": 1,
+      "revision": 1,
+      "principalId": "4b1703fcc76cda5156d7d63cbd6fea8af0bf2d9b8a3e1c3b8696fc893edeb003",
+      "addressHashes": [
+        "729821a028ecce14b4a28dd30cd59fa16f9bbcfef522467d92a8197bd2235154"
+      ],
+      "source": {
+        "registry": "872491a30d60d598962de6e7b834ab76b2aa65fbab102c6ebaaae6acdc238822",
+        "nativeConfig": "bcbe65caf0b6a33f4c6b9d588683d8eeb4aaf97f071f2202b8e58c16dcfbfe49",
+        "overlays": [
+          "b4b33d2441645d4dd0a0694b5989a0a14a5cc22fe9865e6b7b7eae966e0de36c"
+        ]
+      },
+      "tools": [
+        "channel-history"
+      ],
+      "purposes": [
+        "memory"
+      ],
+      "media": [
+        "vision",
+        "edit"
+      ]
+    }
+  },
+  "claim": {
+    "version": 1,
+    "runId": "run",
+    "inputId": "6fdb769f940681870640921d297c18ae7265a2430461df312baf9e460e23cc25",
+    "pluginId": "plugin",
+    "principalId": "4b1703fcc76cda5156d7d63cbd6fea8af0bf2d9b8a3e1c3b8696fc893edeb003",
+    "partnerId": "partner",
+    "grantId": "grant",
+    "grantRevision": 1,
+    "inputSha256": "1f5087db919ced5c123c7f507d3fcce818cb0cf6e77c2f95a8a35e951e03fdb9",
+    "inputText": "{\"question\":\"Edit this image https://images.example.invalid/original.png\",\"facts\":[],\"documents\":[]}",
+    "state": "UNKNOWN",
+    "channel": {
+      "domainId": "domain",
+      "principalId": "subject",
+      "connectionId": "connection",
+      "generation": "generation",
+      "chatId": "original-chat",
+      "eventId": "original-event",
+      "revision": 1,
+      "epoch": 1,
+      "memoryRead": true,
+      "addressHash": "729821a028ecce14b4a28dd30cd59fa16f9bbcfef522467d92a8197bd2235154"
+    }
+  },
+  "asset": {
+    "type": "image-url",
+    "id": "url:b1f7225b835066bb268f64b2c07024149707aa8923f2dcc2887d2b9bd7c0cc0a",
+    "url": "https://images.example.invalid/original.png",
+    "urlSha256": "84cf68c6152bda6ffc8f87f3c5c368c869284e8972c3ee0eb1732e93bb576450",
+    "questionSha256": "d99c6c4535a370b34934ce878a7ea8b2e8aee28d00efc25426b80b6a26e964e7",
+    "addressHash": "729821a028ecce14b4a28dd30cd59fa16f9bbcfef522467d92a8197bd2235154",
+    "binding": {
+      "domainId": "domain",
+      "connectionId": "connection",
+      "generation": "generation",
+      "chatId": "original-chat",
+      "eventId": "original-event",
+      "revision": 1,
+      "epoch": 1,
+      "principalId": "4b1703fcc76cda5156d7d63cbd6fea8af0bf2d9b8a3e1c3b8696fc893edeb003",
+      "partnerId": "partner",
+      "runId": "input:6fdb769f940681870640921d297c18ae7265a2430461df312baf9e460e23cc25",
+      "resourceFingerprint": "7a1dce0ae60ad8c54007c244cf6c1b98cd1e18df8f7c07ac0d12eacf5ee66990",
+      "providerId": "synthetic",
+      "modelId": "edit",
+      "effectSlot": "input-url:84cf68c6152bda6ffc8f87f3c5c368c869284e8972c3ee0eb1732e93bb576450"
+    }
+  }
+}

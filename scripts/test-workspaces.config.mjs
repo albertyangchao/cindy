@@ -383,11 +383,14 @@ export default {
         },
         integration: {
           status: 'manual',
-          reason: 'Local application Agent protocol tests open real loopback sockets and temporary authorization stores.',
+          reason: 'Local application Agent tests use real loopback sockets; owner publication tests use a pinned local Python producer and temporary stage files with synthetic remote effects.',
           execution: 'exclusive',
           coverage: 'allowlist',
           command: vitestBin('run', '--maxWorkers=2'),
-          include: ['src/main/local-agent/__tests__/*.integration.test.ts'],
+          include: [
+            'src/main/local-agent/__tests__/*.integration.test.ts',
+            'src/main/maker-ipc/__tests__/ownerPublicationRuntime.integration.test.ts',
+          ],
         },
         'git-integration': {
           status: 'manual',

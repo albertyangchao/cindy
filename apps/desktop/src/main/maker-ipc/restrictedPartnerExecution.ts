@@ -157,6 +157,14 @@ const id = (value: unknown): value is string =>
 export function validGrant(
   g: RestrictedPartnerGrant | undefined,
 ): asserts g is RestrictedPartnerGrant {
+  validGrantRecord(g);
+  if (g.enabled !== true) fail('RESTRICTED_PARTNER_GRANT_INVALID');
+}
+
+/** Historical inspection/revocation validates the stored record without authorizing execution. */
+export function validGrantRecord(
+  g: RestrictedPartnerGrant | undefined,
+): asserts g is RestrictedPartnerGrant {
   if (!g) throw Error('RESTRICTED_PARTNER_GRANT_INVALID');
   if (
     !g ||
@@ -185,7 +193,7 @@ export function validGrant(
         ].includes(k),
     ) ||
     g.version !== 1 ||
-    g.enabled !== true ||
+    typeof g.enabled !== 'boolean' ||
     !Number.isSafeInteger(g.revision) ||
     g.revision < 1 ||
     ![g.id, g.pluginId, g.partnerId, g.principalId].every(id) ||

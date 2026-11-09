@@ -19402,5 +19402,15 @@
     "message": "允许外部消息使用伙伴“{{partner}}”吗？",
     "detail": "仅使用所选伙伴身份和你明确选择的只读资料。不共享其它任务历史、主人记忆、凭据、网络或通用工具。此授权不会启用消息入口。",
     "resources": "选择允许该外部主体读取的资料"
+  },
+  "restrictedOwnerPublication": {
+    "registerTitle": "确认本人的 iMessage 身份",
+    "registerMessage": "将这个 iMessage 身份登记为本人，并允许申请公开发布 HTML？",
+    "revokeTitle": "撤销 HTML 公开发布登记",
+    "revokeMessage": "撤销这个 iMessage 身份的 HTML 公开发布登记？",
+    "scope": "登记只适用于下方身份和通道。每次发布仍需确认确切的完成内容和最终文件。",
+    "identityCheckbox": "这是我本人的 iMessage 身份。我已核对下方来源和公开发布目标。",
+    "registerButton": "登记本人身份",
+    "revokeButton": "撤销登记"
   }
 }

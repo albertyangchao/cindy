@@ -19646,5 +19646,27 @@
     "rendered": "Afficher le document",
     "wrap": "Retour à la ligne",
     "lineNumbers": "Numéros de ligne"
+  },
+  "restrictedOwnerPublication": {
+    "registerTitle": "Confirmer Mon Identité iMessage",
+    "registerMessage": "Enregistrer cette identité iMessage pour la publication HTML publique ?",
+    "revokeTitle": "Révoquer l’Inscription à la Publication HTML",
+    "revokeMessage": "Révoquer la publication HTML publique pour cette identité iMessage ?",
+    "scope": "L’inscription s’applique uniquement à l’identité et au canal affichés. Chaque publication nécessite encore l’approbation du contenu terminé exact et du fichier final.",
+    "identityCheckbox": "Il s’agit de mon identité iMessage. J’ai vérifié la source et la destination publique ci-dessous.",
+    "registerButton": "Enregistrer Mon Identité",
+    "revokeButton": "Révoquer l’Inscription"
+  },
+  "restrictedPartner": {
+    "originalSourceRoot": "Sélectionner la racine de la source d’origine de ce sujet",
+    "fixedMemoryDirectory": "Sélectionner le répertoire d’origine PROFILE / MEMORY / INTERESTS",
+    "originalAbsenceTitle": "Vérifier les preuves d’absence d’origine",
+    "originalAbsenceBody": "Le registre de source d’origine figé indique que ce sujet n’a jamais eu cette base de données. Confirmez ce registre précis, et pas seulement l’absence actuelle d’un fichier.",
+    "approveOriginalAbsence": "J’ai vérifié le registre d’absence d’origine",
+    "evidenceRevision": "Révision de la preuve d’origine",
+    "title": "Accès du plugin",
+    "message": "Autoriser les entrées externes vers {{partner}} ?",
+    "detail": "Seuls la personnalité du partenaire sélectionné et les fichiers que vous choisissez explicitement sont disponibles. L’historique des autres tâches, la mémoire du propriétaire, les identifiants, le réseau et les outils généraux ne sont pas partagés. Cela n’active pas de canal de messagerie.",
+    "resources": "Choisir les ressources en lecture seule pour ce sujet externe"
   }
 }

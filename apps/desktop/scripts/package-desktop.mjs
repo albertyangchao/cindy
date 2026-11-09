@@ -33,6 +33,9 @@
 //   --no-sign                       主动跳过签名(即使签名配置在手;隐含 --allow-unsigned)。
 //                                   外部签名命令依赖发布方自己的环境,不具备
 //                                   该环境的机器打版本无关包时用它
+//   --local-only                    Mac arm64 本机构建：显式版本、ad-hoc ZIP，
+//                                   保留 smoke，产物隔离到 release/local-artifacts。
+//                                   日志目标缺失时明确关闭，已有坏配置仍拒绝。
 //
 // 产物: release/artifacts/<region>/<version|unversioned>/<platform-arch>/
 //   cindy-<version|unversioned>-Setup.exe / -<arch>.dmg /
@@ -182,7 +185,7 @@ function cleanOutDir() {
   }
 }
 
-function runForgeMake({ platform, arch, region, version, versionless, noSign, webAuthnAppleTeamId }) {
+function runForgeMake({ platform, arch, region, version, versionless, noSign, webAuthnAppleTeamId, localOnly = false }) {
   console.log('==> Building remote bundles...');
   execSync('node scripts/build-remote-bundles.mjs', { cwd: DESKTOP_ROOT, stdio: 'inherit' });
 
@@ -195,12 +198,13 @@ function runForgeMake({ platform, arch, region, version, versionless, noSign, we
     // 日志上报目标(SLS project/logstore/区域)。真值不进仓,读 config/log-upload.json
     // (打包机由 cindy-build-scripts 的 sync-desktop-release-kit.sh 拷回)。
     // 只烘焙**本区域那一个**目标 —— cn 包里物理上不含 global 的 logstore 地址。
-    // 发行(有版本)打包:缺失 / 非法一律抛错让打包失败(除 dev 外每个区域都是必填):这是
+    // 正式发行(非 localOnly 的有版本)打包:缺失 / 非法一律抛错让打包失败:这是
     // 「必须被强制要求做出选择」那条约束从 typecheck 搬过来的落点,不要改成静默跳过。
     // 版本无关 / 开源打包(versionless):配置文件是 gitignore 的、默认 checkout 里不存在,
     // 允许缺失 ⇒ 注入空目标、功能整体关闭,拉仓即可打包(2026-08-04 review P1)。
-    // 注意 allowMissing 只放宽「文件缺失」;文件在但内容损坏两种模式都仍然硬失败。
-    ...desktopLogUploadBuildEnv({ authRegion: region, allowMissing: versionless }),
+    // 显式 localOnly 沿用这个缺失处理并提前明示；不改变正式发行默认值。
+    // 注意 allowMissing 只放宽「文件缺失」;文件在但内容损坏所有模式都硬失败。
+    ...desktopLogUploadBuildEnv({ authRegion: region, allowMissing: versionless || localOnly }),
     // forge.config.ts 的 NSIS appId / AUMID 优先读这个(与 VITE_ 同源,双保险)。
     CINDY_AUTH_REGION: region,
     // forge.config.ts 注入 packagerConfig.appVersion;版本无关时为占位 0.0.0。
@@ -495,7 +499,7 @@ async function main() {
     console.error(`ERROR: ${err.message}`);
     process.exit(1);
   }
-  const { platform, archs, region, versionSpec, skipSmoke, allowUnsigned, noSign } = args;
+  const { platform, archs, region, versionSpec, skipSmoke, allowUnsigned, noSign, localOnly } = args;
   // ensureBinary 的 CDN fallback 按此 region 选择清单基址；必须早于二进制准备。
   process.env.CINDY_AUTH_REGION = region;
   // mac 签名身份按区域从 release-regions.json 注入(文件缺失时静默跳过,
@@ -507,6 +511,17 @@ async function main() {
   if (platform !== process.platform) {
     console.error(`ERROR: 不支持交叉打包(当前 ${process.platform},目标 ${platform});请在目标平台机器上执行。`);
     process.exit(1);
+  }
+  if (localOnly && process.arch !== 'arm64') {
+    throw new Error('--local-only 需要 Mac mini 原生 arm64 Node；不在 Rosetta/x64 进程构建。');
+  }
+
+  if (localOnly) {
+    // Keep the production validator, including malformed/cross-region rejection.
+    // Only an absent private release target is optional for this local artifact.
+    const logEnv = desktopLogUploadBuildEnv({ authRegion: region, allowMissing: true });
+    console.log(`LOCAL_ONLY: 官方发布未执行；日志上报${logEnv.XDT_LOG_UPLOAD_TARGET ? '沿用本机已校验配置' : '未配置，已关闭'}。`);
+    console.log('LOCAL_ONLY: 保留打包 smoke；有版本的本地版仍可能被后续官方更新覆盖。');
   }
 
   // 版本号只解析一次,mac 双架构共用(canary 发布要求两 arch 同版本)。
@@ -597,7 +612,7 @@ async function main() {
     // build-info.json / 安装包(看起来像可发布结果,易被人工分发或发布侧误取)。
     const artifactDir = path.join(
       RELEASE_DIR,
-      ...artifactRelDir({ region, version, versionless, platformKey }).split('/'),
+      ...artifactRelDir({ region, version, versionless, platformKey, localOnly }).split('/'),
     );
     fs.rmSync(artifactDir, { recursive: true, force: true });
 
@@ -609,6 +624,7 @@ async function main() {
       version,
       versionless,
       noSign,
+      localOnly,
       webAuthnAppleTeamId: webAuthnProvisioningProfile ? macSigningIdentity?.teamId : undefined,
     });
 
@@ -674,6 +690,7 @@ async function main() {
         files,
         signing,
         mcpAppsManual,
+        localOnly,
       });
       buildInfoPath = path.join(artifactDir, 'build-info.json');
       fs.writeFileSync(buildInfoPath, JSON.stringify(buildInfo, null, 2) + '\n');

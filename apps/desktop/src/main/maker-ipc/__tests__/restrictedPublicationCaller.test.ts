@@ -1,4 +1,8 @@
-import { expect, it } from 'vitest';
+import { afterEach, expect, it, vi } from 'vitest';
+import {
+  readRestrictedPublicationLaunchPolicy,
+  restrictedPublicationLaunchEnvironment,
+} from '../restrictedPublicationLaunch.js';
 import {
   canonicalSidecar,
   publicMarker,
@@ -9,8 +13,11 @@ import {
 } from '../restrictedPublicationProtocol.js';
 import {
   controlledPublicationRuntime,
+  createControlledPublicationAssembly,
+  resolveControlledPublicationRoot,
   supportedPublicationRoot,
 } from '../restrictedPublicationCaller.js';
+afterEach(() => vi.unstubAllEnvs());
 it('canonical protocol preserves exact Unicode content, validates both members before fixed tuple conversion and rejects duplicate JSON', () => {
   const b = {
     nativeActionId: 'synthetic',
@@ -36,6 +43,7 @@ it('canonical protocol preserves exact Unicode content, validates both members b
   expect(parseNativeFrame('{"x":"汉字"}')).toEqual({ x: '汉字' });
 });
 it('installed publisher/old-consumer proof is unavailable and arbitrary pins or self-created channels cannot enable a production root', () => {
+  vi.stubEnv(restrictedPublicationLaunchEnvironment, '1');
   expect(supportedPublicationRoot).toBeUndefined();
   for (const spec of [
     {},
@@ -45,4 +53,34 @@ it('installed publisher/old-consumer proof is unavailable and arbitrary pins or 
     expect(() =>
       controlledPublicationRuntime(spec as any, { effectCurrent: () => {}, readCurrent: () => {} }),
     ).toThrow();
+});
+
+it('launch configuration is opt-in metadata and rejects ambiguous overrides', () => {
+  const deferred = readRestrictedPublicationLaunchPolicy({});
+  expect(deferred).toEqual({
+    schema: 'restricted-publication-launch/v1', enabled: false,
+    state: 'DEFERRED_POST_LAUNCH',
+    deferredGates: ['ci-producer', 'coverage', 'owner-registry', 'kb', 'os-owner-census'],
+  });
+  for (const value of ['', '0', 'false'])
+    expect(readRestrictedPublicationLaunchPolicy({ [restrictedPublicationLaunchEnvironment]: value })).toEqual(deferred);
+  for (const value of ['1', 'true'])
+    expect(readRestrictedPublicationLaunchPolicy({ [restrictedPublicationLaunchEnvironment]: value })).toEqual({
+      schema: deferred.schema, enabled: true, state: 'ENABLED', deferredGates: [],
+    });
+  for (const value of ['TRUE', ' true ', 'yes', 'enabled'])
+    expect(() => readRestrictedPublicationLaunchPolicy({ [restrictedPublicationLaunchEnvironment]: value })).toThrow('RESTRICTED_PUBLICATION_CONFIGURATION_INVALID');
+});
+
+it('launch default defers the real assembly and runtime before coverage or owner census construction', () => {
+  vi.stubEnv(restrictedPublicationLaunchEnvironment, undefined);
+  expect(() => createControlledPublicationAssembly(undefined as any, 'plugin', undefined as any)).toThrow('RESTRICTED_PUBLICATION_DEFERRED_POST_LAUNCH');
+  const current = vi.fn();
+  expect(resolveControlledPublicationRoot(undefined, null, current)).toBeUndefined();
+  expect(current).toHaveBeenCalledOnce();
+  expect(() => resolveControlledPublicationRoot(undefined, null, () => { throw Error('OWNER_CHANGED'); })).toThrow('OWNER_CHANGED');
+  expect(() => controlledPublicationRuntime(undefined as any, {
+    effectCurrent: current, readCurrent: current,
+  })).toThrow('RESTRICTED_PUBLICATION_DEFERRED_POST_LAUNCH');
+  expect(supportedPublicationRoot).toBeUndefined();
 });

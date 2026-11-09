@@ -1,15 +1,46 @@
 import { expect, it, vi } from 'vitest';
 import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import sharp from 'sharp';
 import { nativeImageUrlAuthority } from '../restrictedPartnerUrlApproval.js';
 import {
   normalizeRestrictedUrlImage,
   originalImageUrls,
+  selectedImageUrls,
   validateRestrictedUrlInput,
   projectedUrlInput,
 } from '../restrictedPartnerUrlInput.js';
 import { grantResourceFingerprint } from '../restrictedPartnerRequirements.js';
 const sha = (v: string | Uint8Array) => createHash('sha256').update(v).digest('hex');
+/* W0 contract regression: the producer used every URL as an image and Main
+ * rejected harmless references. Shared vectors cover exact source selection;
+ * projection checks prove ordinary links are not fetch/model capabilities.
+ * Tier: existing focused URL input tests, no network or real approvals. */
+it('shared mixed-link vectors select only explicit original images and redact ordinary references', () => {
+  const vectors = JSON.parse(readFileSync(new URL('./fixtures/restricted-image-url-cases.json', import.meta.url), 'utf8'));
+  for (const value of vectors) {
+    if (value.denied) expect(() => selectedImageUrls(value.question)).toThrow('DENIED');
+    else expect(selectedImageUrls(value.question)).toEqual(value.selected);
+  }
+  const { g, claim } = source();
+  claim.inputText = JSON.stringify({question:'Read http://docs.example.invalid/reference',facts:['https://notes.example.invalid/private'],documents:[]});
+  const projected = projectedUrlInput(g, claim, [])!;
+  expect(projected).toContain('Read');
+  expect(projected).not.toMatch(/https?:\/\//i);
+  expect(claim.inputText).toContain('http://docs.example.invalid/reference');
+  const mixed = source();
+  const question = 'Reference https://docs.example.invalid/reference and describe image ' + mixed.a.url;
+  mixed.claim.inputText = JSON.stringify({ question, facts: ['https://notes.example.invalid/private'], documents: [] });
+  mixed.a.questionSha256 = sha(question);
+  mixed.a.id = 'url:' + sha(JSON.stringify([
+    Object.entries(mixed.a.binding).sort(([a], [b]) => a.localeCompare(b)),
+    mixed.a.addressHash, mixed.a.questionSha256, mixed.a.urlSha256,
+  ]));
+  const mixedProjection = projectedUrlInput(mixed.g, mixed.claim, [mixed.a])!;
+  expect(mixedProjection).toContain(mixed.a.id);
+  expect(mixedProjection).not.toMatch(/https?:\/\//i);
+  expect(() => projectedUrlInput(mixed.g, mixed.claim, [])).toThrow('DENIED');
+});
 function source() {
   const url = 'https://images.example.invalid/original.png?marker=SYNTHETIC_PRIVATE';
   const principalId = sha(JSON.stringify(['domain', 'subject'])),

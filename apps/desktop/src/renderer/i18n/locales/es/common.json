@@ -19646,5 +19646,27 @@
     "rendered": "Ver documento",
     "wrap": "Ajustar líneas",
     "lineNumbers": "Números de línea"
+  },
+  "restrictedOwnerPublication": {
+    "registerTitle": "Confirmar Mi Identidad de iMessage",
+    "registerMessage": "¿Registrar esta identidad de iMessage para publicar HTML?",
+    "revokeTitle": "Revocar Registro de Publicación HTML",
+    "revokeMessage": "¿Revocar la publicación HTML para esta identidad de iMessage?",
+    "scope": "El registro solo se aplica a la identidad y al canal mostrados. Cada publicación sigue requiriendo la aprobación del contenido terminado exacto y del archivo final.",
+    "identityCheckbox": "Esta es mi identidad de iMessage. He revisado el origen y el destino público que aparecen a continuación.",
+    "registerButton": "Registrar Mi Identidad",
+    "revokeButton": "Revocar Registro"
+  },
+  "restrictedPartner": {
+    "originalSourceRoot": "Seleccionar la raíz de origen original de este sujeto",
+    "fixedMemoryDirectory": "Seleccionar el directorio original PROFILE / MEMORY / INTERESTS",
+    "originalAbsenceTitle": "Revisar la evidencia original de ausencia",
+    "originalAbsenceBody": "El registro de origen original fijado indica que este sujeto nunca tuvo esta base de datos. Confirma ese registro exacto, no solo la ausencia actual de un archivo.",
+    "approveOriginalAbsence": "He revisado el registro original de ausencia",
+    "evidenceRevision": "Revisión de la evidencia original",
+    "title": "Acceso del Complemento",
+    "message": "¿Permitir entradas externas a {{partner}}?",
+    "detail": "Solo están disponibles la personalidad del compañero seleccionado y los archivos que elijas explícitamente. No se comparten el historial de otras tareas, la memoria del propietario, las credenciales, la red ni las herramientas generales. Esto no activa una ruta de mensajería.",
+    "resources": "Elegir recursos de solo lectura para este sujeto externo"
   }
 }

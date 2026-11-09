@@ -1,3 +1,5 @@
+import { requireRestrictedPublicationEnabled } from './restrictedPublicationLaunch.js';
+import { authorizeOwnerPublication, assertOwnerPublicationPermitCurrent } from './restrictedOwnerPublication.js';
 /** Main-owned PUBLIC_RELEASE actions over the existing account receipt table. Not a publisher. */
 import { createHash, randomUUID } from 'node:crypto';
 import { and, eq } from 'drizzle-orm';
@@ -65,6 +67,10 @@ export type PublicationEffect =
 const steps: readonly PublicationEffect[] = publicationEffects;
 export interface NativePublicationRecord extends NativePublicationBinding {
   schema: 'native-publication-action/v1';
+  /** Missing on legacy restricted actions; never inferred from a runtime or wire flag. */
+  authorityMode?: 'owner-bridge/v1';
+  ownerBindingRevision?: number;
+  ownerBindingSha256?: string;
   pluginId: string;
   sourceOutputMessageId: string;
   sourceInputSha256: string;
@@ -105,6 +111,9 @@ export interface NativePublicationReceipt {
 export interface NativePublisherRuntime {
   /** Main-registered exact code/policy identity. No wire caller may supply this object. */
   identity: string;
+  /** Main-only source details for native review; never included in public return metadata. */
+  sourceRoot?: string;
+  sourceIdentity?: string;
   publicOrigin: string;
   dispatcher: string;
   verify(): Promise<void>;
@@ -144,6 +153,7 @@ export interface NativePublicationOwnerInput {
   disclosure: 'PUBLIC_RELEASE';
   publicOrigin: string;
   runtimeIdentity?: string;
+  sourceRoot?: string;
   artifact?: { sha256: string; publisherBindingSha256: string; relative: string };
   assertCurrent(): void;
 }
@@ -164,7 +174,47 @@ export function createNativePublicationAuthority(
     now?: () => number;
   },
 ) {
+  return createPublicationAuthority(db, pluginId, readOwner, current, ports);
+}
+
+/** D2 entry requires a live Main registration handle, not an optional wire bypass flag. */
+export function createOwnerBridgePublicationAuthority(
+  db: DbClient, pluginId: string, readOwner: () => void,
+  current: (g: RestrictedPartnerGrant) => void,
+  ports: Parameters<typeof createNativePublicationAuthority>[4], ownerPermit: object,
+) {
+  assertOwnerPublicationPermitCurrent(ownerPermit, db, pluginId);
+  return createPublicationAuthority(db, pluginId, readOwner, current, ports, ownerPermit);
+}
+
+function createPublicationAuthority(
+  db: DbClient,
+  pluginId: string,
+  readOwner: () => void,
+  current: (g: RestrictedPartnerGrant) => void,
+  ports: {
+    readGrant(id: string): Promise<RestrictedPartnerGrant | undefined>;
+    readRun(runId: string): Promise<RestrictedPartnerClaim | undefined>;
+    approve(
+      input: NativePublicationOwnerInput,
+    ): Promise<{ approved: boolean; publicNonPersonal: boolean }>;
+    runtime(): NativePublisherRuntime | undefined;
+    now?: () => number;
+  },
+  ownerPermit?: object,
+) {
   const now = ports.now ?? Date.now;
+  const requirePublication = async (g: RestrictedPartnerGrant, runId: string, action?: NativePublicationRecord) => {
+    if (ownerPermit) return authorizeOwnerPublication(ownerPermit, db, pluginId, g, runId, action);
+    requireRestrictedPublicationEnabled();
+    if (action?.authorityMode !== undefined) deny();
+    return undefined;
+  };
+  const assertCurrent = current;
+  current = (g) => {
+    assertCurrent(g);
+    if (ownerPermit) assertOwnerPublicationPermitCurrent(ownerPermit, db, pluginId);
+  };
   const row = async (actionId: string) => {
     readOwner();
     const [r] = await db.drizzle
@@ -195,6 +245,9 @@ export function createNativePublicationAuthority(
     ];
     if (
       a.schema !== 'native-publication-action/v1' ||
+      (ownerPermit ? a.authorityMode !== 'owner-bridge/v1' || !Number.isSafeInteger(a.ownerBindingRevision) ||
+        Number(a.ownerBindingRevision) < 1 || !/^[a-f0-9]{64}$/.test(a.ownerBindingSha256 ?? '') :
+        a.authorityMode !== undefined || a.ownerBindingRevision !== undefined || a.ownerBindingSha256 !== undefined) ||
       a.pluginId !== pluginId ||
       a.nativeActionId !== actionId ||
       a.actionRevision !== 1 ||
@@ -258,6 +311,7 @@ export function createNativePublicationAuthority(
     return c!;
   };
   const live = async (g: RestrictedPartnerGrant, a: NativePublicationRecord) => {
+    await requirePublication(g, a.runId, a);
     const c = await source(g, a.runId);
     if (
       a.grantId !== g.id ||
@@ -283,6 +337,7 @@ export function createNativePublicationAuthority(
       throw Error('NATIVE_PUBLICATION_RUNTIME_UNAVAILABLE');
     await runtime.verify();
     current(g);
+    await requirePublication(g, a.runId, a);
     return runtime;
   };
   const cas = async (
@@ -469,6 +524,9 @@ export function createNativePublicationAuthority(
       return readPublic(g, a.nativeActionId);
     },
     async prepare(g: RestrictedPartnerGrant, runId: string) {
+      readOwner();
+      current(g);
+      await requirePublication(g, runId);
       const c = await source(g, runId),
         runtime = ports.runtime();
       if (!runtime) throw Error('NATIVE_PUBLICATION_RUNTIME_UNAVAILABLE');
@@ -483,6 +541,7 @@ export function createNativePublicationAuthority(
         deny();
       await runtime.verify();
       current(g);
+      await requirePublication(g, runId);
       const outputSha = shaText(c.output!),
         key =
           'restricted:publication:' +
@@ -507,7 +566,8 @@ export function createNativePublicationAuthority(
         )
         .limit(1);
       current(g);
-      if (existing) return JSON.parse(existing.payload) as NativePublicationRecord;
+      await requirePublication(g, runId);
+      if (existing) return record((JSON.parse(existing.payload) as NativePublicationRecord).nativeActionId);
       let waits = pending.get(db);
       if (!waits) {
         waits = new Set();
@@ -527,20 +587,25 @@ export function createNativePublicationAuthority(
           target: 'canonical-public-report',
           disclosure: 'PUBLIC_RELEASE',
           publicOrigin: runtime.publicOrigin,
+          ...(ownerPermit ? { runtimeIdentity: runtime.identity, sourceRoot: runtime.sourceRoot } : {}),
           assertCurrent: () => current(g),
         });
         current(g);
+        await requirePublication(g, runId);
         if (!approved.approved || approved.publicNonPersonal !== true) deny();
         const fresh = await source(g, runId);
+        await requirePublication(g, runId);
         if (
           publicationCanonical(fresh) !== publicationCanonical(c) ||
           ports.runtime()?.identity !== runtime.identity
         )
           deny();
+        const ownerPolicy = await requirePublication(g, runId);
         const nativeActionId = randomUUID(),
           createdAt = now();
         const a: NativePublicationRecord = {
           schema: 'native-publication-action/v1',
+          ...ownerPolicy,
           pluginId,
           nativeActionId,
           actionRevision: 1,
@@ -668,6 +733,7 @@ export function createNativePublicationAuthority(
             disclosure: 'PUBLIC_RELEASE',
             publicOrigin: runtime.publicOrigin,
             runtimeIdentity: runtime.identity,
+            ...(ownerPermit ? { sourceRoot: runtime.sourceRoot } : {}),
             artifact: {
               sha256: staged.artifactSha256,
               publisherBindingSha256: staged.publisherBindingSha256,
@@ -770,6 +836,7 @@ export function createNativePublicationAuthority(
       const a = await record(id);
       readOwner();
       if (a.principalId !== g.principalId || a.grantId !== g.id) deny();
+      await requirePublication(g, a.runId, a);
       const runtime = ports.runtime();
       if (!runtime || runtime.identity !== a.runtimeIdentity)
         throw Error('NATIVE_PUBLICATION_RUNTIME_UNAVAILABLE');

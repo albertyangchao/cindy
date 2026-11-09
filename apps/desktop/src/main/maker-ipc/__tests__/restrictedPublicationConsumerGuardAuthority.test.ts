@@ -11,6 +11,7 @@ import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promi
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { controlledPublicationRuntime } from '../restrictedPublicationCaller.js';
+import { restrictedPublicationLaunchEnvironment } from '../restrictedPublicationLaunch.js';
 import {
   digest,
   publicMarker,
@@ -150,6 +151,7 @@ vi.mock('node:child_process', async (importOriginal) => {
 const sha = (s: string) => createHash('sha256').update(s).digest('hex');
 const dbs: Database.Database[] = [];
 afterEach(() => {
+  vi.unstubAllEnvs();
   pureProcess.reply = undefined;
   pureProcess.candidate = undefined;
   pureProcess.managedMode = 'normal';
@@ -610,6 +612,8 @@ it('late switch completion cannot reopen after a concurrent invalidation; damage
 // Exercise the actual Caller queue/three dispatch methods with real tmp files and account SQL.
 // Only the already-accepted pure Python contract process and external transport are synthetic here.
 async function callerFixture(f: ReturnType<typeof fixture>, beforeIO?: () => Promise<void>) {
+  // Retain the real Caller/coverage assertions behind explicit launch opt-in.
+  vi.stubEnv(restrictedPublicationLaunchEnvironment, '1');
   const dir = await realpath(await mkdtemp(path.join(tmpdir(), 'coverage-caller-')));
   const root = path.join(dir, 'root'),
     artifacts = path.join(dir, 'artifacts'),

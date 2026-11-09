@@ -19390,5 +19390,27 @@
     "rendered": "查看文件",
     "wrap": "自動換行",
     "lineNumbers": "行號"
+  },
+  "restrictedOwnerPublication": {
+    "registerTitle": "確認本人的 iMessage 身分",
+    "registerMessage": "將此 iMessage 身分登記為本人，並允許申請公開發佈 HTML？",
+    "revokeTitle": "撤銷 HTML 公開發佈登記",
+    "revokeMessage": "撤銷此 iMessage 身分的 HTML 公開發佈登記？",
+    "scope": "登記只適用於下方身分和通道。每次發佈仍須確認確切的完成內容和最終檔案。",
+    "identityCheckbox": "這是我本人的 iMessage 身分。我已核對下方來源和公開發佈目標。",
+    "registerButton": "登記本人身分",
+    "revokeButton": "撤銷登記"
+  },
+  "restrictedPartner": {
+    "originalSourceRoot": "選取此對象的原始來源根目錄",
+    "fixedMemoryDirectory": "選取原始 PROFILE / MEMORY / INTERESTS 目錄",
+    "originalAbsenceTitle": "核對原始缺席證據",
+    "originalAbsenceBody": "固定的原始來源記錄指出，此對象從未有過這個資料庫。請確認該原始記錄，而不只是目前缺少檔案。",
+    "approveOriginalAbsence": "我已核對原始缺席記錄",
+    "evidenceRevision": "原始證據版本",
+    "title": "插件存取權",
+    "message": "允許外部輸入傳給 {{partner}}？",
+    "detail": "僅提供所選夥伴的人格設定，以及您明確選取的檔案。其他任務歷史、主人記憶、憑證、網路和通用工具不會共用。此操作不會啟用訊息通道。",
+    "resources": "選取此外部對象可唯讀存取的資料"
   }
 }

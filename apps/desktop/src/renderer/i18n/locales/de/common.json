@@ -19462,5 +19462,27 @@
     "rendered": "Dokument anzeigen",
     "wrap": "Zeilenumbruch",
     "lineNumbers": "Zeilennummern"
+  },
+  "restrictedOwnerPublication": {
+    "registerTitle": "Meine iMessage-Identität Bestätigen",
+    "registerMessage": "Diese iMessage-Identität für öffentliche HTML-Veröffentlichungen registrieren?",
+    "revokeTitle": "Registrierung für HTML-Veröffentlichungen Widerrufen",
+    "revokeMessage": "Öffentliche HTML-Veröffentlichungen für diese iMessage-Identität widerrufen?",
+    "scope": "Die Registrierung gilt nur für die angezeigte Identität und den Kanal. Jede Veröffentlichung erfordert weiterhin die Genehmigung des genauen fertigen Inhalts und der endgültigen Datei.",
+    "identityCheckbox": "Dies ist meine eigene iMessage-Identität. Ich habe die unten angezeigte Quelle und das öffentliche Ziel geprüft.",
+    "registerButton": "Meine Identität Registrieren",
+    "revokeButton": "Registrierung Widerrufen"
+  },
+  "restrictedPartner": {
+    "originalSourceRoot": "Ursprüngliches Quellverzeichnis Dieses Subjekts Auswählen",
+    "fixedMemoryDirectory": "Ursprüngliches PROFILE / MEMORY / INTERESTS-Verzeichnis Auswählen",
+    "originalAbsenceTitle": "Ursprünglichen Abwesenheitsnachweis Prüfen",
+    "originalAbsenceBody": "Der festgelegte ursprüngliche Quelldatensatz besagt, dass dieses Subjekt diese Datenbank nie hatte. Bestätigen Sie diesen genauen ursprünglichen Datensatz und nicht nur eine aktuell fehlende Datei.",
+    "approveOriginalAbsence": "Ich habe den ursprünglichen Abwesenheitsnachweis geprüft",
+    "evidenceRevision": "Revision des ursprünglichen Nachweises",
+    "title": "Plugin-Zugriff",
+    "message": "Externe Eingaben an {{partner}} zulassen?",
+    "detail": "Nur die ausgewählte Partnerpersönlichkeit und die ausdrücklich ausgewählten Dateien sind verfügbar. Verlauf anderer Aufgaben, Gedächtnis des Eigentümers, Zugangsdaten, Netzwerk und allgemeine Werkzeuge werden nicht freigegeben. Dies aktiviert keinen Nachrichtenkanal.",
+    "resources": "Schreibgeschützte Ressourcen für Dieses Externe Subjekt Auswählen"
   }
 }

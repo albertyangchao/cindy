@@ -15,11 +15,13 @@ import {
   PLATFORM_ARCHS,
   VERSIONLESS_VERSION,
   assertPageManualCommitted,
+  artifactRelDir,
   buildBuildInfo,
   debianArch,
   pageManualBuildInfo,
   parsePackageArgs,
   packageNodeOptions,
+  resolvePackageVersion,
 } from '../../apps/desktop/scripts/ci/package-lib.mjs';
 
 test('package Node options add headroom and preserve explicit limits and unrelated options', () => {
@@ -249,4 +251,43 @@ test('build-info 记录安装包内手册,打包拒绝未提交的手册', () =>
   assert.doesNotThrow(() => assertPageManualCommitted({ porcelain: '', versionless: false, manualPath }));
   assert.throws(() => assertPageManualCommitted({ porcelain: ' M x/PAGE-GENERATION.md\n', versionless: false, manualPath }), /未提交改动/);
   assert.doesNotThrow(() => assertPageManualCommitted({ porcelain: ' M x/PAGE-GENERATION.md\n', versionless: true, manualPath }));
+});
+
+// D3: a locally versioned Mac build must not need official signing, CDN
+// version history or private release logging targets. Existing release mode
+// and the packaged smoke test must keep their previous behavior.
+test('local-only requires a specific arm64 Mac version and keeps smoke enabled', async () => {
+  const input = ['--local-only', '--platform', 'darwin', '--arch', 'arm64', '--region', 'global', '--version', '1.2.4'];
+  const local = parsePackageArgs(input, { platform: 'darwin', arch: 'arm64' });
+  assert.equal(local.localOnly, true);
+  assert.equal(local.noSign, true);
+  assert.equal(local.allowUnsigned, true);
+  assert.equal(local.skipSmoke, false);
+  const version = await resolvePackageVersion(local.versionSpec, () => { throw Error('CDN must not be queried'); });
+  assert.deepEqual(version, { version: '1.2.4', versionless: false });
+  const official = parsePackageArgs(input.filter((arg) => arg !== '--local-only'), { platform: 'darwin', arch: 'arm64' });
+  assert.equal(official.localOnly, false);
+  assert.equal(official.noSign, false);
+  assert.equal(official.allowUnsigned, false);
+  assert.equal(official.skipSmoke, false);
+  for (const version of ['0.0.0', 'patch', 'minor', 'major']) {
+    assert.throws(() => parsePackageArgs([...input.slice(0, -1), version]), /本机已核基线/);
+  }
+  assert.throws(() => parsePackageArgs(['--local-only', '--platform', 'darwin', '--arch', 'arm64']), /本机已核基线/);
+  assert.throws(() => parsePackageArgs(['--local-only', '--platform', 'darwin', '--region', 'global', '--version', '1.2.4']), /只支持/);
+  assert.throws(() => parsePackageArgs(['--local-only', '--platform', 'linux', '--arch', process.arch, '--region', 'global', '--version', '1.2.4']), /只支持/);
+});
+
+test('local-only artifacts and receipts cannot be mistaken for the official output path', () => {
+  const context = { region: 'global', version: '1.2.4', versionless: false, platformKey: 'darwin-arm64' };
+  assert.equal(artifactRelDir(context), 'artifacts/global/1.2.4/darwin-arm64');
+  assert.equal(artifactRelDir({ ...context, localOnly: true }), 'local-artifacts/global/1.2.4/darwin-arm64');
+  const input = { ...context, platform: 'darwin', arch: 'arm64', files: [], signing: { mode: 'adhoc' } };
+  const local = buildBuildInfo({ ...input, localOnly: true });
+  assert.equal(local.localOnly, true);
+  assert.equal(local.distribution, 'local-only');
+  assert.equal(local.version, '1.2.4');
+  const official = buildBuildInfo(input);
+  assert.equal(Object.hasOwn(official, 'localOnly'), false);
+  assert.equal(Object.hasOwn(official, 'distribution'), false);
 });

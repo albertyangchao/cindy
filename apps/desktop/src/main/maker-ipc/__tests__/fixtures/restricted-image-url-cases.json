@@ -1,0 +1,14 @@
+[
+  {"question":"Read https://docs.example.invalid/topic", "selected":[]},
+  {"question":"参考 http://docs.example.invalid/one https://docs.example.invalid/two https://docs.example.invalid/three", "selected":[]},
+  {"question":"描述这张图片，参考 https://docs.example.invalid/reference 图源 https://images.example.invalid/source.heic", "selected":["https://images.example.invalid/source.heic"]},
+  {"question":"Edit this image https://docs.example.invalid/reference https://images.example.invalid/source.png?size=large", "selected":["https://images.example.invalid/source.png?size=large"]},
+  {"question":"Describe this photo https://images.example.invalid/download?id=synthetic", "selected":["https://images.example.invalid/download?id=synthetic"]},
+  {"question":"Compare https://images.example.invalid/one.jpg and https://images.example.invalid/two.webp", "selected":["https://images.example.invalid/one.jpg","https://images.example.invalid/two.webp"]},
+  {"question":"描述图片 https://images.example.invalid/one https://docs.example.invalid/two", "denied":true},
+  {"question":"http://images.example.invalid/source.png", "denied":true},
+  {"question":"HTTPS://images.example.invalid/source.png", "denied":true},
+  {"question":"https://user:secret@images.example.invalid/source.png", "denied":true},
+  {"question":"https://127.0.0.1/source.png", "denied":true},
+  {"question":"https://images.example.invalid/a.png https://images.example.invalid/b.png https://images.example.invalid/c.png", "denied":true}
+]

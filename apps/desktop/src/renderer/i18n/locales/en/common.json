@@ -19474,5 +19474,15 @@
     "message": "Allow external input to {{partner}}?",
     "detail": "Only the selected partner persona and files you explicitly choose are available. Other task history, owner memory, credentials, network and general tools are not shared. This does not enable a messaging route.",
     "resources": "Choose read-only resources for this external subject"
+  },
+  "restrictedOwnerPublication": {
+    "registerTitle": "Confirm My iMessage Identity",
+    "registerMessage": "Register this iMessage identity for public HTML publication?",
+    "revokeTitle": "Revoke Public HTML Registration",
+    "revokeMessage": "Revoke public HTML publication for this iMessage identity?",
+    "scope": "Registration applies only to the shown identity and channel. Each publication still requires approval of the exact completed output and final artifact.",
+    "identityCheckbox": "This is my own iMessage identity. I reviewed the source and public target shown below.",
+    "registerButton": "Register My Identity",
+    "revokeButton": "Revoke Registration"
   }
 }

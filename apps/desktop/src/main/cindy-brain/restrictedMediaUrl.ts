@@ -2,6 +2,7 @@
 import { createHash } from 'node:crypto';
 import { guardedOutboundFetch } from '../maker-host/outbound-fetch.js';
 import { sniffMediaMime } from '../cindy-media/sniffMediaMime.js';
+import { sniffRestrictedInputImage } from './restrictedMediaImage.js';
 import type { MediaBinding, MediaPermit } from './restrictedMediaAdapter.js';
 export type MediaUrlRole = 'input' | 'output';
 export type MediaUrlGrant = {
@@ -118,7 +119,7 @@ export function createRestrictedMediaUrlLoader(ports: MediaUrlPorts) {
         if (part.done) break;
       }
       const bytes = Buffer.concat(chunks);
-      const mimeType = sniffMediaMime(bytes);
+      const mimeType = role === 'input' ? sniffRestrictedInputImage(bytes) : sniffMediaMime(bytes);
       if (!bytes.length || !mimeType?.startsWith('image/') || mimeType !== header) denied();
       current();
       const sha256 = sha(bytes);

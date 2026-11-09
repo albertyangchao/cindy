@@ -1,7 +1,9 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { InstalledGhost } from '../../../../shared/ghost.js';
 import { GhostRuntime, type SandboxHandle, type SandboxHostAdapter } from '../GhostRuntime.js';
+import { ResidentGhostRestart } from '../ResidentGhostRestart.js';
+import { spawnResidentGhost } from '../../residentGhost.js';
 
 /** 假沙箱:load 立即成功;可手动触发 gone(模拟进程崩溃)。 */
 class FakeHandle implements SandboxHandle {
@@ -186,6 +188,71 @@ describe('GhostRuntime · 状态机', () => {
     expect(onFused).not.toHaveBeenCalled();
   });
 
+  // W0 launch / PLAN 04: existing tests only sent gone while no replacement
+  // existed. A delayed callback must not crash the newly recovered resident.
+  // Production spawn/stop/gone, unit tier, no real timers or Electron process.
+  it('ignores an old sandbox gone callback after a replacement is running', async () => {
+    const { runtime, handles, onFused } = setup();
+    await runtime.spawn(chipGhost());
+    runtime.stop('demo');
+    await runtime.spawn(chipGhost());
+    handles[0].simulateGone();
+    expect(runtime.stateOf('demo')).toBe('running');
+    expect(handles[1].destroyed).toBe(false);
+    expect(onFused).not.toHaveBeenCalled();
+  });
+
+  it('explicit stop clears crashed state even when no sandbox handle remains', async () => {
+    const { runtime, handles } = setup();
+    await runtime.spawn(chipGhost());
+    handles[0].simulateGone();
+    expect(runtime.stateOf('demo')).toBe('crashed');
+    runtime.stop('demo');
+    expect(runtime.stateOf('demo')).toBe('off');
+    expect(runtime.canRestartCrashed(chipGhost())).toBe(false);
+  });
+
+  it.each(['stop', 'replace'] as const)('does not overwrite %s triggered while destroying a crashed handle', async action => {
+    const { runtime, handles, onFused } = setup();
+    await runtime.spawn(chipGhost());
+    handles[0].destroy = () => {
+      handles[0].destroyed = true;
+      runtime.stop('demo');
+      if (action === 'replace') void runtime.spawn(chipGhost());
+    };
+    handles[0].simulateGone();
+    await Promise.resolve();
+    expect(runtime.stateOf('demo')).toBe(action === 'replace' ? 'running' : 'off');
+    expect(onFused).not.toHaveBeenCalled();
+    if (action === 'replace') expect(handles[1].destroyed).toBe(false);
+  });
+
+  it('binds recovery to the failed installation even when adapter creation throws', async () => {
+    let blocked: string | null = null;
+    const runtime = new GhostRuntime({
+      adapter: { create: () => { throw new Error('create failed'); } },
+      startBlockedReason: () => blocked,
+    });
+    const ghost = chipGhost();
+    await runtime.spawn(ghost);
+    expect(runtime.canRestartCrashed(ghost)).toBe(true);
+    const updated = { ...ghost, approval: { state: 'approved' as const, revision: '00000000-0000-4000-8000-000000000002' } };
+    expect(runtime.canRestartCrashed(updated)).toBe(false);
+    blocked = 'restart required';
+    expect(runtime.canRestartCrashed(ghost)).toBe(false);
+  });
+
+  it('honors explicit stop by a starting-state observer before creating a sandbox', async () => {
+    const create = vi.fn(() => new FakeHandle());
+    const runtime = new GhostRuntime({
+      adapter: { create },
+      onStateChanged: (id, state) => { if (state === 'starting') runtime.stop(id); },
+    });
+    expect((await runtime.spawn(chipGhost())).ok).toBe(false);
+    expect(create).not.toHaveBeenCalled();
+    expect(runtime.stateOf('demo')).toBe('off');
+  });
+
   it('destroyAll 销毁全部沙箱并归 off', async () => {
     const { runtime, handles } = setup();
     await runtime.spawn(chipGhost('a'));
@@ -212,6 +279,76 @@ describe('GhostRuntime · 状态机', () => {
     runtime.stop('helper');
     expect(runtime.stateOf('helper')).toBe('off');
     expect(runtime.stateOf('_ns__acme__helper')).toBe('running');
+  });
+});
+
+// W0 launch 04 composition: exercise the production runtime, restart policy and
+// existing resident entry together. Main metadata lookup is the injected boundary;
+// no model/network/send is invoked. Unit tier; fake time; no duplicated runtime.
+describe('resident startup and crash recovery composition', () => {
+  beforeEach(() => { vi.useFakeTimers(); vi.setSystemTime(0); });
+  afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); });
+
+  function residentSetup(failCreate = false) {
+    const ghost = chipGhost();
+    ghost.manifest = { ...ghost.manifest, launch: 'resident' };
+    const handles: FakeHandle[] = [];
+    const create = vi.fn(() => {
+      if (failCreate) throw new Error('sandbox create failed');
+      const handle = new FakeHandle(); handles.push(handle); return handle;
+    });
+    let recovery: ResidentGhostRestart;
+    const runtime = new GhostRuntime({
+      adapter: { create },
+      onStateChanged: (id, state) => recovery.onStateChanged(id, state),
+    });
+    const start = () => spawnResidentGhost(ghost, {
+      isAvailable: () => true,
+      startNode: async () => undefined,
+      spawnBrowser: installed => runtime.spawn(installed),
+      warn: () => undefined,
+    });
+    recovery = new ResidentGhostRestart({
+      current: id => id === 'demo' && runtime.canRestartCrashed(ghost)
+        ? { identity: 'test-owner:1/install-a', restart: start }
+        : null,
+    });
+    return { runtime, create, handles, start };
+  }
+
+  it('retries actual create failures through resident startup and then preserves the runtime fuse', async () => {
+    const h = residentSetup(true); h.start();
+    expect(h.runtime.stateOf('demo')).toBe('crashed');
+    expect(h.create).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(999);
+    expect(h.create).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(h.create).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(h.create).toHaveBeenCalledTimes(3);
+    expect(h.runtime.stateOf('demo')).toBe('fused');
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(h.create).toHaveBeenCalledTimes(3);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('a real stop cancels backoff; a later explicit resident start can recover normally', async () => {
+    const h = residentSetup(); h.start();
+    await vi.advanceTimersByTimeAsync(0);
+    h.handles[0].simulateGone();
+    expect(h.runtime.stateOf('demo')).toBe('crashed');
+    h.runtime.stop('demo');
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(h.handles).toHaveLength(1);
+    expect(h.runtime.stateOf('demo')).toBe('off');
+    h.start();
+    await vi.advanceTimersByTimeAsync(0);
+    h.handles[1].simulateGone();
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(h.handles).toHaveLength(3);
+    expect(h.runtime.stateOf('demo')).toBe('running');
+    h.runtime.destroyAll();
+    expect(vi.getTimerCount()).toBe(0);
   });
 });
 

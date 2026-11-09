@@ -38,15 +38,15 @@ export async function approveNativePublicRelease(
           input.partnerId +
           '\nPrincipal: ' +
           input.principalId +
+          (input.sourceRoot ? '\nReviewed source root: ' + input.sourceRoot : '') +
+          (input.runtimeIdentity ? '\nReviewed renderer identity: ' + input.runtimeIdentity : '') +
           '\n\n' +
           input.output +
           (input.artifact
             ? '\n\nFinal stamped artifact SHA-256: ' +
               input.artifact.sha256 +
               '\nPublisher metadata binding SHA-256: ' +
-              input.artifact.publisherBindingSha256 +
-              '\nReviewed renderer identity: ' +
-              input.runtimeIdentity
+              input.artifact.publisherBindingSha256
             : ''),
         checkboxLabel:
           'I reviewed this exact output. It contains no private or child-personal material. I approve PUBLIC_RELEASE only.',

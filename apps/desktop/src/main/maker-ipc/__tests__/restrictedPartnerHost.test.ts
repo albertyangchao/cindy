@@ -11,6 +11,7 @@ import {
   type RestrictedPartnerHostDeps,
   createRestrictedPartnerHost,
 } from '../restrictedPartnerHost.js';
+import { restrictedPublicationLaunchEnvironment } from '../restrictedPublicationLaunch.js';
 function fixture(
   ready = true,
   mediaRoutes: Record<string, { providerId: string; modelId: string }> = {},
@@ -186,19 +187,80 @@ it('capabilities require a current verified native runtime and never infer readi
   }
 });
 
-it('binding reports current configured media permission; withdrawal cannot sign batch readiness', async () => {
+// Consumer contract: capabilities must project D2's deployment policy through
+// the actual restricted Host entry. Policy-only tests cannot catch a Host that
+// advertises publication merely because its adapter exists. Unit tier; the
+// minimal failure is a configured publisher with no deployment override.
+it('capabilities defer publication by default and expose its ABI only with deployment opt-in and a configured port', async () => {
+  const runtime = vi.fn(() => undefined);
+  const approve = vi.fn(async () => ({ approved: false, publicNonPersonal: false }));
+  const configured = fixture(true, {}, { publication: { runtime, approve } });
+  const absent = fixture(true);
+  try {
+    vi.stubEnv(restrictedPublicationLaunchEnvironment, undefined);
+    expect(await configured.call({ operation: 'capabilities' })).toMatchObject({
+      publicationLaunch: {
+        schema: 'restricted-publication-launch/v1', enabled: false, state: 'DEFERRED_POST_LAUNCH',
+        deferredGates: ['ci-producer', 'coverage', 'owner-registry', 'kb', 'os-owner-census'],
+      },
+      publicReleaseAuthority: false,
+    });
+    vi.stubEnv(restrictedPublicationLaunchEnvironment, 'true');
+    expect(await configured.call({ operation: 'capabilities' })).toMatchObject({
+      publicationLaunch: { enabled: true, state: 'ENABLED', deferredGates: [] },
+      publicReleaseAuthority: 'native-owner-action/v1',
+    });
+    expect(await absent.call({ operation: 'capabilities' })).toMatchObject({
+      publicationLaunch: { enabled: true }, publicReleaseAuthority: false,
+    });
+    vi.stubEnv(restrictedPublicationLaunchEnvironment, 'not-an-override');
+    await expect(configured.call({ operation: 'capabilities' })).rejects.toThrow('RESTRICTED_PUBLICATION_CONFIGURATION_INVALID');
+    expect(runtime).not.toHaveBeenCalled();
+    expect(approve).not.toHaveBeenCalled();
+    expect(configured.start).not.toHaveBeenCalled();
+    expect(configured.sqlite.prepare('SELECT count(*) n FROM plugin_task_requests').get()).toEqual({ n: 0 });
+  } finally {
+    vi.unstubAllEnvs();
+    configured.sqlite.close();
+    absent.sqlite.close();
+  }
+});
+
+// The public binding projection distinguishes absence from replacement while
+// keeping the original approval immutable. A provider substitution is the
+// minimal regression: boolean-only readiness did not tell the consumer why it
+// was denied. Existing producer tests do not read this Host ABI. Unit tier.
+it('binding distinguishes ready, missing and replaced media routes; only explicit reapproval adopts replacement', async () => {
   const f = fixture(true, { vision: { providerId: 'fake', modelId: 'vision' } });
   try {
     await f.call(bind);
     expect(await f.call({ operation: 'binding', principalId })).toMatchObject({
       media: { vision: true },
+      mediaAvailability: { vision: { state: 'READY' }, draw: { state: 'NOT_AUTHORIZED' } },
     });
     f.changeMedia({});
     expect(await f.call({ operation: 'binding', principalId })).toMatchObject({
       media: { vision: false },
+      mediaAvailability: { vision: { state: 'NOT_CONFIGURED' } },
       revision: 1,
       enabled: true,
     });
+    f.changeMedia({ vision: { providerId: 'replacement', modelId: 'other-vision' } });
+    expect(await f.call({ operation: 'binding', principalId })).toMatchObject({
+      media: { vision: false },
+      mediaAvailability: { vision: { state: 'REAPPROVAL_REQUIRED' } },
+      mediaRoutes: { vision: { providerId: 'fake', modelId: 'vision' } },
+      revision: 1,
+    });
+    await f.call({ ...bind, expectedRevision: 1 });
+    expect(await f.call({ operation: 'binding', principalId })).toMatchObject({
+      media: { vision: true },
+      mediaAvailability: { vision: { state: 'READY' } },
+      mediaRoutes: { vision: { providerId: 'replacement', modelId: 'other-vision' } },
+      revision: 2, dispatchEnabled: false,
+    });
+    expect(f.confirm).toHaveBeenCalledTimes(2);
+    expect(f.start).not.toHaveBeenCalled();
   } finally {
     f.sqlite.close();
   }
