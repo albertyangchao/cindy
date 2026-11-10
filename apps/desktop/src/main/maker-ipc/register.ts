@@ -15433,7 +15433,7 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     executionReady: async()=>{
       const status=getCachedBinaryStatus('codex');if(process.platform!=='darwin'||!status.binaryReady||!status.binaryPath)return false;
       const version=await (await import('../agent-binaries/binary-version-probe.js')).probeBinaryVersion(status.binaryPath);
-      const after=getCachedBinaryStatus('codex');return version==='0.166.0'&&after.binaryReady&&after.binaryPath===status.binaryPath;
+      const after=getCachedBinaryStatus('codex');return (version==='0.166.0'||version==='0.167.0')&&after.binaryReady&&after.binaryPath===status.binaryPath;
     },
     mediaConfiguration: async (id,current) => {current();const media=await import('./restrictedPartnerMedia.js');current();return media.restrictedMediaConfiguration(id,current);},
     prepare: async (grant, claim, route, current, assets) => {

@@ -5435,7 +5435,7 @@ assertRouteCurrent();
     );
     const capabilityRoutingProtocolSupported =
       supportsCodexCapabilityRoutingProtocol(initResp.userAgent);
-    if(restricted && (!codexUserAgentAtLeast(initResp.userAgent,[0,166,0]) || codexUserAgentAtLeast(initResp.userAgent,[0,166,1]))) {
+    if(restricted && (!codexUserAgentAtLeast(initResp.userAgent,[0,166,0]) || codexUserAgentAtLeast(initResp.userAgent,[0,167,1]))) {
       releaseHostBindingLeaseIfNeeded();
       throw new Error('RESTRICTED_PARTNER_NATIVE_VERSION_UNVERIFIED');
     }
