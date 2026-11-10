@@ -226,18 +226,24 @@ export function createRestrictedPartnerHost(deps: RestrictedPartnerHostDeps) {
       epochs.set(grantId, (epochs.get(grantId) ?? 0) + 1);
       revisions.delete(grantId); // Invalidate old execution before the first async owner dialog/CAS.
       try {
+        const step = (name: string) => console.warn('[restricted-partner-bind] step', name);
+        step('candidates');
         const partners = await deps.candidates();
         current();
         const partner = partners.find((p) => p.id === a.partnerId);
-        if (!partner) return fail('TARGET_UNAVAILABLE');
+        if (!partner) { step('candidate-missing:' + partners.length); return fail('TARGET_UNAVAILABLE'); }
         const old = await store.readGrant(pluginId, grantId);
         current();
         if ((old?.revision ?? 0) !== a.expectedRevision) return fail('STALE_REVISION');
+        step('profile');
         const profile = await deps.partner(partner.id);
-        if (profile.persona.length > 16000) return fail('TARGET_UNAVAILABLE');
+        if (profile.persona.length > 16000) { step('persona-too-long'); return fail('TARGET_UNAVAILABLE'); }
         current();
+        step('media');
         const media = await deps.mediaConfiguration?.(partner.id, current);
+        step('model');
         const modelRoute = await deps.modelConfiguration?.(partner.id, current);
+        step('confirm');
         current();
         current();
         const decision = await deps.confirm({
@@ -330,6 +336,9 @@ export function createRestrictedPartnerHost(deps: RestrictedPartnerHostDeps) {
         current();
         revisions.set(grantId, grant.revision);
         return safeGrant(grant, true, deps.research === true);
+      } catch (error) {
+        console.warn('[restricted-partner-bind] failed', error instanceof Error ? error.message : String(error));
+        throw error;
       } finally {
         binding.delete(grantId);
       }
