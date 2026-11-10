@@ -19989,6 +19989,11 @@
     "revokeButton": "Révoquer l’Inscription"
   },
   "restrictedPartner": {
+    "projectTitle": "允许伙伴访问项目目录",
+    "projectMessage": "允许“{{partner}}”访问此主体的项目目录？",
+    "projectDetail": "主体：{{principal}}\n项目目录：{{directory}}\n只读访问。伙伴使用新的主体记忆，不导入旧资料。",
+    "projectAllow": "允许",
+    "projectCancel": "取消",
     "originalSourceRoot": "Sélectionner la racine de la source d’origine de ce sujet",
     "fixedMemoryDirectory": "Sélectionner le répertoire d’origine PROFILE / MEMORY / INTERESTS",
     "originalAbsenceTitle": "Vérifier les preuves d’absence d’origine",

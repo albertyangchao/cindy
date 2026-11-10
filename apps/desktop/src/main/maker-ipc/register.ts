@@ -15575,6 +15575,8 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     confirm: async input => {
       const win=getDeepLinkMainWindow();
       if(!win || win.isDestroyed() || !isTrustedAppRendererWindow(win))return {approved:false,paths:[]};
+      if(input.projectDir)return (await import('./restrictedPartnerProjectDirectory.js')).confirmRestrictedPartnerProjectDirectory(
+        {...input,projectDir:input.projectDir},t,options=>dialog.showMessageBox(win,options));
       const result=await dialog.showMessageBox(win,{type:'question',title:t('restrictedPartner.title'),
         message:t('restrictedPartner.message').replace('{{partner}}',input.label),
         detail:t('restrictedPartner.detail')+'\nScoped channel history, subject memory CAS, approved resource readers and available configured Core media routes only. No shell or unscoped integrations.\n'+JSON.stringify({media:input.mediaRoutes??{},model:input.modelRoute??null})+'\n'+'\n\n'+(getInstalledGhostName(input.pluginId)??input.pluginId)+' / '+input.principalId,buttons:[t('pluginCompanionAnswer.allow'),t('pluginCompanionAnswer.cancel')],defaultId:1,cancelId:1});

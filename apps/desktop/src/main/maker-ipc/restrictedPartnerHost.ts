@@ -19,6 +19,7 @@ import {
   type PartnerRequirements,
 } from './restrictedPartnerRequirements.js';
 import { promises as fs } from 'node:fs';
+import path from 'node:path';
 import { restrictedPartnerResources } from './restrictedPartnerResources.js';
 import { createHash } from 'node:crypto';
 import type { AgentSessionHandle, StartSessionOptions } from '@cindy/maker-core';
@@ -71,6 +72,7 @@ export interface RestrictedPartnerHostDeps {
     partnerId: string;
     label: string;
     chooseResources: boolean;
+    projectDir?: string;
     mediaRoutes?: RestrictedPartnerGrant['media'];
     modelRoute?: RestrictedPartnerGrant['modelRoute'];
     requirements?: PartnerRequirements;
@@ -208,6 +210,7 @@ export function createRestrictedPartnerHost(deps: RestrictedPartnerHostDeps) {
               'partnerId',
               'expectedRevision',
               'chooseResources',
+              'projectDir',
               'requirements',
             ].includes(k),
         ) ||
@@ -220,6 +223,16 @@ export function createRestrictedPartnerHost(deps: RestrictedPartnerHostDeps) {
       if (a.requirements !== undefined) {
         validateRequirements(a.requirements);
         if (a.requirements.principalId !== principalId) return fail('INVALID_PARAMS');
+      }
+      let projectDir: string | undefined;
+      if (a.projectDir !== undefined) {
+        if (typeof a.projectDir !== 'string' || !path.isAbsolute(a.projectDir) || a.projectDir.includes('\0')) return fail('INVALID_PARAMS');
+        if ((a.requirements as PartnerRequirements | undefined)?.sourceInventory) return fail('INVALID_PARAMS');
+        try {
+          projectDir = await fs.realpath(a.projectDir);
+          if (!(await fs.stat(projectDir)).isDirectory()) return fail('RESTRICTED_PARTNER_PROJECT_DIRECTORY_INVALID');
+        } catch { return fail('RESTRICTED_PARTNER_PROJECT_DIRECTORY_INVALID'); }
+        current();
       }
       if (binding.has(grantId)) return fail('TASK_BUSY');
       binding.add(grantId);
@@ -252,6 +265,7 @@ export function createRestrictedPartnerHost(deps: RestrictedPartnerHostDeps) {
           partnerId: partner.id,
           label: partner.label,
           chooseResources: a.chooseResources === true,
+          ...(projectDir ? { projectDir } : {}),
           mediaRoutes: media?.routes,
           modelRoute,
           requirements: a.requirements as PartnerRequirements | undefined,

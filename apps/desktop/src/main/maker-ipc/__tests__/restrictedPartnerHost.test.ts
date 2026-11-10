@@ -1,4 +1,4 @@
-import { mkdtemp, realpath, mkdir, rm } from 'node:fs/promises';
+import { mkdtemp, realpath, mkdir, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
@@ -11,6 +11,7 @@ import {
   type RestrictedPartnerHostDeps,
   createRestrictedPartnerHost,
 } from '../restrictedPartnerHost.js';
+import { confirmRestrictedPartnerProjectDirectory } from '../restrictedPartnerProjectDirectory.js';
 import { restrictedPublicationLaunchEnvironment } from '../restrictedPublicationLaunch.js';
 function fixture(
   ready = true,
@@ -454,4 +455,34 @@ it('real binding approves proven original absence with durable facts; later sour
     f.sqlite.close();
     source.cleanup();
   }
+});
+
+// owner-simple-bind: unit; existing binds did not cover a supplied directory or
+// pre-dialog validation. The public bind entry must canonicalize the sole grant
+// and reject missing/non-directory paths without asking the owner.
+it('binds an existing project directory through one owner confirmation', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'restricted-project-'));
+  const showMessageBox=vi.fn(async()=>({response:0}));
+  const confirm = vi.fn((input: Parameters<RestrictedPartnerHostDeps['confirm']>[0]) =>
+    confirmRestrictedPartnerProjectDirectory({...input,projectDir:input.projectDir!},key=>key,showMessageBox));
+  const f = fixture(true, {}, { confirm });
+  try {
+    const g = await f.call({operation:'bind',principalId:'subject',partnerId:'bot_real',expectedRevision:0,projectDir:dir});
+    expect(g.resourceCount).toBe(1);
+    expect(confirm).toHaveBeenCalledTimes(1);
+    expect(showMessageBox).toHaveBeenCalledTimes(1);
+    expect(showMessageBox.mock.calls[0]).toBeDefined();
+    expect(confirm.mock.calls[0][0].projectDir).toBe(await realpath(dir));
+  } finally { f.sqlite.close(); await rm(dir, {recursive:true,force:true}); }
+});
+it('rejects unavailable and non-directory project paths before owner confirmation', async () => {
+  const dir=await mkdtemp(path.join(tmpdir(),'restricted-project-invalid-'));
+  const file=path.join(dir,'file');await writeFile(file,'synthetic');
+  const f = fixture();
+  try {
+    for(const projectDir of [path.join(dir,'missing'),file]){
+      await expect(f.call({operation:'bind',principalId:'subject',partnerId:'bot_real',expectedRevision:0,projectDir})).rejects.toThrow('RESTRICTED_PARTNER_PROJECT_DIRECTORY_INVALID');
+    }
+    expect(f.confirm).not.toHaveBeenCalled();
+  } finally { f.sqlite.close();await rm(dir,{recursive:true,force:true}); }
 });

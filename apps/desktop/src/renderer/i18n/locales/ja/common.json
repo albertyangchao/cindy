@@ -19730,6 +19730,11 @@
     "revokeButton": "登録を取り消す"
   },
   "restrictedPartner": {
+    "projectTitle": "允许伙伴访问项目目录",
+    "projectMessage": "允许“{{partner}}”访问此主体的项目目录？",
+    "projectDetail": "主体：{{principal}}\n项目目录：{{directory}}\n只读访问。伙伴使用新的主体记忆，不导入旧资料。",
+    "projectAllow": "允许",
+    "projectCancel": "取消",
     "originalSourceRoot": "この対象の元のソースルートを選択",
     "fixedMemoryDirectory": "元の PROFILE / MEMORY / INTERESTS ディレクトリを選択",
     "originalAbsenceTitle": "元の不存在証拠を確認",

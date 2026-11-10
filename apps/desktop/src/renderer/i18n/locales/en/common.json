@@ -19792,6 +19792,11 @@
     "failed": "Could not prepare the diagnosis. Please try again."
   },
   "restrictedPartner": {
+    "projectTitle": "允许伙伴访问项目目录",
+    "projectMessage": "允许“{{partner}}”访问此主体的项目目录？",
+    "projectDetail": "主体：{{principal}}\n项目目录：{{directory}}\n只读访问。伙伴使用新的主体记忆，不导入旧资料。",
+    "projectAllow": "允许",
+    "projectCancel": "取消",
     "originalSourceRoot": "Select this subject’s original source root",
     "fixedMemoryDirectory": "Select the original PROFILE / MEMORY / INTERESTS directory",
     "originalAbsenceTitle": "Review original absence evidence",
