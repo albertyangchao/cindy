@@ -17,6 +17,12 @@ import { ensureSystemBinPathForMachineId } from './deviceId.js';
 import { configureLinuxPasswordStore } from './linuxPasswordStore.js';
 import { recognizeLinuxUserInstallation, linuxUserDesktopName } from './linuxInstallation.js';
 import { prepareCindyVersionStartup, dispatchCindyVersionStartup } from './cindy-make/versionStartup.js';
+import { restoreInheritedClaudeCliProxyEnv } from './maker-host/claudeCliProxyEnvironment.js';
+
+// A CLI-launched replacement must not inherit the retiring host's CONNECT
+// bridge. Restore its original proxy environment before startup can spawn or
+// resolve outbound requests; explicit user proxy settings remain untouched.
+restoreInheritedClaudeCliProxyEnv();
 
 if (process.platform === 'linux' && app.isPackaged) {
   const installation = recognizeLinuxUserInstallation(app.getPath('exe'), os.homedir(), process.getuid?.() ?? -1);

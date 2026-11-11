@@ -23,6 +23,7 @@ import { getReadyBinaryPath } from '../agent-binaries/index.js';
 import { createLogger } from '../logger.js';
 import { resolveDesktopOutboundProxy } from './outbound-proxy-resolver.js';
 import { ensureClaudeCliProxyBridge } from './claude-cli-proxy-bridge.js';
+import { buildClaudeCliProxyEnv } from './claudeCliProxyEnvironment.js';
 import { readClaudeCliStatusInWorker } from './claudeCliStatusWorkerClient.js';
 import {
   isClaudeCliLoginStatusFresh,
@@ -49,8 +50,6 @@ const STATUS_TIMEOUT_MS = 10_000;
 const STATUS_FAILURE_BACKOFF_MS = 30_000;
 const LOGIN_TIMEOUT_MS = 5 * 60 * 1000;
 const ANTHROPIC_API_ORIGIN = 'https://api.anthropic.com';
-
-const LOOPBACK_NO_PROXY = 'localhost,127.0.0.1,::1';
 
 /**
  * 让 CLI 走用户的代理。CLI 只认 HTTPS_PROXY 环境变量、不读系统代理 / PAC,也不支持
@@ -85,8 +84,7 @@ export async function claudeCliNetworkEnv(): Promise<Record<string, string>> {
   } catch {
     return {};
   }
-  const noProxy: Record<string, string> = fromEnv ? {} : { NO_PROXY: LOOPBACK_NO_PROXY, no_proxy: LOOPBACK_NO_PROXY };
-  return { HTTPS_PROXY: bridge, https_proxy: bridge, ...noProxy };
+  return buildClaudeCliProxyEnv(bridge, !fromEnv);
 }
 
 function cliBinaryPath(): string | null {

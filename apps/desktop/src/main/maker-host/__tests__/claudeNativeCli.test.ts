@@ -3,6 +3,9 @@
  * CLI 子进程用假 child 代替;代理解析与 SOCKS 桥 mock 掉。
  */
 import { EventEmitter } from 'node:events';
+import {
+  buildClaudeCliProxyEnv, CLAUDE_CLI_PROXY_CONTEXT_ENV, restoreInheritedClaudeCliProxyEnv,
+} from '../claudeCliProxyEnvironment.js';
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -155,6 +158,119 @@ describe('parseClaudeCliLoginStatus', () => {
 });
 
 describe('claudeCliNetworkEnv', () => {
+  // Test value (unit): exercise the real CLI env builder and Desktop startup
+  // restoration, protecting the 0.1.133 descendant-launch failure. Existing
+  // cases only cover CLI traffic, not a replacement host inheriting its bridge.
+  it('carries the parent proxy environment when a CLI descendant launches Cindy', async () => {
+    const original = 'socks5://proxy.example.test:1080';
+    vi.stubEnv('HTTPS_PROXY', original);
+    // Windows aliases share one native environment entry.
+    if (process.platform !== 'win32') vi.stubEnv('https_proxy', undefined);
+    vi.stubEnv('NO_PROXY', '.example.test');
+    try {
+      h.envProxy = true;
+      h.resolved = original;
+      const childEnv = await claudeCliNetworkEnv();
+      expect(process.env.HTTPS_PROXY).toBe(original);
+      expect(process.env.https_proxy).toBe(process.platform === 'win32' ? original : undefined);
+      expect(childEnv[CLAUDE_CLI_PROXY_CONTEXT_ENV]).toEqual(expect.any(String));
+      const relaunched: NodeJS.ProcessEnv = {
+        HTTPS_PROXY: original, NO_PROXY: '.example.test', ...childEnv,
+      };
+      restoreInheritedClaudeCliProxyEnv(relaunched);
+      expect(relaunched.HTTPS_PROXY).toBe(original);
+      expect(relaunched.https_proxy).toBe(process.platform === 'win32' ? original : undefined);
+      expect(relaunched.NO_PROXY).toBe('.example.test');
+      expect(relaunched[CLAUDE_CLI_PROXY_CONTEXT_ENV]).toBeUndefined();
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it('retains the original route across multiple generations of CLI bridge environments', () => {
+    const original = { HTTPS_PROXY: 'socks5://original.example.test:1080', NO_PROXY: '.original.test' };
+    const first = { ...original, ...buildClaudeCliProxyEnv('http://127.0.0.1:5555', true, original, 'darwin') };
+    const second = { ...first, ...buildClaudeCliProxyEnv('http://127.0.0.1:5556', true, first, 'darwin') };
+    restoreInheritedClaudeCliProxyEnv(second);
+    expect(second).toEqual(original);
+    expect(first.HTTPS_PROXY).toBe('http://127.0.0.1:5555');
+  });
+
+  it('restores POSIX system proxy selection and original exclusions without mutating the parent', () => {
+    const parent = { PATH: '/fixture/bin', NO_PROXY: '.internal.test', no_proxy: '' };
+    const child = { ...parent, ...buildClaudeCliProxyEnv('http://127.0.0.1:5555', true, parent, 'darwin') };
+    expect(parent).toEqual({ PATH: '/fixture/bin', NO_PROXY: '.internal.test', no_proxy: '' });
+    restoreInheritedClaudeCliProxyEnv(child);
+    expect(child).toEqual(parent);
+    // Repeated startup normalization is harmless.
+    restoreInheritedClaudeCliProxyEnv(child);
+    expect(child).toEqual(parent);
+  });
+
+  it.each([
+    ['https_proxy', 'http://explicit-proxy.example.test:8080', 'HTTPS_PROXY'],
+    ['no_proxy', '.explicit.example.test', 'NO_PROXY'],
+  ] as const)('keeps a downstream %s choice without reviving its shadowing alias', (key, choice, alias) => {
+    const parent = { HTTPS_PROXY: 'socks5://parent.example.test:1080', NO_PROXY: '.parent.test' };
+    const child: NodeJS.ProcessEnv = {
+      ...parent,
+      ...buildClaudeCliProxyEnv('http://127.0.0.1:5555', true, parent),
+      [key]: choice,
+    };
+    restoreInheritedClaudeCliProxyEnv(child);
+    expect(child[key]).toBe(choice);
+    expect(child[alias]).toBeUndefined();
+    expect(child[CLAUDE_CLI_PROXY_CONTEXT_ENV]).toBeUndefined();
+  });
+
+  it.each(['HTTPS_PROXY', 'https_proxy', 'Https_Proxy'])(
+    'preserves a Windows parent using the %s spelling after native alias folding',
+    (key) => {
+      const original = 'socks5://windows-parent.example.test:1080';
+      const parent = { [key]: original };
+      const patch = buildClaudeCliProxyEnv('http://127.0.0.1:5555', false, parent, 'win32');
+      // Windows forwards one key per case-insensitive name, sorted as Node's
+      // spawn env serializer does. No host path/platform behavior is mocked.
+      const child: NodeJS.ProcessEnv = {};
+      const seen = new Set<string>();
+      const merged = { ...parent, ...patch };
+      for (const name of Object.keys(merged).sort()) {
+        if (seen.has(name.toUpperCase())) continue;
+        seen.add(name.toUpperCase());
+        child[name] = merged[name];
+      }
+      restoreInheritedClaudeCliProxyEnv(child);
+      expect(child.https_proxy ?? child.HTTPS_PROXY).toBe(original);
+    },
+  );
+
+  it('preserves an unmarked user proxy even when it points at a retired loopback port', () => {
+    const explicit = { HTTPS_PROXY: 'http://127.0.0.1:53627', NO_PROXY: '.internal.test' };
+    const env = { ...explicit };
+    restoreInheritedClaudeCliProxyEnv(env);
+    expect(env).toEqual(explicit);
+  });
+
+  it.each([
+    ['malformed JSON', '{'],
+    ['future context', JSON.stringify({ version: 2, overrides: [] })],
+    ['foreign env key', JSON.stringify({ version: 1, overrides: [
+      { key: 'HTTPS_PROXY', injected: 'http://127.0.0.1:5555', previous: null },
+      { key: 'PATH', injected: '/fixture/bin', previous: '/other' },
+    ] })],
+    ['non-bridge proxy', JSON.stringify({ version: 1, overrides: [
+      { key: 'HTTPS_PROXY', injected: 'http://proxy.example.test:5555', previous: null },
+      { key: 'https_proxy', injected: 'http://proxy.example.test:5555', previous: null },
+    ] })],
+  ])('leaves routing unchanged for %s metadata', (_label, context) => {
+    const env: NodeJS.ProcessEnv = {
+      HTTPS_PROXY: 'http://127.0.0.1:5555', PATH: '/fixture/bin',
+      [CLAUDE_CLI_PROXY_CONTEXT_ENV]: context,
+    };
+    restoreInheritedClaudeCliProxyEnv(env);
+    expect(env).toEqual({ HTTPS_PROXY: 'http://127.0.0.1:5555', PATH: '/fixture/bin' });
+  });
+
   it('代理 env 已给出 HTTP 代理:不动,子进程直接继承', async () => {
     h.envProxy = true;
     h.resolved = 'http://127.0.0.1:7890';
@@ -170,6 +286,7 @@ describe('claudeCliNetworkEnv', () => {
     await expect(claudeCliNetworkEnv()).resolves.toEqual({
       HTTPS_PROXY: 'http://127.0.0.1:5555',
       https_proxy: 'http://127.0.0.1:5555',
+      [CLAUDE_CLI_PROXY_CONTEXT_ENV]: expect.any(String),
       NO_PROXY: 'localhost,127.0.0.1,::1',
       no_proxy: 'localhost,127.0.0.1,::1',
     });
@@ -183,6 +300,7 @@ describe('claudeCliNetworkEnv', () => {
     await expect(claudeCliNetworkEnv()).resolves.toEqual({
       HTTPS_PROXY: 'http://127.0.0.1:5555',
       https_proxy: 'http://127.0.0.1:5555',
+      [CLAUDE_CLI_PROXY_CONTEXT_ENV]: expect.any(String),
     });
   });
 
