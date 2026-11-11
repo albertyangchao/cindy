@@ -189,16 +189,16 @@ describe('claudeCliNetworkEnv', () => {
 
   it('retains the original route across multiple generations of CLI bridge environments', () => {
     const original = { HTTPS_PROXY: 'socks5://original.example.test:1080', NO_PROXY: '.original.test' };
-    const first = { ...original, ...buildClaudeCliProxyEnv('http://127.0.0.1:5555', true, original) };
-    const second = { ...first, ...buildClaudeCliProxyEnv('http://127.0.0.1:5556', true, first) };
+    const first = { ...original, ...buildClaudeCliProxyEnv('http://127.0.0.1:5555', true, original, 'darwin') };
+    const second = { ...first, ...buildClaudeCliProxyEnv('http://127.0.0.1:5556', true, first, 'darwin') };
     restoreInheritedClaudeCliProxyEnv(second);
     expect(second).toEqual(original);
     expect(first.HTTPS_PROXY).toBe('http://127.0.0.1:5555');
   });
 
-  it('restores system proxy selection and original exclusions without mutating the parent', () => {
+  it('restores POSIX system proxy selection and original exclusions without mutating the parent', () => {
     const parent = { PATH: '/fixture/bin', NO_PROXY: '.internal.test', no_proxy: '' };
-    const child = { ...parent, ...buildClaudeCliProxyEnv('http://127.0.0.1:5555', true, parent) };
+    const child = { ...parent, ...buildClaudeCliProxyEnv('http://127.0.0.1:5555', true, parent, 'darwin') };
     expect(parent).toEqual({ PATH: '/fixture/bin', NO_PROXY: '.internal.test', no_proxy: '' });
     restoreInheritedClaudeCliProxyEnv(child);
     expect(child).toEqual(parent);
