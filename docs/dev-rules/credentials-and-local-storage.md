@@ -90,6 +90,14 @@ Claude.ai 登录，也不得收集、存储或中转订阅凭证。Cindy 因此�
   端口，它对每个目标重新按系统代理 / PAC 决定直连或走代理（env 作用于整棵进程树，含 Bash
   工具里的 git / npm，内网例外必须照旧直连），明文 HTTP 不下发代理。都是 TCP 隧道，TLS
   端到端，代理、转发端口与 Cindy 都看不到凭证。
+  CLI 代理覆盖同时携带仅含被覆盖键及原值的进程环境上下文；经 CLI 工具启动的新 Cindy
+  在最早启动阶段只恢复仍匹配本应用注入值的键，再按原用户环境或系统代理解析出口，
+  不沿用即将退出的旧实例 CONNECT 端口。子进程后来显式修改的代理保留，且不会恢复
+  可能遮蔽它的另一大小写别名；未带有效上下文的用户代理即使不可达也不自动清除。
+  上下文可能含代理认证信息，只在子进程环境中传递，不记录或持久化；不探测端口、
+  不硬编码代理端口、不新增失败后 DIRECT 降级。见
+  [claudeCliProxyEnvironment.ts](../../apps/desktop/src/main/maker-host/claudeCliProxyEnvironment.ts)
+  及 claudeNativeCli 回归。
 - 订阅会话不设 host 接管标记，并保留 `claude-desktop` 入口，
   CLI 会启用 Desktop 宿主的项目级上游 / 鉴权环境过滤。OAuth token 路径同样保留该入口
   的刷新回调白名单；API Key 路径使用 SDK 原生 `sdk-ts`，避免 Individual API 额度被
