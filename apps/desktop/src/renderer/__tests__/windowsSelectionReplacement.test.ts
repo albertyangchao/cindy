@@ -127,6 +127,21 @@ describe('Windows chat composer selection replacement', () => {
     expect(getState()).toBe(initial);
   });
 
+  it('leaves dictation rewrites in a plain paragraph on the native editing path', () => {
+    const doc = schema.nodes.doc.create(null, [
+      schema.nodes.paragraph.create(null, schema.text('今天天气')),
+    ]);
+    const initial = EditorState.create({ schema, doc });
+    const state = initial.apply(initial.tr.setSelection(TextSelection.atEnd(doc)));
+    const { view, getState } = makeView(state);
+
+    for (const event of [inputEvent('', 'deleteContentBackward'), inputEvent('晴')]) {
+      expect(handleWindowsSelectedTextInput(view, event)).toBe(false);
+      expect(event.preventDefault).not.toHaveBeenCalled();
+    }
+    expect(getState()).toBe(state);
+  });
+
   it('leaves native input alone when there is no inserted text', () => {
     const selected = selectedPrefixState('hardBreak');
     const collapsed = selected.apply(

@@ -19,14 +19,24 @@ interface WindowsSelectionReplacementOptions {
  */
 export function handleWindowsSelectedTextInput(view: EditorView, event: InputEvent): boolean {
   const { selection } = view.state;
+  const { $from } = selection;
   const isSupportedInput =
     event.inputType === 'insertText' ||
     (event.inputType === 'insertReplacementText' && !selection.empty);
+  // Keep ordinary caret input on the same native path as Backspace. Windows
+  // dictation can rewrite a sentence with a burst of alternating deletes and
+  // inserts, without marking either event as composition.
+  const isPlainParagraphCaret =
+    selection.empty &&
+    view.state.doc.childCount === 1 &&
+    $from.parent.type.name === 'paragraph' &&
+    $from.parent.content.size === $from.parent.textContent.length;
   if (
     view.composing ||
     event.isComposing ||
     !event.cancelable ||
     !isSupportedInput ||
+    isPlainParagraphCaret ||
     event.data == null ||
     event.data.length === 0
   ) {
