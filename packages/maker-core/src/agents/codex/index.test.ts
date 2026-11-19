@@ -5512,10 +5512,78 @@ describe('CodexAgent.listCustomizations', () => {
 });
 
 describe('CodexAgent.refreshLocalModels', () => {
+  // Unit regression: explicit OAuth refresh must bypass a hung/bundled native picker.
+  it.each([undefined, 'openai', ACCOUNT_PROVIDER_ID])('reads the selected OAuth account without starting app-server (%s)', async providerId => {
+    MockCodexTransport.dropModelList = true;
+    const refreshCodexLocalModels = vi.fn().mockResolvedValue(true);
+    const agent = new CodexAgent(createDeps({}, { refreshCodexLocalModels,
+      isCodexAccountProvider: id => id === ACCOUNT_PROVIDER_ID }));
+    await expect(agent.refreshLocalModels({ credentialMode: 'oauth-bearer', providerId })).resolves.toBe(true);
+    expect(refreshCodexLocalModels.mock.calls[0][0]).toEqual({ providerId });
+    expect(createdTransports).toHaveLength(0);
+    await agent.dispose();
+  });
+
+  // Unit: an older HTTP response cannot overwrite a newer refresh of the same account.
+  it('revokes publication from an earlier overlapping account refresh', async () => {
+    const releases: Array<() => void> = [];
+    const published: number[] = [];
+    let sequence = 0;
+    const agent = new CodexAgent(createDeps({}, { refreshCodexLocalModels: async (_options, guard) => {
+      const own = ++sequence;
+      await new Promise<void>(resolve => { releases.push(resolve); });
+      if (!guard.isCurrent()) return false;
+      published.push(own);
+      return true;
+    } }));
+    const first = agent.refreshLocalModels({ credentialMode: 'oauth-bearer' });
+    const second = agent.refreshLocalModels({ credentialMode: 'oauth-bearer' });
+    releases[1]();
+    await expect(second).resolves.toBe(true);
+    releases[0]();
+    await expect(first).resolves.toBe(false);
+    expect(published).toEqual([2]);
+    expect(createdTransports).toHaveLength(0);
+    await agent.dispose();
+  });
+
+  // Unit: timeout/dispose invalidates publication even if the host ignores cancellation.
+  it.each(['timeout', 'dispose'])('rejects late account discovery after %s and allows a fresh refresh', async reason => {
+    vi.useFakeTimers();
+    try {
+      let release!: () => void;
+      let published = 0;
+      let guard!: { signal: AbortSignal; isCurrent(): boolean };
+      const refreshCodexLocalModels = vi.fn<NonNullable<AgentDeps['refreshCodexLocalModels']>>(async (_options, context) => {
+        guard = context;
+        await new Promise<void>(resolve => { release = resolve; });
+        if (!context.isCurrent()) return false;
+        published++;
+        return true;
+      });
+      const agent = new CodexAgent(createDeps({}, { refreshCodexLocalModels }));
+      const pending = agent.refreshLocalModels({ credentialMode: 'oauth-bearer' });
+      const rejected = expect(pending).rejects.toThrow(reason === 'timeout' ? 'model refresh timed out' : 'dispose');
+      if (reason === 'timeout') await vi.advanceTimersByTimeAsync(20_000);
+      else await agent.dispose();
+      await rejected;
+      expect(guard.signal.aborted).toBe(true);
+      expect(guard.isCurrent()).toBe(false);
+      release();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(published).toBe(0);
+      refreshCodexLocalModels.mockResolvedValueOnce(false);
+      await expect(agent.refreshLocalModels({ credentialMode: 'oauth-bearer' })).resolves.toBe(false);
+      expect(createdTransports).toHaveLength(0);
+      await agent.dispose();
+    } finally { vi.useRealTimers(); }
+  });
+
   it('delivers API capabilities only to the requesting callback and keeps OAuth discovery separate', async () => {
     const publishOAuth = vi.fn();
     const publishApi = vi.fn();
-    const agent = new CodexAgent(createDeps({}, { onCodexLocalModelsListed: publishOAuth }));
+    const agent = new CodexAgent(createDeps({}, { onCodexLocalModelsListed: publishOAuth,
+      refreshCodexLocalModels: () => { throw new Error('API must not read subscription models'); } }));
     (agent as any).codexHome = '/subscription-history';
     const host = installFakeHost(agent, method => method === Method.ModelList
       ? { data: [{ id: 'gpt-6.1-sol', model: 'gpt-6.1-sol' }], nextCursor: null } : undefined,

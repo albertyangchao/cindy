@@ -23,6 +23,8 @@ import {
 } from '../custom-provider-store.js';
 import { buildUserProvider, mergeDiscoveredRuntimeModels, parseModelsListResponse,
   type CustomProviderConfig } from '@cindy/model-providers';
+import { createCodexLocalModelSink } from '../codexLocalModelSink.js';
+import { fetchCodexAccountModels } from '../codex-account-model-fetch.js';
 import { mapCodexAppServerModelsToCatalog } from '../codex-model-discovery.js';
 
 const CREATE_SQL = `
@@ -77,6 +79,50 @@ afterEach(() => {
   raw?.close();
   client = null;
   raw = null;
+});
+
+// Standard: real selected-provider HTTP -> sink -> database -> public catalog projection.
+describe('native account discovery publication', () => {
+  it('preserves new model facts, keeps last success on failure and accepts explicit empty membership', async () => {
+    mountDb();
+    const config: CustomProviderConfig = { id: 'openai-discovery', name: 'Selected',
+      auth: { method: 'oauth', native: 'codex' }, runtimes: { codex: {
+        baseUrl: 'https://chatgpt.com/backend-api/codex', models: [{ id: 'old-model', name: 'Old' }],
+      } } };
+    await createCustomProvider(config);
+    let payload: unknown = { models: [{ slug: 'new-model', visibility: 'list', supported_in_api: true,
+      context_window: 400000, max_context_window: 1000000, input_modalities: ['image'], additional_speed_tiers: ['fast', 'ultrafast'] }] };
+    const refreshed = vi.fn(async () => {});
+    const sink = createCodexLocalModelSink(refreshed, async (providerId, guard) => {
+      expect(providerId).toBe(config.id);
+      const result = await fetchCodexAccountModels({ accessToken: 'fixture', accountId: 'fixture', clientVersion: '1',
+        ...guard, fetch: async () => Response.json(payload) });
+      return { models: result.data, isCurrent: () => true };
+    });
+    const guard = { signal: new AbortController().signal, isCurrent: () => true };
+    expect(await sink({ providerId: config.id }, guard)).toBe(true);
+    const row = (await getCustomProvider(config.id))!;
+    expect(buildUserProvider(row).models.codex![0]).toMatchObject({ id: 'new-model', contextWindow: 400000,
+      contextWindowMax: 1000000, supportsImageInput: true, supportsFastMode: true, supportsUltrafastMode: true });
+    payload = { models: [{ slug: 'broken-member' }] };
+    await expect(sink({ providerId: config.id }, guard)).rejects.toThrow('discovery failed');
+    expect((await getCustomProvider(config.id))!.runtimes.codex!.models.map(m => m.id)).toEqual(['new-model']);
+    payload = { models: [] };
+    expect(await sink({ providerId: config.id }, guard)).toBe(true);
+    expect((await getCustomProvider(config.id))!.runtimes.codex!.models).toEqual([]);
+    expect(refreshed).toHaveBeenCalledTimes(2);
+  });
+
+  it('rechecks the credential after the database SELECT before starting the update', async () => {
+    mountDb();
+    await createCustomProvider(valid);
+    const before = (await getCustomProvider(valid.id))!;
+    let current = true;
+    queueMicrotask(() => { current = false; });
+    expect(await updateCustomProviderIfUnchanged(valid.id, before, { ...before, name: 'stale credential' }, 1000,
+      () => current)).toBe(false);
+    expect((await getCustomProvider(valid.id))!.name).toBe(before.name);
+  });
 });
 
 describe('custom provider updates through the runtime database proxy', () => {

@@ -2313,8 +2313,8 @@ export function setDiscoveredCodexModels(
   models: CatalogModel[],
   options: { source?: 'cache' | 'list' } = {},
 ): void {
-  // model/list owns current membership, ordering and effort/speed tiers, but does
-  // not report windows or image inputs. Preserve only those metadata fields for
+  // Account HTTP owns membership and explicit capabilities. Older native picker
+  // responses omit windows/image inputs; preserve only missing fields for
   // surviving IDs. Cache/auth refresh remains a complete replacement, including [].
   const previous = new Map(discoveredCodex.map((model) => [model.id, model]));
   discoveredCodex =
@@ -2322,27 +2322,30 @@ export function setDiscoveredCodexModels(
       ? models.map((model) => {
           const known = previous.get(model.id);
           if (!known) return model;
+          const cachedWindow = model.contextWindowVerified !== true && known.contextWindowVerified === true
+            && (model.contextWindowMax === undefined || known.contextWindow <= model.contextWindowMax);
+          const cachedImage = model.supportsImageInput === undefined && known.supportsImageInput !== undefined;
           return {
             ...model,
             discoveredMetadata: {
               ...(model.discoveredMetadata ?? catalogModelMetadata(model)),
-              ...(known.contextWindowVerified === true
+              ...(cachedWindow
                 ? { contextWindow: known.contextWindow }
                 : {}),
-              ...(known.supportsImageInput !== undefined
+              ...(cachedImage
                 ? { supportsImageInput: known.supportsImageInput }
                 : {}),
             },
-            ...(known.contextWindowVerified === true
+            ...(cachedWindow
               ? {
                   contextWindow: known.contextWindow,
                   contextWindowVerified: true,
                 }
               : {}),
-            ...(known.contextWindowMax !== undefined
+            ...(model.contextWindowVerified !== true && model.contextWindowMax === undefined && known.contextWindowMax !== undefined
               ? { contextWindowMax: known.contextWindowMax }
               : {}),
-            ...(known.supportsImageInput !== undefined
+            ...(cachedImage
               ? { supportsImageInput: known.supportsImageInput }
               : {}),
           };

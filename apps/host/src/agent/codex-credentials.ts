@@ -18,14 +18,15 @@ export function createHostCodexCredentials(profileDir: string, accounts: ReturnT
     const home = homeFor(id);
     return isNativeProviderAuthBound('openai') && !shouldSuppressLocalCodexAuth(home, path.join(home, 'auth.json'));
   };
+  const authorizationGeneration = (id = 'openai') => id === 'openai' ? captureNativeProviderAuthorizationGeneration('openai')
+    : JSON.stringify(currentCodexCredentialGeneration(path.join(homeFor(id), 'account.json')));
   /** The proof the desktop adapter's captureOAuthDispatchProof gives the subscription bridge. */
   const captureDispatchProof = (accessToken: string, accountId: string | null, id = 'openai') => {
     if (!authenticated(id)) return null;
     const home = homeFor(id);
     return captureCodexOAuthDispatchProof({ home, accessToken, accountId,
       authenticated: () => authenticated(id),
-      authorization: () => id === 'openai' ? captureNativeProviderAuthorizationGeneration('openai')
-        : JSON.stringify(currentCodexCredentialGeneration(path.join(home, 'account.json'))),
+      authorization: () => authorizationGeneration(id),
     });
   };
   const read = (id = 'openai') => {
@@ -43,6 +44,7 @@ export function createHostCodexCredentials(profileDir: string, accounts: ReturnT
   return {
     hasLogin: () => read() !== null,
     captureDispatchProof,
+    authorizationGeneration,
     /**
      * The access token the subscription bridge checks a rejection against (the desktop
      * adapter's getAccessToken). An independent account also needs its workspace id, as

@@ -1214,6 +1214,38 @@ describe('pooled Claude model discovery', () => {
 });
 
 describe('pooled Codex model discovery', () => {
+  // Unit: the selected pool publishes HTTP facts instead of stale same-profile cache,
+  // and retains the credential proof through the asynchronous cache supplement.
+  it.each([false, true])('preserves live metadata and drops revoked post-read publication (%s)', async revoked => {
+    h.pools.openai = { strategy: 'order', accounts: [{ ...account('default'), paused: true }, account('second')] };
+    await refreshSubscriptionPool('openai');
+    let current = true;
+    h.rpc.mockResolvedValue({ data: [{ id: 'new-model', model: 'new-model',
+      contextWindow: 400000, contextWindowMax: 1000000, contextWindowVerified: true, supportsImageInput: false }],
+      nextCursor: null, canDispatch: () => current });
+    h.modelCacheRead.mockImplementation(async () => {
+      if (revoked) current = false;
+      return JSON.stringify({ models: [{ slug: 'new-model', visibility: 'list', supported_in_api: true,
+        context_window: 100000, input_modalities: ['image'] }] });
+    });
+    await refreshSubscriptionPoolCodexModels();
+    const models = readSubscriptionPoolCodexModels();
+    if (revoked) expect(models?.map(m => m.id) ?? []).not.toContain('new-model');
+    else expect(models?.[0]).toMatchObject({ id: 'new-model', contextWindow: 400000,
+      contextWindowMax: 1000000, supportsImageInput: false, contextWindowVerified: true });
+  });
+
+  // Unit: a cache may fill a missing working window without overwriting an explicit HTTP maximum.
+  it.each([undefined, 300000])('keeps the live maximum while supplementing a cached working window (%s)', async cachedMax => {
+    h.pools.openai = { strategy: 'order', accounts: [{ ...account('default'), paused: true }, account('second')] };
+    await refreshSubscriptionPool('openai');
+    h.rpc.mockResolvedValue({ data: [{ id: 'new-model', contextWindowMax: 400000 }], nextCursor: null });
+    h.modelCacheRead.mockResolvedValue(JSON.stringify({ models: [{ slug: 'new-model', visibility: 'list', supported_in_api: true,
+      context_window: 272000, max_context_window: cachedMax }] }));
+    await refreshSubscriptionPoolCodexModels();
+    expect(readSubscriptionPoolCodexModels()?.[0]).toMatchObject({ contextWindow: 272000, contextWindowMax: 400000 });
+  });
+
   // Unit: the manual refresh entry must route by id, even if a Codex provider is called Claude.
   it('manually refreshes a renamed independent source without using the disconnected default', async () => {
     const providerId = 'openai-sub-12345678';

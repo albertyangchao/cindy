@@ -223,7 +223,8 @@ Codex 在实际 `turn/start` 请求中省略该档位字段，计划模式的 `r
 
 OpenAI（Codex 订阅）与 Anthropic（Claude 订阅）的 root **成员只来自账号清单**：Registry 只给
 已返回的型号补资料、标退役，不补入账号没返回的型号；没有账号清单时名单为空。`sortOrder` 以账号
-返回顺序为准：Codex 取 `models_cache.json` 的 `priority` 或 app-server `model/list` 的返回位置，
+返回顺序为准：本机 Codex OAuth 取账号 HTTP 目录的 `priority`，启动 cache 同样保留原生排序；
+API 与 SSH 的简略清单保留 app-server `model/list` 的返回位置，
 Claude 取 SDK `supportedModels()` 的返回位置。用户本地 addition 按 Registry / 本地 `sortOrder`
 接在其后。装配时重写为连续 `sortOrder`，选择器、设置页、新对话默认与 Claude Code
 bridge 共用这一顺序；OpenAI 订阅的 Pi 以公共 Pi 目录为基础，按同一账号的当前发现／恢复

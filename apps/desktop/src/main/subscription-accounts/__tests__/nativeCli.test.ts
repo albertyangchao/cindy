@@ -9,6 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const h = vi.hoisted(() => ({
   binary: '/fixture/codex' as string | null,
   spawn: vi.fn(),
+  fetch: vi.fn<typeof globalThis.fetch>(),
   error: false,
   errorMessage: 'fixture-secret-must-not-leak',
   hold: false,
@@ -18,6 +19,7 @@ const h = vi.hoisted(() => ({
   oldLogin: vi.fn<(...args: unknown[]) => Promise<{ ok: boolean; reason?: string }>>(async () => ({ ok: true })),
   oldCancel: vi.fn(),
 }));
+vi.mock('../../maker-host/outbound-fetch.desktop.js', () => ({ outboundFetch: h.fetch }));
 vi.mock('node:child_process', () => ({ spawn: h.spawn }));
 vi.mock('@cindy/maker-core', () => ({
   cleanProcessEnv: () => ({
@@ -28,6 +30,7 @@ vi.mock('@cindy/maker-core', () => ({
   }),
 }));
 vi.mock('../../agent-binaries/index.js', () => ({ getReadyBinaryPath: () => h.binary }));
+vi.mock('../../agent-binaries/binary-version-probe.js', () => ({ probeBinaryVersion: async () => '0.166.0' }));
 vi.mock('../../maker-host/codex-account-auth.desktop.js', () => ({
   codexAccountState: () => ({ authenticated: h.oldAuthenticated, errorReason: h.oldAuthenticated ? undefined : h.oldReason }),
   loginCodexAccount: h.oldLogin,
@@ -130,6 +133,7 @@ beforeEach(() => {
   h.errorMessage = 'fixture-secret-must-not-leak';
   h.hold = false;
   h.accountResult = undefined;
+  h.fetch.mockReset();
   h.oldAuthenticated = false;
   h.oldReason = 'oauth_expired';
   h.oldLogin.mockReset().mockResolvedValue({ ok: true });
@@ -199,6 +203,57 @@ describe('Claude profile renewal', () => {
   });
 });
 describe('official Codex profiles', () => {
+  // Unit: the account model reader used to accept the CLI bundle as a fresh
+  // account catalog. Older transport tests only exercised account controls.
+  it('reads current models through the selected native account instead of spawning a bundled picker', async () => {
+    const home = await mkdtemp(path.join(tmpdir(), 'cindy-model-account-'));
+    try {
+      await writeFile(path.join(home, 'auth.json'), JSON.stringify({ tokens: {
+        access_token: 'fixture-model-token', account_id: 'fixture-model-workspace',
+      } }));
+      h.accountResult = { data: [{ model: 'gpt-bundled-old' }], nextCursor: null };
+      h.fetch.mockResolvedValueOnce(Response.json({ models: [{ slug: 'gpt-new-member', display_name: 'New member',
+        visibility: 'list', supported_in_api: true, supported_reasoning_levels: [{ effort: 'low' }],
+        default_reasoning_level: 'low', service_tiers: [] }] }));
+      const result = await codexAccountRpc(home, 'model/list', {}, () => true) as { data: { model: string }[] };
+      expect(result.data.map(item => item.model)).toEqual(['gpt-new-member']);
+      expect(h.fetch).toHaveBeenLastCalledWith(expect.any(String), expect.objectContaining({ headers:
+        expect.objectContaining({ authorization: 'Bearer fixture-model-token', 'chatgpt-account-id': 'fixture-model-workspace' }) }));
+      expect(h.spawn).not.toHaveBeenCalled();
+    } finally { await rm(home, { recursive: true, force: true }); }
+  });
+  // Standard: older native credentials derive their workspace from the existing ID-token parser.
+  it('uses the legacy workspace claim without requiring account_id', async () => {
+    const home = await mkdtemp(path.join(tmpdir(), 'cindy-model-legacy-'));
+    try {
+      const payload = Buffer.from(JSON.stringify({ 'https://api.openai.com/auth': { chatgpt_account_id: 'legacy-workspace' } })).toString('base64url');
+      await writeFile(path.join(home, 'auth.json'), JSON.stringify({ tokens: { access_token: 'fixture-token', id_token: `fixture.${payload}.fixture` } }));
+      h.fetch.mockResolvedValueOnce(Response.json({ models: [] }));
+      await codexAccountRpc(home, 'model/list', {}, () => true);
+      expect(h.fetch.mock.calls[0][1]?.headers).toMatchObject({ 'chatgpt-account-id': 'legacy-workspace' });
+    } finally { await rm(home, { recursive: true, force: true }); }
+  });
+  // Standard: simultaneous rejected HTTP reads share the same profile's official renewal.
+  it('coalesces model-discovery token renewal for the selected profile', async () => {
+    const home = await mkdtemp(path.join(tmpdir(), 'cindy-model-renewal-'));
+    try {
+      await writeFile(path.join(home, 'auth.json'), JSON.stringify({ tokens: { access_token: 'fixture-token', account_id: 'fixture-workspace' } }));
+      h.fetch.mockResolvedValueOnce(new Response(null, { status: 401 }))
+        .mockResolvedValueOnce(new Response(null, { status: 401 }))
+        .mockImplementation(async () => Response.json({ models: [] }));
+      h.hold = true;
+      const pending = Promise.all([codexAccountRpc(home, 'model/list', {}, () => true), codexAccountRpc(home, 'model/list', {}, () => true)]);
+      await vi.waitFor(() => { expect(h.fetch).toHaveBeenCalledTimes(2); expect(h.spawn).toHaveBeenCalledOnce(); });
+      children[0].stdout.emit('data', Buffer.from(JSON.stringify({ id: 1, result: {} }) + '\n'));
+      children[0].stdout.emit('data', Buffer.from(JSON.stringify({ id: 2, result: {} }) + '\n'));
+      await pending;
+      expect(h.spawn).toHaveBeenCalledOnce();
+      expect(h.spawn.mock.calls[0][2].env.CODEX_HOME).toBe(home);
+      expect(h.fetch).toHaveBeenCalledTimes(4);
+      const methods = children[0].stdin.write.mock.calls.map(([line]) => JSON.parse(line).method);
+      expect(methods.filter(method => method === 'account/read')).toHaveLength(1);
+    } finally { await rm(home, { recursive: true, force: true }); }
+  });
   // #10110 review, unit: legacy auth has no plan. Keep the plan returned by the
   // selected profile's quota RPC; the old test fixtures only read account/read.
   it('preserves the selected profile plan alongside its sanitized Codex quota', async () => {

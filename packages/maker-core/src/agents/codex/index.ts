@@ -2509,6 +2509,7 @@ export class CodexAgent extends BaseAgent {
   }
 
   private routeResolutionAbort = new AbortController();
+  private readonly localModelRefreshGenerations = new Map<string, number>();
 
   private async resolveLocalAuthSelection(providerId: string | null | undefined, model: string) {
     const signal = this.routeResolutionAbort.signal;
@@ -2903,12 +2904,33 @@ assertRouteCurrent();
   }
 
   /**
-   * 向本地 app-server 实时读取完整模型清单并交给宿主。
-   * 不能只读 models_cache.json：OAuth 登录前会清旧 cache，model/list 也是 cache ready barrier。
+   * Explicit OAuth discovery uses the host account reader; native API/utility consumers
+   * retain the complete paginated app-server protocol below.
    */
   override async refreshLocalModels(options?: RefreshLocalModelsOptions): Promise<boolean> {
     const nativeSubscriptionAccount = options?.[NATIVE_SUBSCRIPTION_ACCOUNT];
     const credentialMode = nativeSubscriptionAccount ? 'oauth-bearer' : options?.credentialMode;
+    if (credentialMode === 'oauth-bearer' && !nativeSubscriptionAccount && !options?.onModelsListed
+      && this.deps.refreshCodexLocalModels
+      && (!options?.providerId || options.providerId === 'openai' || this.deps.isCodexAccountProvider?.(options.providerId))) {
+      const refreshKey = options?.providerId ?? 'openai';
+      const generation = (this.localModelRefreshGenerations.get(refreshKey) ?? 0) + 1;
+      this.localModelRefreshGenerations.set(refreshKey, generation);
+      const controller = new AbortController();
+      const signal = AbortSignal.any([controller.signal, this.routeResolutionAbort.signal]);
+      const expiresAt = Date.now() + CODEX_MODEL_REFRESH_DEADLINE_MS;
+      const timer = setTimeout(() => controller.abort(
+        new AppServerRequestTimeoutError('model refresh', CODEX_MODEL_REFRESH_DEADLINE_MS)), CODEX_MODEL_REFRESH_DEADLINE_MS);
+      const isCurrent = () => !signal.aborted && Date.now() < expiresAt
+        && this.localModelRefreshGenerations.get(refreshKey) === generation;
+      try {
+        return await awaitCodexRouteSelection(this.deps.refreshCodexLocalModels(
+          { providerId: options?.providerId }, { signal, isCurrent }), signal);
+      } finally {
+        clearTimeout(timer);
+        controller.abort(new Error('Codex model refresh completed'));
+      }
+    }
     if (!credentialMode) return this.refreshLocalModelsWithinDeadline(options);
 
     const key = codexLocalAuthHostIdentity(

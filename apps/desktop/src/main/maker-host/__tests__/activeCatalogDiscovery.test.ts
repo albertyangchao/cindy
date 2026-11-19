@@ -7,6 +7,9 @@
  * OSS 文件)生效,用 fixture 模拟。
  */
 import { afterEach, describe, expect, it } from 'vitest';
+import { createCodexLocalModelSink } from '../codexLocalModelSink.js';
+import { fetchCodexAccountModels } from '../codex-account-model-fetch.js';
+import { createProviderModelRefreshCoordinator } from '../provider-model-auto-refresh.js';
 
 import {
   BUNDLED_CATALOG,
@@ -1105,4 +1108,50 @@ describe('anthropic 发现条目的 modelRegistry 元数据基线', () => {
     expect(getCindyModelContextWindow('claude-fable-5')).toBeNull();
     expect(getCindyModelEffortBaseline('claude-fable-5')).toBeNull();
   });
+});
+
+// Standard: startup revalidates an existing nonempty cache via the same production
+// coordinator and OAuth sink, preserving the last successful snapshot when offline.
+it('revalidates a warm default catalog at startup and never replaces it with a failed read', async () => {
+  setActiveCatalog(bundledWithoutRegistry());
+  setDiscoveredCodexModels([fake('old-member')]);
+  let mode: 'new' | 'offline' | 'empty' = 'new';
+  let reads = 0;
+  const sink = createCodexLocalModelSink(async () => {}, async (_id, guard) => {
+    const result = await fetchCodexAccountModels({ accessToken: 'fixture', accountId: 'fixture', clientVersion: '1',
+      ...guard, fetch: async () => {
+        reads++;
+        if (mode === 'offline') throw new Error('offline');
+        return Response.json({ models: mode === 'empty' ? [] : [{ slug: 'new-member', visibility: 'list',
+          supported_in_api: true, context_window: 400000, input_modalities: ['text'] }] });
+      } });
+    return { models: result.data, isCurrent: () => true };
+  });
+  const guard = { signal: new AbortController().signal, isCurrent: () => true };
+  const coordinator = createProviderModelRefreshCoordinator({
+    listProviders: async () => [{ id: 'openai', source: 'builtin', connected: true } as any],
+    refreshProvider: async () => { await sink({}, guard); },
+    now: () => 1, log: { debug: () => {}, warn: () => {} },
+  });
+  await Promise.all([coordinator.requestAutoRefresh('startup'), coordinator.requestAutoRefresh('startup')]);
+  expect(reads).toBe(1);
+  expect(openaiIds('codex')).toEqual(['new-member']);
+  const current = getActiveCatalog().providers.find(p => p.id === 'openai')!.models.codex![0];
+  expect(current).toMatchObject({ contextWindow: 400000, supportsImageInput: false });
+  mode = 'offline';
+  await expect(coordinator.refreshManually('openai')).rejects.toThrow('discovery failed');
+  expect(openaiIds('codex')).toEqual(['new-member']);
+  mode = 'empty';
+  await coordinator.refreshManually('openai');
+  expect(openaiIds('codex')).toEqual([]);
+});
+
+// Unit: a fresh HTTP declaration wins over surviving model metadata from an old cache.
+it('keeps explicit new HTTP windows and image capability ahead of the previous account cache', () => {
+  setActiveCatalog(bundledWithoutRegistry());
+  setDiscoveredCodexModels([{ ...fake('same-model'), contextWindow: 100000, contextWindowVerified: true, supportsImageInput: true }]);
+  setDiscoveredCodexModels([{ ...fake('same-model'), contextWindow: 500000, contextWindowMax: 1000000,
+    contextWindowVerified: true, supportsImageInput: false }], { source: 'list' });
+  expect(getActiveCatalog().providers.find(p => p.id === 'openai')!.models.codex![0])
+    .toMatchObject({ contextWindow: 500000, contextWindowMax: 1000000, supportsImageInput: false });
 });

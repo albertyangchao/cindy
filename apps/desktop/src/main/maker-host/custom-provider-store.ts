@@ -1042,6 +1042,7 @@ export async function updateCustomProviderIfUnchanged(
   expected: CustomProviderConfig,
   config: CustomProviderConfig,
   now: number = Date.now(),
+  canCommit: () => boolean = () => true,
 ): Promise<boolean> {
   const expectedConfig = normalizeConfig({ ...expected, id });
   const nextConfig = invalidateEditedProviderMetadata(
@@ -1050,7 +1051,7 @@ export async function updateCustomProviderIfUnchanged(
   );
   const db = getDbClient().drizzle;
   const existing = await db.select().from(customProviders).where(eq(customProviders.id, id)).get();
-  if (!existing) return false;
+  if (!existing || !canCommit()) return false;
   const expectedRuntimes = JSON.stringify(expectedConfig.runtimes);
   const expectedAuth = expectedConfig.auth ? JSON.stringify(expectedConfig.auth) : null;
   if (

@@ -91,13 +91,9 @@ export interface CodexModelBackfillCoordinator {
  *   - `generation`:auth 边界的代号,`reset()` 递增。在途拉取回来时若代号已变,**不广播、
  *     不计额度**。
  *
- * **代号管的不是目录写入**(容易误读,PR #1076 review 三轮都绕着这点):目录写入发生在
- * `refreshLive()` 内部 —— agent 的 `onCodexLocalModelsListed` 回调,在 promise resolve
- * **之前**就跑完了,本模块没有任何介入点。挡住跨边界写入的判据在 maker-core:CodexAgent 把
- * model/list 结果交给宿主前会校验 `this.hosts.get(key) !== host`,所以只要 auth 边界收口
- * **退役了旧 host**,迟到响应就压根不会调回调。四条收口路径(登出 / 登录 / 凭证失效 /
- * auth 模式切换)现在都退役 host,这条不变量由那一处判据统一保证 —— 不要在写入侧再加第二层
- * 闸门,那既是重复判据,也挡不住真正的问题(试过,见 review 第二、三轮)。
+ * 目录写入发生在 refreshLive 内部。本机 OAuth 的宿主 HTTP hook 将总 deadline、
+ * owner/授权和凭据文件 proof 贯通至目录/CAS 更新前；旧原生路径仍验证 host 身份。
+ * coordinator 的代号仅处理本模块的广播与失败额度，不代替发现入口的写入证明。
  *
  * 这里的代号只管两件**本模块自己**的事:广播(`onApplied` —— 不为一次已被 host 校验挡掉的
  * 写入白广播一轮)与失败额度的归属(旧边界的失败不该扣新边界的重试次数)。

@@ -1,4 +1,7 @@
 import { createCodexLocalModelSink } from '../../../desktop/src/main/maker-host/codexLocalModelSink.js';
+import { refreshCodexAccountTokens } from '../../../desktop/src/main/maker-host/codex-account-control.js';
+import { fetchCodexAccountModelsWithRefresh } from '../../../desktop/src/main/maker-host/codex-account-model-fetch.js';
+import { probeBinaryVersion } from '../../../desktop/src/main/agent-binaries/binary-version-probe.js';
 import { hostBlobStore, hostMediaIngest, hostMediaJournal } from '../media-store.js';
 import { MAKER_PUSH } from '../../../desktop/src/main/maker-ipc/channels.js';
 import path from 'node:path';
@@ -208,7 +211,23 @@ export function createHostCodexRuntime(options: {
     ...threadStorage.deps,
     prepareCodexExtraSpawnConfig: async (...args) => { check(); const value = inbound.withToken(await prepare(...args)); check(); return value; },
     disableCodexPluginRuntime: true,
-    onCodexLocalModelsListed: createCodexLocalModelSink(options.config.list),
+    refreshCodexLocalModels: createCodexLocalModelSink(options.config.list, async (providerId, guard) => {
+      check();
+      const version = await probeBinaryVersion(options.binaryPath);
+      if (!version) throw new Error('Codex version unavailable for model discovery');
+      const authorization = native.authorizationGeneration(providerId);
+      const authorized = () => current() && guard.isCurrent() && authorization === native.authorizationGeneration(providerId)
+        && !accounts.isCodexAccountLoginActive(providerId ?? 'openai');
+      const result = await fetchCodexAccountModelsWithRefresh({ clientVersion: version, signal: guard.signal,
+        fetch: (...args) => hostOutbound.outboundFetch(...args),
+        isCurrent: authorized,
+        readTokens: () => native.readForDispatch(providerId),
+        refreshTokens: proof => refreshCodexAccountTokens(options.binaryPath,
+          providerId ? accounts.codexAccountHome(providerId) : path.join(options.profileDir, 'codex-home'),
+          proof),
+      });
+      return { models: result.data, isCurrent: () => authorized() && result.canDispatch() };
+    }),
     resolveCodexSubagentRoutingSignature: createCodexRoutingSignature(() => options.config.publicViews(Boolean(credential()))),
     resolveCodexLocalAuthPolicy: captureCodexLocalAuthPolicy,
     isCodexAccountProvider: id => id !== 'openai' && options.config.codexAccounts.isCodexAccountProvider(id),

@@ -2,6 +2,7 @@ import { applyProjectDirectoriesForTurn } from '../projectDirectoryRuntime.js';
 import { createOneShotUsageRecorder } from '../usage/auxiliaryUsage.js';
 import { attachmentPreservation, attachmentStorageRoots } from './oversized-attachment-recovery.js';
 import { createCodexLocalModelSink } from './codexLocalModelSink.js';
+import { readCodexAccountModels } from './codex-account-model-reader.desktop.js';
 import { createCodexSpawnConfig, createCodexRoutingSignature } from './codexSpawnConfigCore.js';
 import { refreshCodexGatewayRuntime } from './codexGatewayRefresh.js';
 import { isReplacedCindyGatewayKey } from '../model-access/gatewayKeyRejection.js';
@@ -1791,7 +1792,7 @@ export function getMaker(): Maker {
       resolveCodexLocalAuthPolicy: captureCodexLocalAuthPolicy,
       isCodexAccountProvider,
       isolateCodexAccountSessions: true,
-      onCodexLocalModelsListed: createCodexLocalModelSink(refreshCustomProvidersIntoCatalog),
+      refreshCodexLocalModels: createCodexLocalModelSink(refreshCustomProvidersIntoCatalog, readCodexAccountModels),
       // 「后端不可达」终局升级时读一次本次请求的出站路径判定,把通用猜测换成实测事实。
       // 快照的 proxy 字段在 resolver 侧已脱敏,可直接进用户可见的错误消息。
       //

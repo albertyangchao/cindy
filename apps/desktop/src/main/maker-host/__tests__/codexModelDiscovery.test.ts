@@ -25,6 +25,7 @@ import {
   readCodexDiscoveredModels,
   readCodexDiscoveredModelsForAuthRefresh,
 } from '../codex-model-discovery.js';
+import { fetchCodexAccountModels, fetchCodexAccountModelsWithRefresh } from '../codex-account-model-fetch.js';
 
 // 取自本机 ~/.codex/models_cache.json 的真实结构(裁剪到关键字段)。
 const SAMPLE = {
@@ -99,6 +100,128 @@ const SAMPLE = {
   ],
 };
 const OAUTH_AUTH = JSON.stringify({ tokens: { access_token: 'oauth-token' } });
+
+// Unit regression: native model/list can report a bundled list after timeout.
+// Existing cache/mapper tests cannot distinguish that from a current account
+// response. Exercise the actual host HTTP reader, including revocation, failure
+// and bounded response semantics; no real account, process or network is used.
+describe('account model HTTP discovery', () => {
+  const credentials = { accessToken: 'fixture-token', accountId: 'fixture-workspace', clientVersion: '0.166.0' };
+  const run = (fetch: typeof globalThis.fetch, isCurrent: () => boolean | Promise<boolean> = () => true) =>
+    fetchCodexAccountModels({ ...credentials, fetch, isCurrent });
+
+  it('discovers new members without a CLI bundle or per-model allowlist', async () => {
+    const fetch = vi.fn<typeof globalThis.fetch>(async () => Response.json({ models: [
+      { ...SAMPLE.models[0], slug: 'gpt-next-generation', display_name: 'New model' },
+      SAMPLE.models[4],
+    ] }));
+    const result = await run(fetch);
+    expect(result.data.map(model => model.model)).toEqual(['gpt-next-generation']);
+    expect(result.nextCursor).toBeNull();
+    const [url, init] = fetch.mock.calls[0];
+    expect(new URL(String(url)).searchParams.get('client_version')).toBe('0.166.0');
+    expect(init).toMatchObject({ redirect: 'error', headers: { authorization: 'Bearer fixture-token',
+      'chatgpt-account-id': 'fixture-workspace' } });
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('accepts an authoritative empty account catalog', async () => {
+    expect(await run(async () => Response.json({ models: [] }))).toEqual({ data: [], nextCursor: null });
+  });
+
+  it.each([
+    () => Response.json({ error: 'fixture-token' }, { status: 401 }),
+    () => Response.json({ models: [{}] }),
+    () => Response.json({ models: [{ slug: 'gpt-new' }] }),
+    () => Response.json({ models: [{ slug: 'gpt-new', visibility: 'list', supported_in_api: 'true' }] }),
+    () => Response.json({ data: [] }),
+    () => new Response('not json'),
+  ])('rejects failed/invalid discovery instead of publishing an empty or bundled list', async response => {
+    await expect(run(async () => response())).rejects.toThrow('Codex account model discovery failed');
+  });
+
+  it.each([false, Promise.resolve(false)])('does not send when the account proof is revoked: %s', async proof => {
+    const fetch = vi.fn<typeof globalThis.fetch>();
+    await expect(run(fetch, () => proof)).rejects.toThrow('Codex model account changed');
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it('discards a late response after an account or owner change', async () => {
+    let current = true;
+    await expect(run(async () => { current = false; return Response.json(SAMPLE); }, () => current))
+      .rejects.toThrow('Codex account model discovery failed');
+  });
+
+  it('bounds the response and cancels its stream on overflow', async () => {
+    const cancel = vi.fn();
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) { controller.enqueue(new Uint8Array(8 * 1024 * 1024 + 1)); }, cancel,
+    });
+    await expect(run(async () => new Response(body))).rejects.toThrow('Codex account model discovery failed');
+    expect(cancel).toHaveBeenCalledOnce();
+  });
+
+  it('keeps network errors sanitized and does not multiply retries', async () => {
+    const fetch = vi.fn<typeof globalThis.fetch>(async () => { throw new Error('fixture-token authorization'); });
+    const error = await run(fetch).catch(error => error as Error);
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toBe('Codex account model discovery failed');
+    expect(fetch).toHaveBeenCalledOnce();
+  });
+});
+
+// Unit: selected-account HTTP lifecycle, fake tokens only; no inference/network.
+describe('account model refresh lifecycle', () => {
+  it.each(['unknown', 'false', 'true', 'ultrafast'])('preserves new-model facts and native priority (%s)', async speed => {
+    const speedFacts = speed === 'unknown' ? {} : { additional_speed_tiers: speed === 'false' ? []
+      : speed === 'true' ? ['fast'] : ['fast', 'ultrafast'] };
+    const { data } = await fetchCodexAccountModels({ accessToken: 'fixture', accountId: 'fixture', clientVersion: '1',
+      isCurrent: () => true, fetch: async () => Response.json({ models: [
+        { slug: 'later', visibility: 'list', supported_in_api: true, priority: 10 },
+        { slug: 'new-model', visibility: 'list', supported_in_api: true, priority: 1,
+          context_window: 400000, max_context_window: 1000000, input_modalities: ['text', 'image'], ...speedFacts },
+      ] }) });
+    const mapped = mapCodexAppServerModelsToCatalog(data);
+    expect(mapped.map(row => row.id)).toEqual(['new-model', 'later']);
+    expect(mapped[0]).toMatchObject({ contextWindow: 400000, contextWindowMax: 1000000,
+      contextWindowVerified: true, supportsImageInput: true, supportsUltrafastMode: speed === 'ultrafast' });
+    expect(mapped[0].supportsFastMode).toBe(speed === 'unknown' ? undefined : speed !== 'false');
+    expect(mapped[0].discoveredMetadata?.efforts).toBeUndefined();
+  });
+
+  it.each(['success', 'swapped', 'offline'])('renews only one rejected same-account credential: %s', async outcome => {
+    let renewed = false;
+    const fetch = vi.fn<typeof globalThis.fetch>(async () => {
+      if (outcome === 'offline') throw new Error('offline fixture');
+      return renewed ? Response.json({ models: [] }) : new Response(null, { status: 401 });
+    });
+    const refreshTokens = vi.fn(async (proof: () => boolean | Promise<boolean>) => {
+      expect(await proof()).toBe(true); renewed = true;
+    });
+    const read = fetchCodexAccountModelsWithRefresh({ clientVersion: '1', fetch, isCurrent: () => true,
+      readTokens: async () => ({ accessToken: renewed ? 'new-fixture' : 'old-fixture',
+        accountId: renewed && outcome === 'swapped' ? 'other' : 'selected', canDispatch: () => true }), refreshTokens });
+    if (outcome === 'success') {
+      expect((await read).data).toEqual([]);
+      expect(fetch).toHaveBeenCalledTimes(2);
+      expect(refreshTokens).toHaveBeenCalledOnce();
+    } else {
+      await expect(read).rejects.toThrow('discovery failed');
+      expect(fetch).toHaveBeenCalledOnce();
+      expect(refreshTokens).toHaveBeenCalledTimes(outcome === 'swapped' ? 1 : 0);
+    }
+  });
+
+  it('does not renew a credential revoked during its rejected request', async () => {
+    let current = true;
+    const refreshTokens = vi.fn();
+    await expect(fetchCodexAccountModelsWithRefresh({ clientVersion: '1', isCurrent: () => current,
+      readTokens: async () => ({ accessToken: 'fixture', accountId: 'fixture', canDispatch: () => current }), refreshTokens,
+      fetch: async () => { current = false; return new Response(null, { status: 401 }); },
+    })).rejects.toThrow('discovery failed');
+    expect(refreshTokens).not.toHaveBeenCalled();
+  });
+});
 
 describe('mapCodexModelsToCatalog', () => {
   it.each([

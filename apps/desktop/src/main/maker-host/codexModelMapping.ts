@@ -117,6 +117,7 @@ export function mapCodexModelsToCatalog(raw: unknown): CatalogModel[] {
         name: str(m.display_name),
         description: str(m.description),
         contextWindow: m.context_window,
+        contextWindowMax,
         supportsImageInput:
           inputModalities !== undefined ? inputModalities.includes('image') : undefined,
         efforts: Array.isArray(m.supported_reasoning_levels) ? efforts : undefined,
@@ -155,7 +156,7 @@ export function mapCodexModelsToCatalog(raw: unknown): CatalogModel[] {
  * mapper 提供更细元数据；首次 OAuth 的关键是绝不能因为 cache 尚未落盘而发布空目录。
  */
 export function mapCodexAppServerModelsToCatalog(
-  models: readonly CodexModelListItem[],
+  models: readonly Partial<CodexModelListItem>[],
 ): CatalogModel[] {
   const out: CatalogModel[] = [];
   const seen = new Set<string>();
@@ -188,11 +189,21 @@ export function mapCodexAppServerModelsToCatalog(
       ...(Array.isArray(raw.additionalSpeedTiers) ? raw.additionalSpeedTiers : []),
     ];
     const supportsFastMode = tiers.some((tier) => tier === 'priority' || tier === 'fast');
+    // The host's account HTTP reader also carries explicit native capabilities.
+    // Older app-server rows omit them and keep the unverified 272k fallback.
+    const verifiedWindow = raw.contextWindowVerified === true && positiveTokens(raw.contextWindow);
+    const contextWindow = verifiedWindow ? raw.contextWindow as number
+      : Math.min(272_000, positiveTokens(raw.contextWindowMax) ? raw.contextWindowMax : 272_000);
+    const contextWindowMax = positiveTokens(raw.contextWindowMax) && (raw.contextWindowMax as number) >= contextWindow
+      ? raw.contextWindowMax as number : undefined;
     const model: CatalogModel = {
       id: slug,
       discoveredMetadata: pickModelMetadata({
         name: str(raw.displayName),
         description: str(raw.description),
+        ...(verifiedWindow ? { contextWindow } : {}),
+        ...(contextWindowMax !== undefined ? { contextWindowMax } : {}),
+        ...(typeof raw.supportsImageInput === 'boolean' ? { supportsImageInput: raw.supportsImageInput } : {}),
         efforts: Array.isArray(raw.supportedReasoningEfforts) ? efforts : undefined,
         defaultEffort: requestedDefault,
         supportsFastMode:
@@ -205,10 +216,11 @@ export function mapCodexAppServerModelsToCatalog(
       // app-server 已按官方 picker 顺序返回；按返回位置记账户顺序。
       sortOrder: index,
       ...(str(raw.description) ? { description: raw.description } : {}),
-      // 刻意**不**设 contextWindowVerified: live 协议不给 context_window, 这 272k 是
-      // 统一兜底而非该模型的真实上限。标了它就会被拿去收敛运行期上报的窗口, 把真实
-      // 更大的窗口(例如 400k 的 gpt-5.6)压成 272k, 上下文占比与 memory flush 全偏早。
-      contextWindow: 272_000,
+      // Only the host HTTP reader carries verified windows; native picker fallbacks stay unverified.
+      contextWindow,
+      ...(verifiedWindow ? { contextWindowVerified: true } : {}),
+      ...(contextWindowMax !== undefined ? { contextWindowMax } : {}),
+      ...(typeof raw.supportsImageInput === 'boolean' ? { supportsImageInput: raw.supportsImageInput } : {}),
       efforts: efforts as CatalogModel['efforts'],
       defaultEffort,
       status: 'active',

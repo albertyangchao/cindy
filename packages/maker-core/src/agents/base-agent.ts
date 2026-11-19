@@ -1173,6 +1173,12 @@ export interface AgentDeps {
     providerId?: string,
   ) => void | Promise<void>;
 
+  /** Host-owned account HTTP discovery. No native picker fallback may establish OAuth membership. */
+  refreshCodexLocalModels?: (
+    options: Pick<RefreshLocalModelsOptions, 'providerId'>,
+    guard: { signal: AbortSignal; isCurrent(): boolean },
+  ) => Promise<boolean>;
+
   /** Host-confirmed native account identity; ordinary custom API providers return false. */
   isCodexAccountProvider?: (providerId?: string | null) => boolean;
   /** Retire each local task's writer on close so native history can change accounts. */

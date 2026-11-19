@@ -1,4 +1,4 @@
-/** Official CLI login/control APIs only. No Claude credential access. */
+/** Selected-profile native account control and model discovery. No Claude credential access. */
 import { spawn } from 'node:child_process';
 import { homedir } from 'node:os';
 import path from 'node:path';
@@ -6,6 +6,11 @@ import { open } from 'node:fs/promises';
 import { statSync, type Stats } from 'node:fs';
 import { cleanProcessEnv, type AuthState } from '@cindy/maker-core';
 import { getReadyBinaryPath } from '../agent-binaries/index.js';
+import { probeBinaryVersion } from '../agent-binaries/binary-version-probe.js';
+import { outboundFetch } from '../maker-host/outbound-fetch.desktop.js';
+import { codexAccountControlRpc, refreshCodexAccountTokens } from '../maker-host/codex-account-control.js';
+import { chatgptAccountIdFromTokens } from '../maker-host/codexCredentialRead.js';
+import { fetchCodexAccountModelsWithRefresh } from '../maker-host/codex-account-model-fetch.js';
 import {
   refreshClaudeCliLoginStatus,
   readClaudeCliPlanUsage,
@@ -14,7 +19,7 @@ import {
 import { parseClaudeOAuthUsageResponse } from '../../shared/claudeSubscriptionUsage.js';
 import { providerGroupCodexUsageFromReads } from '../provider-group/usage.js';
 import type { SubscriptionProvider } from '../../shared/subscriptionAccounts.js';
-import { AccountServiceUnreachableError, isAccountServiceUnreachable } from './accountServiceError.js';
+import { isAccountServiceUnreachable } from './accountServiceError.js';
 
 /** Preserve the old adapter's owner/revocation checks; do not adopt ~/.codex on upgrade. */
 export async function readLegacyCodexAccount(): Promise<AuthState> {
@@ -61,17 +66,6 @@ export async function loginLegacyCodexProviderAccount(providerId: string, signal
   } finally {
     signal.removeEventListener('abort', cancel);
   }
-}
-
-// Only used to classify; the CLI's own wording never leaves this module.
-const UNREACHABLE_CLI_ERROR = /time(?:d)?\s*out|timeout|network|connect|dns|unreachable|sending request|tls|certificate|proxy|offline/i;
-
-function codexRequestError(error: unknown): Error {
-  const message = typeof (error as { message?: unknown })?.message === 'string'
-    ? (error as { message: string }).message : '';
-  return UNREACHABLE_CLI_ERROR.test(message)
-    ? new AccountServiceUnreachableError('Codex account request failed')
-    : new Error('Codex account request failed');
 }
 
 function codexProfileEnv(directory: string): Record<string, string> {
@@ -165,21 +159,12 @@ function codexCredits(raw: unknown) {
     : null;
 }
 
-const codexRefreshes = new Map<string, Promise<unknown>>();
-
 /** Codex's existing external-auth bridge. Never used for Claude or returned through IPC. */
 export async function readNativeCodexTokens(directory: string, refresh = false) {
   if (refresh) {
-    let pending = codexRefreshes.get(directory);
-    if (!pending) {
-      pending = codexAccountRpc(directory, 'account/read', { refreshToken: true });
-      codexRefreshes.set(directory, pending);
-    }
-    try {
-      await pending;
-    } finally {
-      if (codexRefreshes.get(directory) === pending) codexRefreshes.delete(directory);
-    }
+    const binary = getReadyBinaryPath('codex');
+    if (!binary) throw new Error('Codex CLI unavailable');
+    await refreshCodexAccountTokens(binary, directory);
   }
   const authPath = path.join(directory, 'auth.json');
   const file = await open(authPath, 'r');
@@ -206,12 +191,12 @@ export async function readNativeCodexTokens(directory: string, refresh = false) 
       !sameFile(before, after) ||
       !canDispatch() ||
       typeof raw.tokens?.access_token !== 'string' ||
-      typeof raw.tokens?.account_id !== 'string'
+      !chatgptAccountIdFromTokens(raw.tokens)
     )
       throw new Error('Codex account authentication bridge is unavailable');
     return {
       accessToken: raw.tokens.access_token as string,
-      chatgptAccountId: raw.tokens.account_id as string,
+      chatgptAccountId: chatgptAccountIdFromTokens(raw.tokens)!,
       canDispatch,
     };
   } finally {
@@ -225,77 +210,26 @@ export function codexAccountRpc(
   method: string,
   params: unknown,
   canDispatch?: () => boolean | Promise<boolean>,
+  signal?: AbortSignal,
 ): Promise<unknown> {
   const binary = getReadyBinaryPath('codex');
   if (!binary) return Promise.reject(new Error('Codex CLI unavailable'));
-  return new Promise((resolve, reject) => {
-    const child = spawn(binary, ['app-server'], {
-      cwd: homedir(),
-      env: codexProfileEnv(directory),
-      stdio: ['pipe', 'pipe', 'ignore'],
-      windowsHide: true,
-    });
-    let settled = false;
-    let buffer = '';
-    const finish = (error?: Error, result?: unknown) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      child.kill();
-      if (error) reject(error);
-      else resolve(result);
-    };
-    // A stalled read is almost always the CLI waiting on its account service (startup refreshes).
-    const timer = setTimeout(() => finish(new AccountServiceUnreachableError('Codex account read timed out')), 15_000);
-    const send = (message: unknown) => child.stdin.write(JSON.stringify(message) + '\n');
-    const dispatch = async () => {
-      try {
-        if (canDispatch) {
-          const allowed = canDispatch();
-          // Existing synchronous proofs and the write must stay in the same synchronous segment.
-          if (!(typeof allowed === 'boolean' ? allowed : await allowed))
-            return finish(new Error('Codex account changed before dispatch'));
-        }
-        // An asynchronous credential/source check can outlive this control connection.
-        if (!settled) send({ id: 2, method, params });
-      } catch {
-        finish(new Error('Codex account changed before dispatch'));
-      }
-    };
-    child.stdin.on('error', () => finish(new Error('Codex account connection closed')));
-    child.on('error', () => finish(new Error('Codex CLI unavailable')));
-    child.on('close', () => finish(new Error('Codex account connection closed')));
-    child.stdout.on('data', (chunk: Buffer) => {
-      buffer += chunk.toString('utf8');
-      if (buffer.length > 1_048_576) return finish(new Error('Codex account response too large'));
-      let newline: number;
-      while ((newline = buffer.indexOf('\n')) >= 0) {
-        const line = buffer.slice(0, newline);
-        buffer = buffer.slice(newline + 1);
-        let message: { id?: number; error?: unknown; result?: unknown };
-        try {
-          message = JSON.parse(line);
-        } catch {
-          continue;
-        }
-        if (message.error) return finish(codexRequestError(message.error));
-        if (message.id === 1) {
-          send({ method: 'initialized', params: {} });
-          // Startup may await configuration/auth refresh. A reset must still use
-          // the exact credential observed before spawning this control connection.
-          void dispatch();
-        } else if (message.id === 2) finish(undefined, message.result);
-      }
-    });
-    send({
-      id: 1,
-      method: 'initialize',
-      params: {
-        clientInfo: { name: 'cindy', version: '1.0.0' },
-        capabilities: { experimentalApi: true },
+  if (method === 'model/list') return (async () => {
+    // model/list can silently return the CLI's bundled catalog after its short
+    // network timeout. Only an account HTTP response can replace membership.
+    if ((params as { cursor?: unknown } | null)?.cursor) throw new Error('Unexpected Codex model cursor');
+    const version = await probeBinaryVersion(binary);
+    if (!version) throw new Error('Codex version unavailable for model discovery');
+    return fetchCodexAccountModelsWithRefresh({ clientVersion: version, fetch: (...args) => outboundFetch(...args), signal,
+      isCurrent: canDispatch ?? (() => true),
+      readTokens: async () => {
+        const tokens = await readNativeCodexTokens(directory);
+        return { accessToken: tokens.accessToken, accountId: tokens.chatgptAccountId, canDispatch: tokens.canDispatch };
       },
+      refreshTokens: proof => refreshCodexAccountTokens(binary, directory, proof),
     });
-  });
+  })();
+  return codexAccountControlRpc(binary, directory, method, params, canDispatch, signal);
 }
 
 export async function loginNativeAccount(

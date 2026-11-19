@@ -1216,6 +1216,7 @@ export async function refreshSubscriptionPoolCodexModels(
     const flight = (async () => {
       try {
         const models: CodexModelListItem[] = [];
+        const proofs: Array<() => boolean> = [];
         const cursors = new Set<string>();
         let pages = 0;
         let cursor: string | null = null;
@@ -1223,9 +1224,10 @@ export async function refreshSubscriptionPoolCodexModels(
           if (!isCurrent()) return;
           if (pages >= CODEX_MODEL_MAX_PAGES) throw new Error('Codex model page budget exceeded');
           const page = await codexAccountRpc(directory, 'model/list', { cursor, limit: 100, includeHidden: false }, isCurrent) as {
-            data: CodexModelListItem[]; nextCursor?: string | null;
+            data: CodexModelListItem[]; nextCursor?: string | null; canDispatch?: () => boolean;
           };
           if (!Array.isArray(page?.data)) throw new Error('Invalid Codex model list');
+          if (page.canDispatch) proofs.push(page.canDispatch);
           pages += 1;
           if (models.length + page.data.length > CODEX_MODEL_MAX_ITEMS) throw new Error('Codex model item budget exceeded');
           models.push(...page.data);
@@ -1239,18 +1241,21 @@ export async function refreshSubscriptionPoolCodexModels(
         const cached = await readFile(path.join(directory, 'models_cache.json'), 'utf8')
           .then(raw => new Map(mapCodexModelsToCatalog(JSON.parse(raw)).map(model => [model.id, model])))
           .catch(() => new Map<string, CatalogModel>());
-        if (!isCurrent()) return;
+        if (!isCurrent() || proofs.some(proof => !proof())) return;
         state.codexModels.set(id, { auth, models: mapCodexAppServerModelsToCatalog(models).map(model => {
           const known = cached.get(model.id);
           if (!known) return model;
+          const cachedWindow = model.contextWindowVerified !== true && known.contextWindowVerified === true
+            && (model.contextWindowMax === undefined || known.contextWindow <= model.contextWindowMax);
+          const cachedImage = model.supportsImageInput === undefined && known.supportsImageInput !== undefined;
           return { ...model,
-            ...(known.contextWindowVerified ? { contextWindow: known.contextWindow, contextWindowVerified: true,
-              contextWindowMax: known.contextWindowMax } : {}),
-            ...(known.supportsImageInput !== undefined ? { supportsImageInput: known.supportsImageInput } : {}),
+            ...(cachedWindow ? { contextWindow: known.contextWindow, contextWindowVerified: true,
+              contextWindowMax: model.contextWindowMax ?? known.contextWindowMax } : {}),
+            ...(cachedImage ? { supportsImageInput: known.supportsImageInput } : {}),
             discoveredMetadata: {
               ...model.discoveredMetadata,
-              ...(known.contextWindowVerified ? { contextWindow: known.contextWindow } : {}),
-              ...(known.supportsImageInput !== undefined ? { supportsImageInput: known.supportsImageInput } : {}),
+              ...(cachedWindow ? { contextWindow: known.contextWindow } : {}),
+              ...(cachedImage ? { supportsImageInput: known.supportsImageInput } : {}),
             },
           };
         }) });
